@@ -1,6 +1,5 @@
-/* gcry.c - rsyslog's libgcrypt based crypto provider
+/* libossl.c - rsyslog's openssl based crypto provider
  *
- * Copyright 2013-2018 Adiscon GmbH.
  *
  * We need to store some additional information in support of encryption.
  * For this, we create a side-file, which is named like the actual log
@@ -40,64 +39,90 @@
 #include "config.h"
 #endif
 #include <stdio.h>
-#include <gcrypt.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <openssl/evp.h>
+#include <string.h>
 
 #include "rsyslog.h"
 #include "srUtils.h"
 #include "debug.h"
-#include "libgcry.h"
+#include "libossl.h"
 #include "libcry_common.h"
 
 #define READBUF_SIZE 4096	/* size of the read buffer */
+static rsRetVal rsosslBlkBegin(osslfile gf);
 
-static rsRetVal rsgcryBlkBegin(gcryfile gf);
+/* read a key from a key file
+ * @param[out] key - key buffer, must be freed by caller
+ * @param[out] keylen - length of buffer
+ * @returns 0 if OK, something else otherwise (we do not use
+ *            iRet as this is also called from non-rsyslog w/o runtime)
+ *	      on error, errno is set and can be queried
+ * The key length is limited to 64KiB to prevent DoS.
+ * Note well: key is a blob, not a C string (NUL may be present!)
+ */
+int osslGetKeyFromFile(const char* const fn, char** const key, unsigned* const keylen) {
+	struct stat sb;
+	int r = -1;
 
-int
-rsgcryAlgoname2Algo(char *const __restrict__ algoname)
-{
-	if(!strcmp((char*)algoname, "3DES")) return GCRY_CIPHER_3DES;
-	if(!strcmp((char*)algoname, "CAST5")) return GCRY_CIPHER_CAST5;
-	if(!strcmp((char*)algoname, "BLOWFISH")) return GCRY_CIPHER_BLOWFISH;
-	if(!strcmp((char*)algoname, "AES128")) return GCRY_CIPHER_AES128;
-	if(!strcmp((char*)algoname, "AES192")) return GCRY_CIPHER_AES192;
-	if(!strcmp((char*)algoname, "AES256")) return GCRY_CIPHER_AES256;
-	if(!strcmp((char*)algoname, "TWOFISH")) return GCRY_CIPHER_TWOFISH;
-	if(!strcmp((char*)algoname, "TWOFISH128")) return GCRY_CIPHER_TWOFISH128;
-	if(!strcmp((char*)algoname, "ARCFOUR")) return GCRY_CIPHER_ARCFOUR;
-	if(!strcmp((char*)algoname, "DES")) return GCRY_CIPHER_DES;
-	if(!strcmp((char*)algoname, "SERPENT128")) return GCRY_CIPHER_SERPENT128;
-	if(!strcmp((char*)algoname, "SERPENT192")) return GCRY_CIPHER_SERPENT192;
-	if(!strcmp((char*)algoname, "SERPENT256")) return GCRY_CIPHER_SERPENT256;
-	if(!strcmp((char*)algoname, "RFC2268_40")) return GCRY_CIPHER_RFC2268_40;
-	if(!strcmp((char*)algoname, "SEED")) return GCRY_CIPHER_SEED;
-	if(!strcmp((char*)algoname, "CAMELLIA128")) return GCRY_CIPHER_CAMELLIA128;
-	if(!strcmp((char*)algoname, "CAMELLIA192")) return GCRY_CIPHER_CAMELLIA192;
-	if(!strcmp((char*)algoname, "CAMELLIA256")) return GCRY_CIPHER_CAMELLIA256;
-	return GCRY_CIPHER_NONE;
+	const int fd = open(fn, O_RDONLY);
+	if (fd < 0) goto done;
+	if (fstat(fd, &sb) == -1) goto done;
+	if (sb.st_size > 64 * 1024) {
+		errno = EMSGSIZE;
+		goto done;
+	}
+	if ((*key = malloc(sb.st_size)) == NULL) goto done;
+	if (read(fd, *key, sb.st_size) != sb.st_size) goto done;
+	*keylen = sb.st_size;
+	r = 0;
+done:
+	if (fd >= 0) {
+		close(fd);
+	}
+	return r;
 }
 
-int
-rsgcryModename2Mode(char *const __restrict__ modename)
-{
-	if(!strcmp((char*)modename, "ECB")) return GCRY_CIPHER_MODE_ECB;
-	if(!strcmp((char*)modename, "CFB")) return GCRY_CIPHER_MODE_CFB;
-	if(!strcmp((char*)modename, "CBC")) return GCRY_CIPHER_MODE_CBC;
-	if(!strcmp((char*)modename, "STREAM")) return GCRY_CIPHER_MODE_STREAM;
-	if(!strcmp((char*)modename, "OFB")) return GCRY_CIPHER_MODE_OFB;
-	if(!strcmp((char*)modename, "CTR")) return GCRY_CIPHER_MODE_CTR;
-#	ifdef GCRY_CIPHER_MODE_AESWRAP
-	if(!strcmp((char*)modename, "AESWRAP")) return GCRY_CIPHER_MODE_AESWRAP;
-#	endif
-	return GCRY_CIPHER_MODE_NONE;
+static void
+addPadding(osslfile pF, uchar* buf, size_t* plen) {
+	unsigned i;
+	size_t nPad;
+	nPad = (pF->blkLength - *plen % pF->blkLength) % pF->blkLength;
+	DBGPRINTF("libgcry: addPadding %zd chars, blkLength %zd, mod %zd, pad %zd\n",
+		*plen, pF->blkLength, *plen % pF->blkLength, nPad);
+	for (i = 0; i < nPad; ++i)
+		buf[(*plen) + i] = 0x00;
+	(*plen) += nPad;
 }
+
+static void ATTR_NONNULL()
+removePadding(uchar* const buf, size_t* const plen) {
+	const size_t len = *plen;
+	size_t iSrc, iDst;
+
+	iSrc = 0;
+	/* skip to first NUL */
+	while (iSrc < len && buf[iSrc] == '\0') {
+		++iSrc;
+	}
+	iDst = iSrc;
+
+	while (iSrc < len) {
+		if (buf[iSrc] != 0x00)
+			buf[iDst++] = buf[iSrc];
+		++iSrc;
+	}
+
+	*plen = iDst;
+}
+
 static rsRetVal
-eiWriteRec(gcryfile gf, const char *recHdr, size_t lenRecHdr, const char *buf, size_t lenBuf)
+eiWriteRec(osslfile gf, const char *recHdr, size_t lenRecHdr, const char *buf, size_t lenBuf)
 {
 	struct iovec iov[3];
 	ssize_t nwritten, towrite;
@@ -123,7 +148,7 @@ finalize_it:
 }
 
 static rsRetVal
-eiOpenRead(gcryfile gf)
+eiOpenRead(osslfile gf)
 {
 	DEFiRet;
 	gf->fd = open((char*)gf->eiName, O_RDONLY|O_NOCTTY|O_CLOEXEC);
@@ -135,7 +160,7 @@ finalize_it:
 }
 
 static rsRetVal
-eiRead(gcryfile gf)
+eiRead(osslfile gf)
 {
 	ssize_t nRead;
 	DEFiRet;
@@ -158,7 +183,7 @@ finalize_it:
 
 /* returns EOF on any kind of error */
 static int
-eiReadChar(gcryfile gf)
+eiReadChar(osslfile gf)
 {
 	int c;
 
@@ -175,7 +200,7 @@ finalize_it:
 
 
 static rsRetVal
-eiCheckFiletype(gcryfile gf)
+eiCheckFiletype(osslfile gf)
 {
 	char hdrBuf[128];
 	size_t toRead, didRead;
@@ -207,7 +232,7 @@ finalize_it:
  * returns 0 on success or something else on error/EOF
  */
 static rsRetVal
-eiGetRecord(gcryfile gf, char *rectype, char *value)
+eiGetRecord(osslfile gf, char* rectype, char* value)
 {
 	unsigned short i, j;
 	int c;
@@ -237,7 +262,7 @@ finalize_it:
 }
 
 static rsRetVal
-eiGetIV(gcryfile gf, uchar *iv, size_t leniv)
+eiGetIV(osslfile gf, uchar* iv, size_t leniv)
 {
 	char rectype[EIF_MAX_RECTYPE_LEN+1];
 	char value[EIF_MAX_VALUE_LEN+1];
@@ -279,7 +304,7 @@ finalize_it:
 }
 
 static rsRetVal
-eiGetEND(gcryfile gf, off64_t *offs)
+eiGetEND(osslfile gf, off64_t* offs)
 {
 	char rectype[EIF_MAX_RECTYPE_LEN+1];
 	char value[EIF_MAX_VALUE_LEN+1];
@@ -298,7 +323,7 @@ finalize_it:
 }
 
 static rsRetVal
-eiOpenAppend(gcryfile gf)
+eiOpenAppend(osslfile gf)
 {
 	rsRetVal localRet;
 	DEFiRet;
@@ -329,7 +354,7 @@ finalize_it:
 }
 
 static rsRetVal __attribute__((nonnull(2)))
-eiWriteIV(gcryfile gf, const uchar *const iv)
+eiWriteIV(osslfile gf, const uchar* const iv)
 {
 	static const char hexchars[16] =
 	   {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
@@ -357,7 +382,7 @@ finalize_it:
  * no matter what happens.
  */
 static void
-eiClose(gcryfile gf, off64_t offsLogfile)
+eiClose(osslfile gf, off64_t offsLogfile)
 {
 	char offs[21];
 	size_t len;
@@ -368,7 +393,7 @@ eiClose(gcryfile gf, off64_t offsLogfile)
 		len = snprintf(offs, sizeof(offs), "%lld", (long long) offsLogfile);
 		eiWriteRec(gf, "END:", 4, offs, len);
 	}
-	gcry_cipher_close(gf->chd);
+	EVP_CIPHER_CTX_free(gf->chd);
 	free(gf->readBuf);
 	close(gf->fd);
 	gf->fd = -1;
@@ -380,18 +405,18 @@ eiClose(gcryfile gf, off64_t offsLogfile)
  * to read the next block in this case.
  */
 rsRetVal
-gcryfileGetBytesLeftInBlock(gcryfile gf, ssize_t *left)
+osslfileGetBytesLeftInBlock(osslfile gf, ssize_t* left)
 {
 	DEFiRet;
 	if(gf->bytesToBlkEnd == 0) {
-		DBGPRINTF("libgcry: end of current crypto block\n");
-		gcry_cipher_close(gf->chd);
-		CHKiRet(rsgcryBlkBegin(gf));
+		DBGPRINTF("libossl: end of current crypto block\n");
+		EVP_CIPHER_CTX_free(gf->chd);
+		CHKiRet(rsosslBlkBegin(gf));
 	}
 	*left = gf->bytesToBlkEnd;
 finalize_it:
 	// TODO: remove once this code is sufficiently well-proven
-	DBGPRINTF("gcryfileGetBytesLeftInBlock returns %lld, iRet %d\n", (long long) *left, iRet);
+	DBGPRINTF("osslfileGetBytesLeftInBlock returns %lld, iRet %d\n", (long long) *left, iRet);
 	RETiRet;
 }
 
@@ -401,25 +426,26 @@ finalize_it:
  * of "all" state files, which currently happens to be a single one.
  */
 rsRetVal
-gcryfileDeleteState(uchar *logfn)
+osslfileDeleteState(uchar *logfn)
 {
 	char fn[MAXFNAME+1];
 	DEFiRet;
 	snprintf(fn, sizeof(fn), "%s%s", logfn, ENCINFO_SUFFIX);
 	fn[MAXFNAME] = '\0'; /* be on save side */
-	DBGPRINTF("crypto provider deletes state file '%s' on request\n", fn);
+	DBGPRINTF("ossl crypto provider deletes state file '%s' on request\n", fn);
 	unlink(fn);
 	RETiRet;
 }
 
 static rsRetVal
-gcryfileConstruct(gcryctx ctx, gcryfile *pgf, uchar *logfn)
+osslfileConstruct(osslctx ctx, osslfile* pgf, uchar* logfn)
 {
 	char fn[MAXFNAME+1];
-	gcryfile gf;
+	osslfile gf;
 	DEFiRet;
 
-	CHKmalloc(gf = calloc(1, sizeof(struct gcryfile_s)));
+	CHKmalloc(gf = calloc(1, sizeof(struct osslfile_s)));
+	CHKmalloc(gf->chd = EVP_CIPHER_CTX_new());
 	gf->ctx = ctx;
 	gf->fd = -1;
 	snprintf(fn, sizeof(fn), "%s%s", logfn, ENCINFO_SUFFIX);
@@ -431,26 +457,27 @@ finalize_it:
 }
 
 
-gcryctx
-gcryCtxNew(void)
+osslctx
+osslCtxNew(void)
 {
-	gcryctx ctx;
-	ctx = calloc(1, sizeof(struct gcryctx_s));
-	if(ctx != NULL) {
-		ctx->algo = GCRY_CIPHER_AES128;
-		ctx->mode = GCRY_CIPHER_MODE_CBC;
+	osslctx ctx;
+	ctx = calloc(1, sizeof(struct osslctx_s));
+	if (ctx != NULL) {
+		ctx->cipher = EVP_aes_128_cbc();
+		ctx->key = NULL;
+		ctx->keyLen = -1;
 	}
 	return ctx;
 }
 
 int
-gcryfileDestruct(gcryfile gf, off64_t offsLogfile)
+osslfileDestruct(osslfile gf, off64_t offsLogfile)
 {
 	int r = 0;
 	if(gf == NULL)
 		goto done;
 
-	DBGPRINTF("libgcry: close file %s\n", gf->eiName);
+	DBGPRINTF("libossl: close file %s\n", gf->eiName);
 	eiClose(gf, offsLogfile);
 	if(gf->bDeleteOnClose) {
 		DBGPRINTF("unlink file '%s' due to bDeleteOnClose set\n", gf->eiName);
@@ -458,10 +485,12 @@ gcryfileDestruct(gcryfile gf, off64_t offsLogfile)
 	}
 	free(gf->eiName);
 	free(gf);
-done:	return r;
+done:
+	return r;
 }
+
 void
-rsgcryCtxDel(gcryctx ctx)
+rsosslCtxDel(osslctx ctx)
 {
 	if(ctx != NULL) {
 		free(ctx->key);
@@ -469,51 +498,17 @@ rsgcryCtxDel(gcryctx ctx)
 	}
 }
 
-static void
-addPadding(gcryfile pF, uchar *buf, size_t *plen)
-{
-	unsigned i;
-	size_t nPad;
-	nPad = (pF->blkLength - *plen % pF->blkLength) % pF->blkLength;
-	DBGPRINTF("libgcry: addPadding %zd chars, blkLength %zd, mod %zd, pad %zd\n",
-		  *plen, pF->blkLength, *plen % pF->blkLength, nPad);
-	for(i = 0 ; i < nPad ; ++i)
-		buf[(*plen)+i] = 0x00;
-	(*plen)+= nPad;
-}
-
-static void ATTR_NONNULL()
-removePadding(uchar *const buf, size_t *const plen)
-{
-	const size_t len = *plen;
-	size_t iSrc, iDst;
-
-	iSrc = 0;
-	/* skip to first NUL */
-	while(iSrc < len && buf[iSrc] == '\0') {
-		++iSrc;
-	}
-	iDst = iSrc;
-
-	while(iSrc < len) {
-		if(buf[iSrc] != 0x00)
-			buf[iDst++] = buf[iSrc];
-		++iSrc;
-	}
-
-	*plen = iDst;
-}
 
 /* returns 0 on succes, positive if key length does not match and key
  * of return value size is required.
  */
 int
-rsgcrySetKey(gcryctx ctx, unsigned char *key, uint16_t keyLen)
+rsosslSetKey(osslctx ctx, unsigned char *key, uint16_t keyLen)
 {
 	uint16_t reqKeyLen;
 	int r;
 
-	reqKeyLen = gcry_cipher_get_algo_keylen(ctx->algo);
+	reqKeyLen = EVP_CIPHER_get_key_length(ctx->cipher);
 	if(keyLen != reqKeyLen) {
 		r = reqKeyLen;
 		goto done;
@@ -522,35 +517,22 @@ rsgcrySetKey(gcryctx ctx, unsigned char *key, uint16_t keyLen)
 	ctx->key = malloc(keyLen);
 	memcpy(ctx->key, key, keyLen);
 	r = 0;
-done:	return r;
+done:
+	return r;
 }
 
 rsRetVal
-rsgcrySetMode(gcryctx ctx, uchar *modename)
+rsosslSetAlgoMode(osslctx ctx, uchar *algorithm)
 {
-	int mode;
+	EVP_CIPHER *cipher;
 	DEFiRet;
 
-	mode = rsgcryModename2Mode((char *)modename);
-	if(mode == GCRY_CIPHER_MODE_NONE) {
-		ABORT_FINALIZE(RS_RET_CRY_INVLD_MODE);
-	}
-	ctx->mode = mode;
-finalize_it:
-	RETiRet;
-}
-
-rsRetVal
-rsgcrySetAlgo(gcryctx ctx, uchar *algoname)
-{
-	int algo;
-	DEFiRet;
-
-	algo = rsgcryAlgoname2Algo((char *)algoname);
-	if(algo == GCRY_CIPHER_NONE) {
+	cipher = EVP_CIPHER_fetch(NULL, (char *)algorithm, NULL);
+	if (cipher == NULL) {
 		ABORT_FINALIZE(RS_RET_CRY_INVLD_ALGO);
 	}
-	ctx->algo = algo;
+	ctx->cipher = cipher;
+
 finalize_it:
 	RETiRet;
 }
@@ -565,7 +547,7 @@ static rsRetVal
 #if defined(__clang__)
 __attribute__((no_sanitize("shift"))) /* IV shift causes known overflow */
 #endif
-seedIV(gcryfile gf, uchar **iv)
+seedIV(osslfile gf, uchar **iv)
 {
 	long rndnum = 0; /* keep compiler happy -- this value is always overriden */
 	DEFiRet;
@@ -583,7 +565,7 @@ finalize_it:
 }
 
 static rsRetVal
-readIV(gcryfile gf, uchar **iv)
+readIV(osslfile gf, uchar **iv)
 {
 	rsRetVal localRet;
 	DEFiRet;
@@ -615,7 +597,7 @@ finalize_it:
  * implementations. -- gerhards, 2013-05-16
  */
 static rsRetVal
-readBlkEnd(gcryfile gf)
+readBlkEnd(osslfile gf)
 {
 	off64_t blkEnd;
 	DEFiRet;
@@ -634,46 +616,56 @@ finalize_it:
 }
 
 
-/* Read the block begin metadata and set our state variables accordingly. Can also
- * be used to init the first block in write case.
+
+/* module-init dummy for potential later use */
+int
+rsosslInit(void)
+{
+	return 0;
+}
+
+/* module-deinit dummy for potential later use */
+void
+rsosslExit(void)
+{
+	return;
+}
+
+/* Read the block begin metadata and set our state variables accordingly.
+ * Can also be used to init the first block in write case.
  */
 static rsRetVal
-rsgcryBlkBegin(gcryfile gf)
-{
-	gcry_error_t gcryError;
-	uchar *iv = NULL;
+rsosslBlkBegin(osslfile gf) {
+	uchar* iv = NULL;
 	DEFiRet;
 	const char openMode = gf->openMode;
+	// FIXME error handling
 
-	gcryError = gcry_cipher_open(&gf->chd, gf->ctx->algo, gf->ctx->mode, 0);
-	if (gcryError) {
-		DBGPRINTF("gcry_cipher_open failed:  %s/%s\n",
-			gcry_strsource(gcryError), gcry_strerror(gcryError));
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	gcryError = gcry_cipher_setkey(gf->chd, gf->ctx->key, gf->ctx->keyLen);
-	if (gcryError) {
-		DBGPRINTF("gcry_cipher_setkey failed:  %s/%s\n",
-			gcry_strsource(gcryError), gcry_strerror(gcryError));
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	if(openMode == 'r') {
+	if (openMode == 'r') {
 		readIV(gf, &iv);
 		readBlkEnd(gf);
 	} else {
 		CHKiRet(seedIV(gf, &iv));
 	}
 
-	gcryError = gcry_cipher_setiv(gf->chd, iv, gf->blkLength);
-	if (gcryError) {
-		DBGPRINTF("gcry_cipher_setiv failed:  %s/%s\n",
-			gcry_strsource(gcryError), gcry_strerror(gcryError));
+	if (openMode == 'r') {
+		if ((iRet = EVP_DecryptInit_ex(gf->chd, gf->ctx->cipher, NULL, gf->ctx->key, iv)) != 1) {
+			DBGPRINTF("EVP_DecryptInit_ex failed:  %d\n", iRet);
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+	} else {
+		if ((iRet = EVP_EncryptInit_ex(gf->chd, gf->ctx->cipher, NULL, gf->ctx->key, iv)) != 1){
+			DBGPRINTF("EVP_EncryptInit_ex failed:  %d\n", iRet);
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+	}
+
+	if ((iRet = EVP_CIPHER_CTX_set_padding(gf->chd, 0)) != 1) {
+		fprintf(stderr, "EVP_CIPHER_set_padding failed:  %d\n", iRet);
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
-	if(openMode == 'w') {
+	if (openMode == 'w') {
 		CHKiRet(eiOpenAppend(gf));
 		CHKiRet(eiWriteIV(gf, iv));
 	}
@@ -683,84 +675,62 @@ finalize_it:
 }
 
 rsRetVal
-rsgcryInitCrypt(gcryctx ctx, gcryfile *pgf, uchar *fname, char openMode)
-{
-	gcryfile gf = NULL;
+rsosslInitCrypt(osslctx ctx, osslfile* pgf, uchar* fname, char openMode) {
+	osslfile gf = NULL;
 	DEFiRet;
 
-	CHKiRet(gcryfileConstruct(ctx, &gf, fname));
+	CHKiRet(osslfileConstruct(ctx, &gf, fname));
 	gf->openMode = openMode;
-	gf->blkLength = gcry_cipher_get_algo_blklen(ctx->algo);
-	CHKiRet(rsgcryBlkBegin(gf));
+	gf->blkLength = EVP_CIPHER_get_block_size(ctx->cipher);
+	CHKiRet(rsosslBlkBegin(gf));
 	*pgf = gf;
 finalize_it:
-	if(iRet != RS_RET_OK && gf != NULL)
-		gcryfileDestruct(gf, -1);
+	if (iRet != RS_RET_OK && gf != NULL)
+		osslfileDestruct(gf, -1);
 	RETiRet;
 }
 
 rsRetVal
-rsgcryEncrypt(gcryfile pF, uchar *buf, size_t *len)
-{
-	int gcryError;
+rsosslDecrypt(osslfile pF, uchar* buf, size_t* len) {
 	DEFiRet;
+	int rc;
 
-	if(*len == 0)
-		FINALIZE;
-
-	addPadding(pF, buf, len);
-	gcryError = gcry_cipher_encrypt(pF->chd, buf, *len, NULL, 0);
-	if(gcryError) {
-		dbgprintf("gcry_cipher_encrypt failed:  %s/%s\n",
-			gcry_strsource(gcryError),
-			gcry_strerror(gcryError));
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-finalize_it:
-	RETiRet;
-}
-
-/* TODO: handle multiple blocks
- * test-read END record; if present, store offset, else unbounded (current active block)
- * when decrypting, check if bound is reached. If yes, split into two blocks, get new IV for
- * second one.
- */
-rsRetVal
-rsgcryDecrypt(gcryfile pF, uchar *buf, size_t *len)
-{
-	gcry_error_t gcryError;
-	DEFiRet;
-
-	if(pF->bytesToBlkEnd != -1)
+	if (pF->bytesToBlkEnd != -1)
 		pF->bytesToBlkEnd -= *len;
-	gcryError = gcry_cipher_decrypt(pF->chd, buf, *len, NULL, 0);
-	if(gcryError) {
-		DBGPRINTF("gcry_cipher_decrypt failed:  %s/%s\n",
-			gcry_strsource(gcryError),
-			gcry_strerror(gcryError));
+	rc = EVP_DecryptUpdate(pF->chd, buf, (int *)len, buf, (int) *len);
+	if (rc != 1) {
+		DBGPRINTF("EVP_DecryptUpdate failed\n");
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 	removePadding(buf, len);
-	// TODO: remove dbgprintf once things are sufficently stable -- rgerhards, 2013-05-16
-	dbgprintf("libgcry: decrypted, bytesToBlkEnd %lld, buffer is now '%50.50s'\n",
-		(long long) pF->bytesToBlkEnd, buf);
+
+	dbgprintf("libossl: decrypted, bytesToBlkEnd %lld, buffer is now '%50.50s'\n",
+		(long long)pF->bytesToBlkEnd, buf);
 
 finalize_it:
 	RETiRet;
 }
 
+rsRetVal
+rsosslEncrypt(osslfile pF, uchar* buf, size_t* len) {
+	DEFiRet;
+	int tmplen;
 
+	if (*len == 0)
+		FINALIZE;
 
-/* module-init dummy for potential later use */
-int
-rsgcryInit(void)
-{
-	return 0;
-}
+	addPadding(pF, buf, len);
+	if (EVP_EncryptUpdate(pF->chd, buf, (int *)len, buf, (int) *len) != 1) {
+		dbgprintf("EVP_EncryptUpdate failed\n");
+		ABORT_FINALIZE(RS_RET_CRYPROV_ERR);
+	}
 
-/* module-deinit dummy for potential later use */
-void
-rsgcryExit(void)
-{
-	return;
+	if (EVP_EncryptFinal_ex(pF->chd, buf + *len, &tmplen) != 1) {
+		dbgprintf("EVP_EncryptFinal_ex failed\n");
+		ABORT_FINALIZE(RS_RET_CRYPROV_ERR);
+	}
+	*len += tmplen;
+
+finalize_it:
+	RETiRet;
 }

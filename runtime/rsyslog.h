@@ -54,6 +54,11 @@
 		#pragma GCC diagnostic ignored "-Wjump-misses-init"
 	#endif /* if __GNUC__ >= 8 */
 
+	#if defined(__clang__)
+		#define ATTR_NO_SANITIZE_UNDEFINED __attribute__((no_sanitize("undefined")))
+	#else
+		#define ATTR_NO_SANITIZE_UNDEFINED
+	#endif
 	/* define a couple of attributes to improve cross-platform builds */
 	#if __GNUC__ > 6
 		#define CASE_FALLTHROUGH __attribute__((fallthrough));
@@ -104,18 +109,26 @@
 						_Pragma("GCC diagnostic ignored \"-Wexpansion-to-defined\"")
 	#define PRAGMA_IGNORE_Wunknown_warning_option \
 						_Pragma("GCC diagnostic ignored \"-Wunknown-warning-option\"")
-	#define PRAGMA_IGNORE_Wunknown_attribute \
+	#if !defined(__clang__)
+		#define PRAGMA_IGNORE_Wunknown_attribute \
 						_Pragma("GCC diagnostic ignored \"-Wunknown-attribute\"")
+	#else
+		#define PRAGMA_IGNORE_Wunknown_attribute
+	#endif
 	#define PRAGMA_IGNORE_Wformat_nonliteral \
 						_Pragma("GCC diagnostic ignored \"-Wformat-nonliteral\"")
-	#define PRAGMA_IGNORE_Wdeprecated_declarations \
-						_Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
-	#if  __GNUC__ >= 5
+	#if (__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 2) || defined(__clang__)
+		#define PRAGMA_IGNORE_Wdeprecated_declarations \
+			_Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+		#define PRAGMA_IGNORE_Wunused_parameter \
+			_Pragma("GCC diagnostic ignored \"-Wunused-parameter\"")
 		#define PRAGMA_DIAGNOSTIC_PUSH \
 			_Pragma("GCC diagnostic push")
 		#define PRAGMA_DIAGNOSTIC_POP \
 			_Pragma("GCC diagnostic pop")
 	#else
+		#define PRAGMA_IGNORE_Wdeprecated_declarations
+		#define PRAGMA_IGNORE_Wunused_parameter
 		#define PRAGMA_DIAGNOSTIC_PUSH
 		#define PRAGMA_DIAGNOSTIC_POP
 	#endif
@@ -136,6 +149,15 @@
 	#define PRAGMA_DIAGNOSTIC_PUSH
 	#define PRAGMA_DIAGNOSTIC_POP
 #endif
+
+#define NULL_CHECK(ptr) \
+	do { \
+		if(unlikely(ptr == NULL)) { \
+			LogError(0, RS_RET_PROGRAM_ERROR, \
+				"%s:%d: prevented NULL pointer access", __FILE__, __LINE__); \
+			ABORT_FINALIZE(RS_RET_PROGRAM_ERROR); \
+		} \
+	} while(0);
 
 /* ############################################################# *
  * #                 Some constant values                      # *
@@ -608,6 +630,9 @@ enum rsRetVal_				/** return value. All methods return this if not specified oth
 	RS_RET_REDIS_AUTH_FAILED = -2453, /**< redis authentication failure */
 	RS_RET_FAUP_INIT_OPTIONS_FAILED = -2454, /**< could not initialize faup options */
 	RS_RET_LIBCAPNG_ERR = -2455, /**< error during dropping the capabilities */
+	RS_RET_NET_CONN_ABORTED = -2456, /**< error during dropping the capabilities */
+	RS_RET_PROGRAM_ERROR = -2457, /**< rsyslogd internal error, like tried NULL-ptr access */
+	RS_RET_DEBUG = -2458, /**< status messages primarily meant for debugging, no error */
 
 	/* RainerScript error messages (range 1000.. 1999) */
 	RS_RET_SYSVAR_NOT_FOUND = 1001, /**< system variable could not be found (maybe misspelled) */

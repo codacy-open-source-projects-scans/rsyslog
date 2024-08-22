@@ -2,9 +2,9 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-AC_INIT([rsyslog],[8.2408.0.master],[rsyslog@lists.adiscon.com])   # UPDATE on release
+AC_INIT([rsyslog],[8.2410.0.master],[rsyslog@lists.adiscon.com])   # UPDATE on release
 AC_DEFINE(VERSION_YEAR,  24, [year part of real rsyslog version])  # UPDATE on release
-AC_DEFINE(VERSION_MONTH,  8, [month part of real rsyslog version]) # UPDATE on release
+AC_DEFINE(VERSION_MONTH, 10, [month part of real rsyslog version]) # UPDATE on release
 
 AM_INIT_AUTOMAKE([subdir-objects])
 
@@ -1126,6 +1126,25 @@ if test "x$enable_openssl" = "xyes"; then
 fi
 AM_CONDITIONAL(ENABLE_OPENSSL, test x$enable_openssl = xyes)
 
+AC_ARG_ENABLE(openssl_crypto_provider,
+        [AS_HELP_STRING([--enable-opensslcrypto],[Enable openssl crypto provider @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_openssl_crypto_provider="yes" ;;
+          no) enable_openssl_crypto_provider="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-openssl) ;;
+         esac],
+        [enable_openssl_crypto_provider=no]
+)
+if test "x$enable_openssl" = "xyes" && test "x$enable_openssl_crypto_provider" = "xyes"; then
+	AC_CHECK_LIB(
+		[crypto],
+		[EVP_CIPHER_get_block_size],
+		[enable_openssl_crypto_provider="yes"
+		AC_DEFINE([ENABLE_OPENSSL_CRYPTO_PROVIDER], [1], [Indicator that openssl(EVP_CIPHER_get_block_size) is present])
+		],
+		[AC_MSG_WARN([The ossl encryption provider will not be enabled (EVP_CIPHER_get_block_size is missing)])]
+	)
+fi
 
 # GnuTLS support
 AC_ARG_ENABLE(gnutls,
@@ -1197,6 +1216,8 @@ if test "x$enable_libgcrypt" = "xyes"; then
 	AC_DEFINE([ENABLE_LIBGCRYPT], [1], [Indicator that LIBGCRYPT is present])
 fi
 AM_CONDITIONAL(ENABLE_LIBGCRYPT, test x$enable_libgcrypt = xyes)
+AM_CONDITIONAL(ENABLE_RSCRYUTIL, test x$enable_libgcrypt = xyes || test x$enable_openssl_crypto_provider = xyes)
+AM_CONDITIONAL(ENABLE_OPENSSL_CRYPTO_PROVIDER, test x$enable_openssl_crypto_provider = xyes)
 AC_SUBST(LIBGCRYPT_CFLAGS)
 AC_SUBST(LIBGCRYPT_LIBS)
 
@@ -2954,7 +2975,8 @@ echo "    have to generate man pages:               $have_to_generate_man_pages"
 echo "    Unlimited select() support enabled:       $enable_unlimited_select"
 echo "    uuid support enabled:                     $enable_uuid"
 echo "    Log file signing support via KSI LS12:    $enable_ksi_ls12"
-echo "    Log file encryption support:              $enable_libgcrypt"
+echo "    Log file gcry encryption support:         $enable_libgcrypt"
+echo "    Log file ossl encryption support:         $enable_openssl_crypto_provider"
 echo "    Log file compression via zstd support:    $enable_libzstd"
 echo "    anonymization support enabled:            $enable_mmanon"
 echo "    message counting support enabled:         $enable_mmcount"
