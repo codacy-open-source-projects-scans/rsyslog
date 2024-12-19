@@ -1,5 +1,57 @@
 ----------------------------------------------------------------------------------------
-Scheduled Release 8.2412.0 (aka 2024.12) 2024-12-xx
+Scheduled Release 8.2502.0 (aka 2024.12) 2025-02-??
+- 2024-12-04: omazureeventhubs bugfix: URL escaping
+  Some characters were not properly escaped, leading to malfunction on submission.
+----------------------------------------------------------------------------------------
+Scheduled Release 8.2412.0 (aka 2024.12) 2024-12-03
+- 2024-12-02: rainerscript bugfix: do not try to call a function if it does not exist
+  This could previously cause a segfault when the function was called.
+  Thanks to Attila Lakatos for the patch.
+- 2024-12-02: Fix legacy $ActionQueueDiscardMark parameter
+  If the $ActionQueueSize legacy parameter was configured
+  with a much value higher than the default, the queueDiscardMark
+  option was not automatically adjusted to represent 98% of
+  the actual queue size. This caused a misalignment issue,
+  which does not occur when using the RainerScript syntax.
+  Thanks to Attila Lakatos for the patch.
+  Note: We usually do NOT change legacy parameters, but in this case it makes
+  sense to adjust to recent developments.
+- 2024-11-25: improvements in CI system
+  added some support for Ubuntu 24.04 - stil more work to do
+- 2024-11-25: small nitfixes
+  mostly to address nits detected by newer compilers due to CI-system modernization
+- 2024-11-19: core bugfix: potential stability issue with corrupt queue file resolved
+  Thanks to Flos Lonicerae for the patch.
+- 2024-11-19: core bugfix: prevent segfault on use of $ControlCharacterEscapePrefix
+  When this obsolete legacy directive was used, rsyslog most probably segfaulted during
+  startup. This did not affect it's modern counterpart.
+  Thanks to Flos Lonicerae for the patch.
+- 2024-11-14: core bugfix: rsyslog could segfault if immediately stopped during startup
+  systemd restart rsyslog in the early start of OS will let rsyslog segmentation
+  fault. This cmd will send sigTerm to rsylogd, and rsyslogd will handle the
+  signal in rsyslogdDoDie. If the rsyslogd havn't parse the conf, the runConf
+  will be NULL So check the pointer before reference it.
+  see also: https://github.com/rsyslog/rsyslog/issues/5453
+  thanks to Wang Haitao for the patch.
+- 2024-11-14: imhiredis cleanup: fix incorrect variable definitions and missing prototype
+  Thanks to Théo Bertin for the patch.
+- 2024-11-14: config processing bugfix: typo and missing space when file can't be accessed
+  When using the backtick feature with cat and a file that does not exist,
+  an error message is placed where the file content would be. This error
+  message contained a typo in could as well as a missing space between
+  see and error, which have now been fixed.
+  Thanks to Tobias Kantusch for the patch.
+- 2024-11-14: build fix: resolved issue when building on musl
+  Thanks to Quincy Fleming for the patch.
+- 2024-11-14: testbench bugfix: typo caused invalid test file to be used
+  ... which went unnoticed during regular make check runs, but lead to
+  "left-over files after distclean" after make distcheck.
+  This could also potentially be responsible for some flakes that were
+  not fully explainable.
+- 2024-11-14: nsd_ptcp regression fix: remove debugging messages emited to stderr
+  fix regression introduced by 9ac56b286. This spits out a debug message
+  to stderr. That message is removed by this patch here.
+  closes https://github.com/rsyslog/rsyslog/issues/5485
 ----------------------------------------------------------------------------------------
 Scheduled Release 8.2410.0 (aka 2024.10) 2024-10-22
 - network subsystem: improve connection failure error message
