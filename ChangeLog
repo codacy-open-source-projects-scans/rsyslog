@@ -1,14 +1,148 @@
 ----------------------------------------------------------------------------------------
-Scheduled Release 8.2512.0 (aka 2025.10) 2025-12-0?
+Scheduled Release 8.2602.0 (aka 2026.02) 2026-12-??
 - overall improved documentation via a large set of topic updates.
+
+- 2025-12-11: core: stop busy-loop when action disables itself
+  In the field, an action that disables itself could leave workers in a
+  tight retry/commit cycle, pegging a CPU core. This change makes the
+  engine recognize and short-circuit disabled actions promptly, avoiding
+  spin and wasted work.
+  Before/After: disabled action could spin in retry/commit ->
+  disabled action is marked and skipped with a clear return code.
+  Impact: CPU spikes from disabled actions are eliminated. Messages for
+  that action are no longer retried once disabled (unchanged intent).
+  Fixes: https://github.com/rsyslog/rsyslog/issues/5423
+- 2025-12-11: build: Add code coverage targets
+  Add new feature to enable code coverage using gcc, lcov and genhtml
+  Add Makeile targets to run coverage after or during checks
+  Note: full coverage report requires that all tests run on various platforms
+  and must be consolidated. This patch is primarily for focussed checks for
+  specific modules. The rsyslog CI uses codecov application to gain overall
+  insight.
+  Thanks to Théo Bertin for the patch.
+- 2025-12-11: doc: added omelasticsearch TLS doc, which was missing
+- 2025-12-11: core: fix LogError(0, ...) anti-pattern and add guidelines
+  This change improves the consistency and reliability of error logging by
+  removing a common anti-pattern where errno was manually formatted. It
+  also establishes clear coding guidelines to prevent this in the future,
+  enhancing code maintainability.
+  Impact: No user-visible behavior change; internal error logging consistency improved.
+  Refactored LogError(0, ...) calls that used manual rs_strerror_r or
+  strerror formatting to instead pass errno directly to LogError.
+  This allows LogError to handle error string formatting consistently.
+  Affected components include imrelp, omrelp, imdtls,
+  omelasticsearch, and runtime/rsconf.
+  Added doc/source/development/coding_practices/error_logging_with_errno.rst
+  to document this pattern and updated the coding practices index.
+  Fixed a format string error in runtime/rsconf.c discovered during
+  refactoring.
+  Updated runtime/errmsg.h with explicit Doxygen notes for AI agents
+  to use LogError(errno, ...) correctly.
+- 2025-12-11: omdtls: fix incorrect usage of gai_strerror
+  The gai_strerror function was being used to report errors from connect(),
+  which sets errno. This resulted in misleading error messages.
+  Replaced gai_strerror with rs_strerror_r to correctly report system errors.
+  closes https://github.com/rsyslog/rsyslog/issues/5518
+----------------------------------------------------------------------------------------
+Scheduled Release 8.2512.0 (aka 2025.12) 2025-12-09
+- overall improved documentation via a large set of topic updates.
+- 2025-12-05: omhiredis: add TLS support
+  * Add support for TLS in omhiredis
+  * fix(omhiredis): Make redis SSL support user-configurable
+  * fix(omhiredis): Adding SSL variables into conditinal compilation
+  * fix(omhiredis): Ensure both client_cert and client_key are specified together
+  * fix(omhiredis): fix SSL initialization for thread safety
+  * fix(configure.ac): Need hiredis_ssl>=1.0.0
+  Thanks to Jérémie Jourdin, Amine EL AKKANI, frikilax for the patch.
+- 2025-12-04: packaging/docker: add TLS support to collector image
+  Add OpenSSL-based TLS support to the rsyslog collector Docker
+  image, enabling secure log collection over encrypted connections
+  while maintaining full backward compatibility.
+- 2025-12-04: mmsnareparse: make regex trailing search limit configurable
+  Add ignoreTrailingPattern.searchWindow parameter to control the maximum number
+  of characters searched at the end of messages.
+- 2025-12-04: nsd_gtls: fix repeated warnings on connection retry
+  Move loggedWarnings to static storage to ensure missing cert/key/CA warnings are
+  emitted only once per process, preventing log spam on broken connections.
+  Thanks to Attila Lakatos for the patch.
+- 2025-12-02: omuxsock: add NetworkNamespace functionality
+  This builds on "PR#6121 net: Add NetworkNamespace APIS"
+  to add Network Namespace support for omuxsock.  In
+  addition, new functionality is added to support
+  abstract socket names, as well as connected sockets.
+  Changes are isolated to omuxsock to provide the new
+  functionality:
+  a. Abstract unix socket names (including network namespaces)
+  b. Connected socket support (SOCK_STREAM, SOCK_SEQPACKET)
+  c. Support for load, and action configuration
+  d. Bug fix related to closing/reopening sockets
+     This bug would cause the socket to be closed and
+     reopened for every message sent.
+  New tests are added as follows:
+  a. uxsock_multiple.sh tests basic functionality with
+     multiple output instances.
+  b. uxsock_multiple_netns.sh is similar but using
+     multiple namespaces.
+  c. uxsock_simple_abstract.sh mirrors the existing
+     uxsock_simple.sh but tests with abstract socket
+     names.
+  The uxsockrcvr test program was modified to support
+  these new tests.
+  Thanks to Billie Alsup for the patch.
+- 2025-11-28: imtcp: add support for NetworkNamespace
+  This builds on
+    https://github.com/rsyslog/rsyslog/pull/6121
+  to add Network Namespace support to imtcp module. This
+  extends imtcp to support a wider range of Unix/Linux
+  environments (or any environment supporting network
+  namespaces).
+  The imtcp module is enhanced to accept a NetworkNamespace
+  parameter, both as a default at the module level, and
+  on a per-instance basis.
+  The tcpsrv module is enhanced to allow the NetworkNamespace
+  to be applied to a listener's configuration parameters.
+  Finally, the netstrm module is enhanced to switch namespaces
+  before invoking the downstream (driver specific) LstnInit
+  function.
+  A new test imtcp-netns (and associated imtcp-netns-vg) is
+  added to test this functionality.  This must be run as root
+  (technically it must be run by a user with CAP_SYS_ADMIN
+  capabilities, as network namespace creating/change is
+  required).
+  A slight change to diag.sh is made to allow passing $RS_REDIR
+  to valgrind (as $RS_REDIR is used in the imtcp-netns.sh
+  test for some negative cases).
+  Thanks to Billie Alsup for the patch.
 - 2025-11-25: mmanon: fixed data race issue in pseudonymization handling
   Thanks to Jan Gerhards for the patch.
+- 2025-11-24: mmsnareparse: add regex support for trailing data removal
+  Add ignoreTrailingPattern.regex parameter to support POSIX extended regular
+  expressions for dynamic trailing data removal.
+- 2025-11-21: mmsnareparse: add ignoreTrailingPattern parameter
+  Add configurable mechanism to detect and remove trailing extra-data sections
+  from messages before parsing.
+- 2025-11-17: mmsnareparse: add Sysmon event support
+  Add support for Microsoft Sysinternals Sysmon events via an external JSON
+  definition file.
 - 2025-11-12: omhttp: added explicit splunk HEC profile
   permits easier configuration with good defaults.
   Thanks to github user shinigami35 for the patch.
-
---- TODO: check git log, some commits are missing! ---
-
+- 2025-11-07: imkafka: Implement Kafka Metrics and new pstats format
+  * Adapted omkafka pstats counters to the consumer imkafka modules.
+  * Implemented both global (module-level) and local (topic+cg-level) metrics.
+  * Added support for librdkafka metrics and JSON emissions.
+  * Updated impstats to include new format="zabbix" compatible with Zabbix LLD.
+  Thanks to MRedbourne for the patch.
+- 2025-11-03: content_count_check: use optional file argument if provided
+  Thanks to Attila Lakatos for the patch.
+- 2025-10-30: omhttp: Implement optional per destination server stats
+  Thanks to github user shinigami35 for the patch.
+- 2025-10-30: omhiredis: support UDS redis server address
+  Thanks to github user Appla for the patch.
+- 2025-10-29: omelasticsearch: add apikey authentication
+  Add support for APIKEY authentication, which is recommended by Elasticsearch.
+- 2025-10-28: net: Add IP address SAN support
+  Thanks to Sebastien Deronne for the patch.
 - 2025-10-15: ossl bugfix: ensure peer cert is freed in osslChkPeerAuth
   Ensure osslChkPeerAuth starts with a null peer-certificate pointer and
   frees any retrieved X509 certificate so OpenSSL allocations from

@@ -2,11 +2,13 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-AC_INIT([rsyslog],[8.2512.0.main],[rsyslog@lists.adiscon.com])     # UPDATE on release
-AC_DEFINE(VERSION_YEAR,  25, [year part of real rsyslog version])  # UPDATE on release
-AC_DEFINE(VERSION_MONTH, 12, [month part of real rsyslog version]) # UPDATE on release
+AC_INIT([rsyslog],[8.2602.0.daily],[rsyslog@lists.adiscon.com])     # UPDATE on release
+AC_DEFINE(VERSION_YEAR,  26, [year part of real rsyslog version])   # UPDATE on release
+AC_DEFINE(VERSION_MONTH,  2, [month part of real rsyslog version])  # UPDATE on release
 
 AM_INIT_AUTOMAKE([tar-pax subdir-objects])
+
+AM_EXTRA_RECURSIVE_TARGETS([clean-coverage distclean-coverage])
 
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
@@ -806,6 +808,36 @@ AC_ARG_ENABLE(debug_symbols,
         [enable_debug_symbols="yes"]
 )
 
+# coverage
+AC_ARG_ENABLE([coverage],
+        [AS_HELP_STRING([--enable-coverage], [Enable code coverage @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_coverage="yes" ;;
+          no) enable_coverage="no" ;;
+           *) AC_MSG_ERROR([bad value ${enableval} for --enable-coverage]) ;;
+         esac],
+        [enable_coverage="no"]
+)
+if test "$enable_coverage" = "yes"; then
+        AC_CHECK_TOOL([GCOV], [gcov], [no])
+        AS_IF(
+                [test "x$GCOV" = "xno"],
+                [AC_MSG_ERROR([required program "gcov" for code coverage not found])]
+        )
+        AC_CHECK_PROG([LCOV], [lcov], [lcov], [no])
+        AS_IF(
+                [test "x$LCOV" = "xno"],
+                [AC_MSG_ERROR([required program "lcov" for code coverage not found])]
+        )
+        AC_CHECK_PROG([GENHTML], [genhtml], [genhtml], [no])
+        AS_IF(
+                [test "x$GENHTML" = "xno"],
+                [AC_MSG_ERROR([required program "genhtml" for code coverage not found])]
+        )
+        AC_DEFINE([ENABLE_COVERAGE], [1], [Define to 1 if code coverage is enabled.])
+fi
+AM_CONDITIONAL([ENABLE_COVERAGE], [test "x$enable_coverage" = xyes])
+
 
 # total debugless: highest performance, but no way at all to enable debug
 # logging
@@ -1371,6 +1403,10 @@ if test "$GCC" = "yes"; then
   if test "x$enable_debug_symbols" = "xyes"; then
     RSRT_CFLAGS="$RSRT_CFLAGS -g"
   fi
+  if test "x$enable_coverage" = "xyes"; then
+    RSRT_CFLAGS="$RSRT_CFLAGS --coverage -g -O0"
+    LDFLAGS="$LDFLAGS --coverage"
+  fi
 fi
 RSRT_CFLAGS="$RSRT_CFLAGS $WARN_CFLAGS"
 RSRT_LIBS="\$(RSRT_LIBS1) \$(LIBESTR_LIBS) \$(LIBFASTJSON_LIBS) \$(LIBSYSTEMD_LIBS)"
@@ -1475,19 +1511,16 @@ AM_CONDITIONAL(ENABLE_FMHTTP, test x$enable_fmhttp = xyes)
 # imdiag support
 # This is a core testbench tool. You need to enable it if you want to
 # use not only a small subset of the testbench.
+imdiag_user_set=no
 AC_ARG_ENABLE(imdiag,
         [AS_HELP_STRING([--enable-imdiag],[Enable imdiag @<:@default=no@:>@])],
         [case "${enableval}" in
-         yes) enable_imdiag="yes" ;;
-          no) enable_imdiag="no" ;;
+         yes) enable_imdiag="yes"; imdiag_user_set=yes ;;
+          no) enable_imdiag="no"; imdiag_user_set=yes ;;
            *) AC_MSG_ERROR(bad value ${enableval} for --enable-imdiag) ;;
          esac],
         [enable_imdiag=no]
 )
-if test "x$enable_imdiag" = "xyes"; then
-	AC_DEFINE([ENABLE_IMDIAG], [1], [Indicator that IMDIAG is present])
-fi
-AM_CONDITIONAL(ENABLE_IMDIAG, test x$enable_imdiag = xyes)
 
 
 # mmnormalize
@@ -2298,27 +2331,41 @@ AC_ARG_ENABLE(omsendertrack,
 )
 AM_CONDITIONAL(ENABLE_OMSENDERTRACK, test x$enable_omsendertrack = xyes)
 
+omstdout_user_set=no
 # settings for omstdout
 AC_ARG_ENABLE(omstdout,
         [AS_HELP_STRING([--enable-omstdout],[Compiles stdout module @<:@default=no@:>@])],
         [case "${enableval}" in
-         yes) enable_omstdout="yes" ;;
-          no) enable_omstdout="no" ;;
+         yes) enable_omstdout="yes"; omstdout_user_set=yes ;;
+          no) enable_omstdout="no"; omstdout_user_set=yes ;;
            *) AC_MSG_ERROR(bad value ${enableval} for --enable-omstdout) ;;
          esac],
         [enable_omstdout=no]
 )
-AM_CONDITIONAL(ENABLE_OMSTDOUT, test x$enable_omstdout = xyes)
 
-AM_CONDITIONAL(ENABLE_TESTBENCH, test x$enable_testbench = xyes)
 if test "x$enable_testbench" = "xyes"; then
 	if test "x$enable_imdiag" != "xyes"; then
-		AC_MSG_ERROR("--enable-testbench requires --enable-imdiag")
+		if test "x$imdiag_user_set" = "xyes"; then
+			AC_MSG_ERROR([--enable-testbench conflicts with --disable-imdiag])
+		fi
+		AC_MSG_NOTICE([--enable-testbench auto-enabling imdiag])
+		enable_imdiag="yes"
 	fi
 	if test "x$enable_omstdout" != "xyes"; then
-		AC_MSG_ERROR("--enable-testbench requires --enable-omstdout")
+		if test "x$omstdout_user_set" = "xyes"; then
+			AC_MSG_ERROR([--enable-testbench conflicts with --disable-omstdout])
+		fi
+		AC_MSG_NOTICE([--enable-testbench auto-enabling omstdout])
+		enable_omstdout="yes"
 	fi
 fi
+
+if test "x$enable_imdiag" = "xyes"; then
+	AC_DEFINE([ENABLE_IMDIAG], [1], [Indicator that IMDIAG is present])
+fi
+AM_CONDITIONAL(ENABLE_IMDIAG, test x$enable_imdiag = xyes)
+AM_CONDITIONAL(ENABLE_OMSTDOUT, test x$enable_omstdout = xyes)
+AM_CONDITIONAL(ENABLE_TESTBENCH, test x$enable_testbench = xyes)
 
 
 # settings for omjournal
@@ -2514,9 +2561,27 @@ AC_ARG_ENABLE(omhdfs,
         [enable_omhdfs=no]
 )
 if test "x$enable_omhdfs"; then
-	AC_CHECK_HEADERS([hdfs.h hadoop/hdfs.h])
+        AC_CHECK_HEADERS([hdfs.h hadoop/hdfs.h])
 fi
 AM_CONDITIONAL(ENABLE_OMHDFS, test x$enable_omhdfs = xyes)
+
+AC_ARG_ENABLE(omotlp,
+        [AS_HELP_STRING([--enable-omotlp],[Enable OpenTelemetry output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omotlp="yes" ;;
+          no) enable_omotlp="no" ;;
+            *) AC_MSG_ERROR(bad value ${enableval} for --enable-omotlp) ;;
+         esac],
+        [enable_omotlp=no]
+)
+OMOTLP_HTTP_CFLAGS=""
+OMOTLP_HTTP_LIBS=""
+if test "x$enable_omotlp" = "xyes"; then
+        PKG_CHECK_MODULES([OMOTLP_HTTP], [libcurl libfastjson])
+fi
+AC_SUBST([OMOTLP_HTTP_CFLAGS])
+AC_SUBST([OMOTLP_HTTP_LIBS])
+AM_CONDITIONAL(ENABLE_OMOTLP, test x$enable_omotlp = xyes)
 
 # support for kafka input output
 AC_ARG_ENABLE(omkafka,
@@ -2860,6 +2925,16 @@ AC_ARG_ENABLE(redis_tests,
 )
 AM_CONDITIONAL(ENABLE_REDIS_TESTS, test x$enable_redis_tests = xyes)
 
+AC_ARG_ENABLE(redis_ssl,
+        [AS_HELP_STRING([--enable-redis-ssl],[Enable redis ssl support @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_redis_ssl="yes" ;;
+          no) enable_redis_ssl="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-redis-ssl) ;;
+         esac],
+        [enable_redis_ssl=no]
+)
+
 if test "x$enable_omhiredis" = "xyes" -o "x$enable_imhiredis" = "xyes" ; then
     PKG_CHECK_MODULES(HIREDIS, hiredis >= 0.10.1, [],
         [AC_SEARCH_LIBS(redisConnectWithTimeout, hiredis,
@@ -2884,6 +2959,39 @@ if test "x$enable_omhiredis" = "xyes" -o "x$enable_imhiredis" = "xyes" ; then
             [AC_MSG_ERROR([hiredis not found])]
         )]
     )
+        if test "x$enable_redis_ssl" = "xyes"; then
+                PKG_CHECK_MODULES(HIREDIS_SSL, hiredis_ssl >= 1.0.0,
+                        # hiredis_ssl found using pkg-config
+                        [
+                        AC_DEFINE(HIREDIS_SSL, 1, [TLS support enabled in hiredis])
+                        ],
+                        # hiredis_ssl not found with pkg-static, searching for it manually
+                        [AC_SEARCH_LIBS(redisCreateSSLContext, hiredis_ssl,
+                        [AC_COMPILE_IFELSE(
+                                [AC_LANG_PROGRAM(
+                                [[ #include <hiredis/hiredis.h>
+                                #include <hiredis/hiredis_ssl.h>
+                                ]],
+                                [[ #define major 1
+                                #define minor 0
+                                #define patch 0
+                                #if (( HIREDIS_MAJOR > major ) || \
+                                        (( HIREDIS_MAJOR == major ) && ( HIREDIS_MINOR > minor )) || \
+                                        (( HIREDIS_MAJOR == major ) && ( HIREDIS_MINOR == minor ) && ( HIREDIS_PATCH >= patch ))) \
+                                /* OK */
+                                #else
+                                # error Hiredis version must be >= major.minor.path for SSL support
+                                #endif
+                                ]]
+                                )],
+                                [],
+                                [AC_MSG_ERROR([hiredis version must be >= 1.0.0 for SSL support])]
+                        )],
+                        [AC_MSG_ERROR([hiredis_ssl not found, no TLS support in hiredis])]
+                        )]
+                )
+        fi
+
 fi
 
 if test "x$enable_imhiredis" = "xyes" ; then
@@ -2894,6 +3002,7 @@ if test "x$enable_imhiredis" = "xyes" ; then
         ],
         # libevent not found
         [AC_MSG_ERROR([no libevent >= 2.0 found with pthreads support, imhiredis cannot use pub/sub])])
+
 fi
 
 if test "x$enable_imhiredis" = "xyes" || test "x$enable_omhiredis" = "xyes"; then
@@ -3086,52 +3195,6 @@ if test "x$have_to_generate_man_pages" = "xyes" && test "x$RST2MAN" = "xfalse"; 
         AC_MSG_ERROR([rst2man is required when building from git source or --enable-generate-man-pages option was set, please install python-docutils.])
 fi
 
-
-dnl ---- gather doc files for EXTRA_DIST ----
-# .rst files and selected assets from doc/source
-doc_src_files=`cd "$srcdir" && find doc/source -type f \( -name '*.rst' -o -name '*.conf' -o -name '*.jpg' -o -name '*.png' \) -print 2>/dev/null | LC_ALL=C sort`
-
-# Additional doc assets that must be shipped in dist tarball
-# - Vendored static JS/CSS used by the docs
-doc_vendor_files=`cd "$srcdir" && find doc/source/_static/vendor -type f -print 2>/dev/null | LC_ALL=C sort`
-# - Documentation build helper scripts and tools
-doc_tools_files=`cd "$srcdir" && find doc/tools -type f -print 2>/dev/null | LC_ALL=C sort`
-
-# assemble; keep paths relative to top (we cd into $srcdir above)
-DOC_FILES="$doc_src_files
-$doc_vendor_files
-$doc_tools_files
-doc/source/conf.py
-doc/source/conf_helpers.py
-doc/source/_ext/edit_on_github.py
-doc/source/_ext/rsyslog_lexer.py
-doc/source/_static/rsyslog.css
-doc/source/tutorials/cert-script.tar.gz
-doc/ai/structure_and_paths.md
-doc/ai/authoring_guidelines.md
-doc/ai/chunking_and_embeddings.md
-doc/ai/crosslinking_and_nav.md
-doc/ai/drift_monitoring.md
-doc/ai/mermaid_rules.md
-doc/ai/README.md
-doc/ai/templates/template-concept.rst
-doc/ai/templates/template-tutorial.rst
-doc/ai/terminology.md
-doc/ai/module_map.yaml
-doc/requirements.txt
-doc/README.md
-doc/STRATEGY.md
-doc/CONTRIBUTING.md
-doc/LICENSE
-doc/Makefile
-$ai_files"
-
-# collapse newlines and extra whitespace to single spaces
-DOC_FILES=`printf "%s\n" "$DOC_FILES" | awk 'NF' | tr '\n' ' '`
-
-AC_SUBST([DOC_FILES])
-
-
 AC_CONFIG_FILES([Makefile \
 		runtime/Makefile \
 		compat/Makefile \
@@ -3145,8 +3208,9 @@ AC_CONFIG_FILES([Makefile \
 		plugins/imjournal/Makefile \
 		plugins/immark/Makefile \
 		plugins/imklog/Makefile \
-		plugins/omhdfs/Makefile \
-		plugins/omkafka/Makefile \
+                plugins/omhdfs/Makefile \
+                plugins/omotlp/Makefile \
+                plugins/omkafka/Makefile \
 		plugins/omprog/Makefile \
 		plugins/mmexternal/Makefile \
 		plugins/omstdout/Makefile \
@@ -3294,6 +3358,7 @@ echo "    omstdout module will be compiled:         $enable_omstdout"
 echo "    omsendertrack module will be compiled:    $enable_omsendertrack"
 echo "    omjournal module will be compiled:        $enable_omjournal"
 echo "    omhdfs module will be compiled:           $enable_omhdfs"
+echo "    omotlp module will be compiled:           $enable_omotlp"
 echo "    omelasticsearch module will be compiled:  $enable_elasticsearch"
 echo "    omclickhouse module will be compiled:     $enable_clickhouse"
 echo "    omhttp module will be compiled:           $enable_omhttp"
@@ -3359,6 +3424,7 @@ echo "    Mbed TLS network stream driver enabled:   $enable_mbedtls"
 echo "    GSSAPI Kerberos 5 support enabled:        $enable_gssapi_krb5"
 echo "    RELP support enabled:                     $enable_relp"
 echo "    SNMP support enabled:                     $enable_snmp"
+echo "    redis ssl support enabled:                $enable_redis_ssl"
 echo
 echo "---{ function modules }---"
 echo "    fmhttp enabled:                           $enable_fmhttp"
@@ -3395,4 +3461,5 @@ echo "    (total) debugless mode enabled:           $enable_debugless"
 echo "    Diagnostic tools enabled:                 $enable_diagtools"
 echo "    End-User tools enabled:                   $enable_usertools"
 echo "    Valgrind support settings enabled:        $enable_valgrind"
+echo "    Code coverage using gcov/lcov enabled:    $enable_coverage"
 echo
