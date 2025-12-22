@@ -109,7 +109,7 @@ When the user says the codeword "BUILD" optionally followed by configure options
 Examples:
 - `BUILD` - Uses default testbench configuration
 - `BUILD --enable-testbench --enable-mmsnareparse` - Custom configuration with mmsnareparse module
-- `BUILD --enable-testbench --enable-imdiag --enable-omstdout --enable-mmsnareparse --enable-omotlp` - Multiple modules
+- `BUILD --enable-testbench --enable-imdiag --enable-omstdout --enable-mmsnareparse --enable-omotel` - Multiple modules
 
 ### `TEST [test-script-names]`
 
@@ -240,6 +240,16 @@ When fixing compiler warnings like `stringop-overread`, explain in the commit me
 
 -----
 
+## Defensive Coding and Assertions
+
+Use `assert()` to signal "impossible" states to Static Analyzers and AI agents. Whenever feasible and low-complexity, follow with a defensive `if` check to prevent production crashes. See [Defensive Coding Practice](doc/source/development/coding_practices/defensive_coding.rst) for full details.
+
+- **Mandatory**: `assert()` for invariants (allows SA/AI to reason about code).
+- **Recommended**: Defensive `if` check (optional if fallback logic is excessively complex).
+- **Prohibited**: `__builtin_unreachable()` (causes Undefined Behavior).
+
+-----
+
 ## Editor & Formatting Configuration
 
 The repository includes:
@@ -303,6 +313,17 @@ Avoiding the harness matters because `make check`:
   - Consumes significant resources on large suites
 
 Instead, AI agents should invoke individual test scripts directly. This yields unfiltered output and immediate feedback, without the CI harness. The `diag.sh` framework now builds any required test support automatically, so there is **no longer** a need for a separate “build core components” step.
+
+-----
+
+## Documentation Requirements
+
+When introducing new configuration parameters, features, or significant behavior changes, you **must** update the user-facing documentation in the `doc/` subtree.
+
+1.  **Locate the relevant guide**: Most module documentation is in `doc/source/configuration/modules/<module>.rst`.
+2.  **Update parameter references**: If adding a parameter, create or update the corresponding file in `doc/source/reference/parameters/` and include it in the module's `.rst` file.
+3.  **Cross-link**: Ensure new documentation is discoverable from the module's main page and appropriate `index.rst`.
+4.  **Validate**: If possible, run `./doc/tools/build-doc-linux.sh --clean --format html` to catch Sphinx errors.
 
 -----
 
@@ -397,7 +418,7 @@ touch /tmp/rsyslog_base_env.flag
    # For multiple modules:
    ./configure --enable-testbench --enable-imdiag --enable-omstdout \
        --enable-mmsnareparse \
-       --enable-omotlp \
+       --enable-omotel \
        --enable-imhttp
    ```
 

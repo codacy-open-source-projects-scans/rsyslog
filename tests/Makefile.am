@@ -1057,15 +1057,15 @@ TESTS +=  \
 endif
 endif
 
-if ENABLE_OMOTLP
+if ENABLE_OMOTEL
 TESTS += \
-        omotlp-http-batch.sh \
-        omotlp-basic.sh \
-        omotlp-batch.sh \
-        omotlp-compression.sh \
-        omotlp-proxy.sh \
-        omotlp-tls.sh \
-        omotlp-trace-correlation.sh
+        omotel-http-batch.sh \
+        omotel-basic.sh \
+        omotel-batch.sh \
+        omotel-compression.sh \
+        omotel-proxy.sh \
+        omotel-tls.sh \
+        omotel-trace-correlation.sh
 endif
 
 if ENABLE_OMKAFKA
@@ -1277,6 +1277,8 @@ endif # ENABLE_REDIS_TESTS
 if ENABLE_IMPSTATS
 TESTS +=  \
 	impstats-hup.sh \
+	impstats-overwrite.sh \
+	impstats-no-overwrite.sh \
 	perctile-simple.sh \
 	dynstats.sh \
 	dynstats_overflow.sh \
@@ -3163,6 +3165,8 @@ EXTRA_DIST= \
 	dynstats_reset.sh \
 	dynstats_reset-vg.sh \
 	impstats-hup.sh \
+	impstats-overwrite.sh \
+	impstats-no-overwrite.sh \
 	dynstats.sh \
 	dynstats-vg.sh \
 	dynstats_prevent_premature_eviction.sh \
