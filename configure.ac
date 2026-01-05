@@ -93,7 +93,7 @@ fi
 # modules we require
 PKG_CHECK_MODULES(LIBESTR, libestr >= 0.1.9)
 
-PKG_CHECK_MODULES([LIBFASTJSON], [libfastjson >= 0.99.8],,)
+PKG_CHECK_MODULES([LIBFASTJSON], [libfastjson >= 0.99.9],,)
 
 AC_DEFINE_UNQUOTED([PLATFORM_ID], ["${host}"], [platform id for display purposes])
 # we don't mind if we don't have the lsb_release utility. But if we have, it's
@@ -245,6 +245,18 @@ AM_CONDITIONAL(ENABLE_INOTIFY, test x$rsyslog_sysinotify = xyes -a x$rsyslog_ino
 
 # getifaddrs is in libc (mostly) or in libsocket (eg Solaris 11) or not defined (eg Solaris 10)
 AC_SEARCH_LIBS([getifaddrs], [socket], [AC_DEFINE(HAVE_GETIFADDRS, [1], [set define])])
+
+AC_CHECK_HEADERS([arpa/nameser.h resolv.h])
+AC_SEARCH_LIBS([ns_initparse], [resolv])
+LIBRESOLV_LIBS=$ac_cv_search_ns_initparse
+AS_CASE([$LIBRESOLV_LIBS],
+        ["none required"], [LIBRESOLV_LIBS=""],
+        ["no"], [LIBRESOLV_LIBS=""])
+AC_SUBST([LIBRESOLV_LIBS])
+AS_IF([test "x$ac_cv_search_ns_initparse" != "xno"],
+      [AC_DEFINE([HAVE_RESOLV_NS_INITPARSE], [1],
+                 [Define if resolver provides ns_initparse])])
+AM_CONDITIONAL([HAVE_SRV_DISCOVERY], [test "x$ac_cv_search_ns_initparse" != "xno"])
 
 # the check below is probably ugly. If someone knows how to do it in a better way, please
 # let me know! -- rgerhards, 2010-10-06

@@ -80,9 +80,12 @@ static rsRetVal doRetry(nsd_ossl_t *pNsd) {
     switch (pNsd->rtryCall) {
         case osslRtry_handshake:
             dbgprintf("doRetry: start osslHandshakeCheck, nsd: %p\n", pNsd);
+            /* Reset retry flag before calling handshake check.
+             * If it needs more retries, it will set it again.
+             */
+            pNsd->rtryCall = osslRtry_None;
             /* Do the handshake again*/
             CHKiRet(osslHandshakeCheck(pNsdOSSL));
-            pNsd->rtryCall = osslRtry_None; /* we are done */
             break;
         case osslRtry_recv:
         case osslRtry_None:
@@ -1404,9 +1407,10 @@ static rsRetVal SetTlsCAFile(nsd_t *pNsd, const uchar *const caFile) {
     nsd_ossl_t *const pThis = (nsd_ossl_t *)pNsd;
 
     ISOBJ_TYPE_assert((pThis), nsd_ossl);
-    if (caFile == NULL) {
-        pThis->pNetOssl->pszCAFile = NULL;
-    } else {
+    free((void *)pThis->pNetOssl->pszCAFile);
+    pThis->pNetOssl->pszCAFile = NULL;
+
+    if (caFile != NULL) {
         CHKmalloc(pThis->pNetOssl->pszCAFile = (const uchar *)strdup((const char *)caFile));
     }
 
@@ -1419,9 +1423,10 @@ static rsRetVal SetTlsCRLFile(nsd_t *pNsd, const uchar *const crlFile) {
     nsd_ossl_t *const pThis = (nsd_ossl_t *)pNsd;
 
     ISOBJ_TYPE_assert((pThis), nsd_ossl);
-    if (crlFile == NULL) {
-        pThis->pNetOssl->pszCRLFile = NULL;
-    } else {
+    free((void *)pThis->pNetOssl->pszCRLFile);
+    pThis->pNetOssl->pszCRLFile = NULL;
+
+    if (crlFile != NULL) {
         CHKmalloc(pThis->pNetOssl->pszCRLFile = (const uchar *)strdup((const char *)crlFile));
     }
 
@@ -1435,9 +1440,10 @@ static rsRetVal SetTlsKeyFile(nsd_t *pNsd, const uchar *const pszFile) {
     nsd_ossl_t *const pThis = (nsd_ossl_t *)pNsd;
 
     ISOBJ_TYPE_assert((pThis), nsd_ossl);
-    if (pszFile == NULL) {
-        pThis->pNetOssl->pszKeyFile = NULL;
-    } else {
+    free((void *)pThis->pNetOssl->pszKeyFile);
+    pThis->pNetOssl->pszKeyFile = NULL;
+
+    if (pszFile != NULL) {
         CHKmalloc(pThis->pNetOssl->pszKeyFile = (const uchar *)strdup((const char *)pszFile));
     }
 
@@ -1450,9 +1456,10 @@ static rsRetVal SetTlsCertFile(nsd_t *pNsd, const uchar *const pszFile) {
     nsd_ossl_t *const pThis = (nsd_ossl_t *)pNsd;
 
     ISOBJ_TYPE_assert((pThis), nsd_ossl);
-    if (pszFile == NULL) {
-        pThis->pNetOssl->pszCertFile = NULL;
-    } else {
+    free((void *)pThis->pNetOssl->pszCertFile);
+    pThis->pNetOssl->pszCertFile = NULL;
+
+    if (pszFile != NULL) {
         CHKmalloc(pThis->pNetOssl->pszCertFile = (const uchar *)strdup((const char *)pszFile));
     }
 

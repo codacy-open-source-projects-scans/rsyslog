@@ -2,6 +2,65 @@
 Scheduled Release 8.2602.0 (aka 2026.02) 2026-12-??
 - overall improved documentation via a large set of topic updates.
 
+- 2026-01-04: lookup_table: fix issue with int32 vs. int64
+  There were some issues with int32 overflow, which could lead to improper
+  lookup table returns. This has now been fixed.
+  Thanks to Janmejay Singh for the patch.
+- 2026-01-03: runtime/nsd_ossl.c: fix potential authmode authorization bypass
+  In the `ossl` driver, `doRetry` unconditionally cleared the `rtryCall` state after
+  calling `osslHandshakeCheck`, even if the handshake was still incomplete (e.g.,
+  returning `WANT_READ` and re-setting the retry flag). This caused subsequent receive
+  operations to assume the handshake was finished, potentially bypassing the
+  authorization check (`osslChkPeerAuth`).
+  This change ensures `rtryCall` is reset *before* attempting the handshake, so that
+  if `osslHandshakeCheck` sets it again, the state is preserved. This logic aligns
+  with the intent of the retry mechanism and prevents the bypass.
+  closes https://github.com/rsyslog/rsyslog/issues/6350
+- 2026-01-02: tcpsrv: restore default stack size assignment
+  Worker threads need to be assigned the "rsyslog default stack size".
+  This is especially an issue with musl lib, which has a very small stack
+  size. As such, rsyslog can segfault without specifying our expected
+  Note that the segfault would most probably occur with imtcp when running
+  e.g. under Alpine Linux.
+  stack size.
+  closes https://github.com/rsyslog/rsyslog/issues/6357
+- 2026-01-02: omfwd: add DNS SRV discovery (targetSrv)
+  Simplify large-scale configs by auto-discovering receivers via DNS SRV
+  records. This reduces per-host configuration and helps enterprise and
+  container setups where target pools change over time.
+  Impact: new param `targetSrv`; config now errors on conflicts or empty
+  SRV answers; feature depends on resolver support.
+  closes https://github.com/rsyslog/rsyslog/issues/6314
+- 2026-01-01: net driver ossl: fix ctx double-free and config string leaks
+  This improves stability of the OpenSSL stream driver and prevents
+  occasional aborts seen in the field with rulesets and per-host TLS
+  configuration. It also reduces memory growth during reconfiguration.
+  Impact: Fixes a crash (double-free) and plugs several leaks; no config
+  or API changes.
+  closes: https://github.com/rsyslog/rsyslog/issues/6358
+- 2026-01-01: core, runtime, omfwd: plumb action name into modules and logs
+  Non-technical: actions need to obtain their name for better reporting.
+  This wires a safe way for OMs to learn their owning action and use its
+  human-readable name in diagnostics.
+  Impact: omfwd log messages now include the action name in some errors.
+  Also, a generic internal API has been added to enable actions to obtain
+  their assigned name. The omfwd change is primarily a template of how
+  this can be done (but also useful in itself).
+  With the help of AI Agents: ChatGPT Codex
+- 2025-12-31: imjournal: make PRIORITY parsing robust and quiet
+  Some systems emit journal entries where PRIORITY is not exactly
+  "PRIORITY=X". The previous parser treated multi-byte PRIORITY values
+  as errors and logged for every message, creating the impression of
+  trouble when internal rate limiting kicked in. This also lead users to
+  the false impression that journal messages were lost. The change reduces
+  noise and keeps rsyslog calm in noisy journald environments.
+  Impact: Internal error spam is eliminated; unparsable values fall back
+  to the configured default severity; numeric out-of-range is logged at
+  INFO, not ERROR.
+  Before/After: BEFORE required length==10 and errored on mismatch.
+  AFTER parses the integer from a safe buffer, validates 0–7, otherwise
+  uses the default severity without spamming logs.
+  closes: https://github.com/rsyslog/rsyslog/issues/5613
 - 2025-12-30: omelasticsearch fix: potential NULL dereference
   Under some exotic cases, omelasticsearch could dereference a NULL
   pointer during shutdown cleanup. This would lead to undefined behaviour
