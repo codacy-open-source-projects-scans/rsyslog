@@ -8,7 +8,7 @@
  * (and in the web doc set on https://www.rsyslog.com/doc/). Be sure to read it
  * if you are getting aquainted to the object.
  *
- * Copyright 2008-2018 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2008-2026 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -181,17 +181,26 @@ BEGINobjDestruct(wtp) /* be sure to specify the object type also in END and CODE
 ENDobjDestruct(wtp)
 
 
-/* Sent a specific state for the worker thread pool. -- rgerhards, 2008-01-21
- * We do not need to do atomic instructions as set operations are only
- * called when terminating the pool, and then in strict sequence. So we
- * can never overwrite each other. On the other hand, it also doesn't
- * matter if the read operation obtains an older value, as we then simply
- * do one more iteration, what is perfectly legal (during shutdown
- * they are awoken in any case). -- rgerhards, 2009-07-20
+/* Set worker thread pool state. -- rgerhards, 2008-01-21
+ *
+ * This function is called from multiple contexts:
+ *   1. During shutdown (wtpShutdownAll, queue destructor)
+ *   2. During persistence mode changes (queuePersist)
+ *
+ * IMPORTANT: Uses atomic store because worker threads read wtpState atomically
+ * in wtpChkStopWrkr(). Mixing plain stores with atomic loads violates the C11
+ * memory model and creates undefined behavior.
+ *
+ * The atomic store ensures:
+ *   - Immediate visibility to all worker threads
+ *   - SHUTDOWN_IMMEDIATE is seen without delay
+ *   - Proper memory barriers on all architectures (including ARM)
+ *
+ * rgerhards, 2008-01-21
  */
 rsRetVal wtpSetState(wtp_t *pThis, wtpState_t iNewState) {
     ISOBJ_TYPE_assert(pThis, wtp);
-    pThis->wtpState = iNewState;  // TODO: do we need a mutex here? 2010-04-26
+    ATOMIC_STORE_INT((int *)&pThis->wtpState, &pThis->mutWtpState, iNewState);
     return RS_RET_OK;
 }
 
@@ -266,7 +275,11 @@ PRAGMA_IGNORE_Wempty_body
     d_pthread_mutex_lock(&pThis->mutWtp);
     pthread_cleanup_push(mutexCancelCleanup, &pThis->mutWtp);
     bTimedOut = 0;
-    while (pThis->iCurNumWrkThrd > 0 && !bTimedOut) {
+    /* Use atomic read for consistency - iCurNumWrkThrd is updated atomically by
+     * worker threads. Even though we hold mutWtp, workers update this counter
+     * atomically, so we must read it atomically to ensure we see the latest value.
+     */
+    while (ATOMIC_FETCH_32BIT(&pThis->iCurNumWrkThrd, &pThis->mutCurNumWrkThrd) > 0 && !bTimedOut) {
         wtpJoinTerminatedWrkr(pThis);
         DBGPRINTF("%s: waiting %ldms on worker thread termination, %d still running\n", wtpGetDbgHdr(pThis),
                   timeoutVal(ptTimeout), ATOMIC_FETCH_32BIT(&pThis->iCurNumWrkThrd, &pThis->mutCurNumWrkThrd));
@@ -439,8 +452,20 @@ static rsRetVal ATTR_NONNULL() wtpStartWrkr(wtp_t *const pThis, const int permit
         fprintf(stderr, "%s: worker start requested, num workers currently %d\n", wtpGetDbgHdr(pThis),
                 ATOMIC_FETCH_32BIT(&pThis->iCurNumWrkThrd, &pThis->mutCurNumWrkThrd));
     }
+
+    d_pthread_mutex_lock(&pThis->mutWtp);
+
+    /* Check state under mutex to prevent TOCTOU race where worker could be
+     * created during shutdown. Must hold mutWtp to ensure state doesn't change
+     * between check and worker creation.
+     *
+     * Note: An atomic read is required as wtpState is protected by its own
+     * lock (mutWtpState). This lock on mutWtp ensures the check and
+     * subsequent worker creation are an atomic unit, fixing the TOCTOU race.
+     */
     const wtpState_t wtpState = (wtpState_t)ATOMIC_FETCH_32BIT((int *)&pThis->wtpState, &pThis->mutWtpState);
     if (wtpState != wtpState_RUNNING && !permit_during_shutdown) {
+        d_pthread_mutex_unlock(&pThis->mutWtp);
         DBGPRINTF("%s: worker start requested during shutdown - ignored\n", wtpGetDbgHdr(pThis));
         if (dbgTimeoutToStderr) {
             fprintf(stderr, "rsyslog debug: %s: worker start requested during shutdown - ignored\n",
@@ -449,12 +474,10 @@ static rsRetVal ATTR_NONNULL() wtpStartWrkr(wtp_t *const pThis, const int permit
         return RS_RET_ERR; /* exceptional case, but really makes sense here! */
     }
 
-    d_pthread_mutex_lock(&pThis->mutWtp);
-
     wtpJoinTerminatedWrkr(pThis);
     /* find free spot in thread table. */
     for (i = 0; i < pThis->iNumWorkerThreads; ++i) {
-        if (wtiGetState(pThis->pWrkr[i]) == WRKTHRD_STOPPED) {
+        if (wtiCASState(pThis->pWrkr[i], WRKTHRD_STOPPED, WRKTHRD_INITIALIZING) == RS_RET_OK) {
             break;
         }
     }
@@ -466,7 +489,6 @@ static rsRetVal ATTR_NONNULL() wtpStartWrkr(wtp_t *const pThis, const int permit
     }
 
     pWti = pThis->pWrkr[i];
-    wtiSetState(pWti, WRKTHRD_INITIALIZING);
     iState = pthread_create(&(pWti->thrdID), &pThis->attrThrd, wtpWorker, (void *)pWti);
     ATOMIC_INC(&pThis->iCurNumWrkThrd, &pThis->mutCurNumWrkThrd); /* we got one more! */
 

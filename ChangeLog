@@ -2,6 +2,75 @@
 Scheduled Release 8.2602.0 (aka 2026.02) 2026-12-??
 - overall improved documentation via a large set of topic updates.
 
+- 2026-01-07: omazureeventhubs: fix data races and suppressions
+  There were thread synchronization issues in omazureeventhubs, which now
+  have been solved. Also some new, verified, valgrind suppressions have
+  been added for Proton lib (outside of rsyslog project).
+- 2026-01-07: runtime: fix inconsistent synchronization of iCurNumWrkThrd
+  Fixed inconsistent access to iCurNumWrkThrd where the shutdown loop used
+  a plain read while all other accesses used atomic operations. This could
+  result in the loop reading a stale value and not properly detecting when
+  all workers have terminated.
+  Note: there were not reports from practice, patch trigerred by code review.
+  This is from a series of patches on potential data races in action runtime.
+- 2026-01-07: runtime: runtime: fix TOCTOU race in worker thread creation
+  Fixed a Time-Of-Check-Time-Of-Use race condition in wtpStartWrkr() where
+  the wtpState check occurred before acquiring mutWtp. This allowed the
+  state to change between the check and worker thread creation, potentially
+  resulting in workers being created during shutdown.
+  Note: there were not reports from practice, patch trigerred by code review.
+  This is from a series of patches on potential data races in action runtime.
+- 2026-01-07: runtime: fix race in wtpSetState()
+  Fixed a race condition where wtpSetState() used a plain store while readers
+  (wtpChkStopWrkr) used atomic loads. This violated the C11 memory model and
+  created undefined behavior, potentially causing shutdown delays and
+  potential message loss.
+  Note: there were not reports from practice, patch trigerred by code review.
+  This is from a series of patches on potential data races in action runtime.
+- 2026-01-07: imfile: fix file handle leaks
+  FIle handler leaks can occur if the deleted file still has a lingering symbolic
+  link, even if the file has actually been deleted.
+  Thanks to Nelson Yen for the patch.
+- 2026-01-06: runtime: fix race condition in worker thread startup
+  Fixed a critical race condition in `wtpStartWrkr` where the same worker thread
+  instance (`wti_t`) could be started twice if multiple threads called `wtpStartWrkr`
+  concurrently. This occurred because the check for `WRKTHRD_STOPPED` and the
+  subsequent transition to `WRKTHRD_INITIALIZING` were not atomic.
+  The fix introduces a new `wtiCASState` function that uses atomic Compare-And-Swap
+  to safely reserve a worker slot. This ensures that only one thread can successfully
+  transition a worker from `STOPPED` to `INITIALIZING`, preventing duplicate reuse.
+  This resolves crashes and memory corruption seen in threaded outputs (e.g., ommysql)
+  where thread-local data was incorrectly shared between two active threads.
+  Note that such conditions only occured under pressure. There were no bug
+  reports from practice, we detected this via CI.
+- 2026-01-05: mysql: stabilize async ommysql workers via proper thread init
+  ThreadSanitizer flagged potential races in the MySQL client library when
+  multiple workers run concurrently. While the rsyslog module architecture
+  already ensures per-worker isolation (each worker has its own connection
+  handle and data structures), the client library itself can trigger
+  TSAN reports or Valgrind aborts if thread initialization is not strictly
+  managed.
+  This patch improves stability by keeping mysql_thread_init/mysql_thread_end
+  paired per worker using a `threadInitialized` flag. This ensures the
+  client library stays correctly bound to rsyslog queue threads, avoiding
+  the Valgrind aborts seen in mysql-asyn-vg and potential TSAN warnings
+  without the need for heavy-handed mutex serialization or skipping tests.
+  Further changes:
+  - Use a per-worker reusable SQL buffer to reduce allocation overhead
+  - Overflow-safe SQL buffer growth (SIZE_MAX guard)
+  - tests/mysql-asyn.sh: Enabled for TSAN, as thread_init fixes the root cause
+- 2026-01-05: queue: re-implement queue size warnings
+  This restores the warnings for invalid queue.highWaterMark and
+  queue.lowWaterMark configurations which were reverted in a previous
+  commit due to regressions.
+  The logic has been improved to only emit warnings if the user
+  explicitly configured an invalid value (i.e., not the default -1).
+  Previously, default values (which are -1) were triggering the warnings
+  incorrectly.
+  See also https://github.com/rsyslog/rsyslog/issues/5615
+  See also https://github.com/rsyslog/rsyslog/issues/5586
+  See also https://github.com/rsyslog/rsyslog/issues/5676
+  closes https://github.com/rsyslog/rsyslog/issues/5677
 - 2026-01-04: lookup_table: fix issue with int32 vs. int64
   There were some issues with int32 overflow, which could lead to improper
   lookup table returns. This has now been fixed.

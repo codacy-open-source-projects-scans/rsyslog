@@ -487,6 +487,7 @@ TESTS +=  \
 	include-obj-text-from-file.sh \
 	include-obj-text-from-file-noexist.sh \
 	multiple_lookup_tables.sh \
+	lookup_sparse_array_ipv4.sh \
 	parsertest-parse1.sh \
 	parsertest-parse1-udp.sh \
 	parsertest-parse2.sh \
@@ -2123,6 +2124,9 @@ EXTRA_DIST= \
     mmexternal-SegFault-empty-jroot-vg.sh \
     testsuites/mmexternal-SegFault-mm-python.py \
     testsuites/mmsnareparse/sample-custom-pattern.data \
+    testsuites/mmsnareparse/sample-windows2022-security.data \
+    testsuites/mmsnareparse/sample-windows2025-security.data \
+    testsuites/mmsnareparse/sample-events.data \
     mmsnareparse-basic.sh \
     mmsnareparse-comprehensive.sh \
     mmsnareparse-comprehensive-vg.sh \
@@ -3284,7 +3288,9 @@ EXTRA_DIST= \
 	testsuites/xlate_array_more_misuse.lkp_tbl \
 	sparse_array_lookup_table.sh \
 	sparse_array_lookup_table-vg.sh \
+	lookup_sparse_array_ipv4.sh \
 	testsuites/xlate_sparse_array.lkp_tbl \
+	testsuites/lookup_sparse_array_ipv4.lkp_tbl \
 	testsuites/xlate_sparse_array_more.lkp_tbl \
 	lookup_table_bad_configs.sh \
 	lookup_table_bad_configs-vg.sh \
