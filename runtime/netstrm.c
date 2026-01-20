@@ -264,6 +264,12 @@ finalize_it:
 }
 
 /* tls verify depth */
+static rsRetVal SetDrvrTlsRevocationCheck(netstrm_t *pThis, int enabled) {
+    DEFiRet;
+    iRet = pThis->Drvr.SetTlsRevocationCheck(pThis->pDrvrData, enabled);
+    RETiRet;
+}
+
 static rsRetVal SetDrvrTlsVerifyDepth(netstrm_t *pThis, int verifyDepth) {
     DEFiRet;
     NULL_CHECK(pThis);
@@ -304,6 +310,16 @@ static rsRetVal SetDrvrTlsCertFile(netstrm_t *const pThis, const uchar *const fi
     DEFiRet;
     NULL_CHECK(pThis);
     iRet = pThis->Drvr.SetTlsCertFile(pThis->pDrvrData, file);
+
+finalize_it:
+    RETiRet;
+}
+
+/* Set remote host's TLS SNI */
+static rsRetVal SetDrvrRemoteSNI(netstrm_t *pThis, uchar *remoteSNI) {
+    DEFiRet;
+    NULL_CHECK(pThis);
+    iRet = pThis->Drvr.SetRemoteSNI(pThis->pDrvrData, remoteSNI);
 
 finalize_it:
     RETiRet;
@@ -496,10 +512,12 @@ BEGINobjQueryInterface(netstrm)
     pIf->SetDrvrCheckExtendedKeyUsage = SetDrvrCheckExtendedKeyUsage;
     pIf->SetDrvrPrioritizeSAN = SetDrvrPrioritizeSAN;
     pIf->SetDrvrTlsVerifyDepth = SetDrvrTlsVerifyDepth;
+    pIf->SetDrvrTlsRevocationCheck = SetDrvrTlsRevocationCheck;
     pIf->SetDrvrTlsCAFile = SetDrvrTlsCAFile;
     pIf->SetDrvrTlsCRLFile = SetDrvrTlsCRLFile;
     pIf->SetDrvrTlsKeyFile = SetDrvrTlsKeyFile;
     pIf->SetDrvrTlsCertFile = SetDrvrTlsCertFile;
+    pIf->SetDrvrRemoteSNI = SetDrvrRemoteSNI;
 finalize_it:
 ENDobjQueryInterface(netstrm)
 

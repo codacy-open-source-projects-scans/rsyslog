@@ -122,6 +122,10 @@ BEGINobjDestruct(netstrms) /* be sure to specify the object type also in END and
         free(pThis->gnutlsPriorityString);
         pThis->gnutlsPriorityString = NULL;
     }
+    if (pThis->remoteSNI != NULL) {
+        free(pThis->remoteSNI);
+        pThis->remoteSNI = NULL;
+    }
 ENDobjDestruct(netstrms)
 
 
@@ -342,6 +346,20 @@ static int GetDrvrPrioritizeSAN(netstrms_t *pThis) {
 }
 
 /* set the driver TlsVerifyDepth -- alorbach, 2019-12-20 */
+/* set TLS revocation check */
+static rsRetVal SetDrvrTlsRevocationCheck(netstrms_t *pThis, int enabled) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, netstrms);
+    pThis->DrvrTlsRevocationCheck = (enabled != 0) ? 1 : 0;
+    RETiRet;
+}
+
+/* return TLS revocation check setting */
+static int GetDrvrTlsRevocationCheck(netstrms_t *pThis) {
+    ISOBJ_TYPE_assert(pThis, netstrms);
+    return pThis->DrvrTlsRevocationCheck;
+}
+
 static rsRetVal SetDrvrTlsVerifyDepth(netstrms_t *pThis, int verifyDepth) {
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, netstrms);
@@ -372,6 +390,20 @@ static const uchar *GetDrvrTlsKeyFile(netstrms_t *pThis) {
 static const uchar *GetDrvrTlsCertFile(netstrms_t *pThis) {
     ISOBJ_TYPE_assert(pThis, netstrms);
     return pThis->pszDrvrCertFile;
+}
+
+static rsRetVal SetDrvrRemoteSNI(netstrms_t *pThis, uchar *remoteSNI) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, netstrms);
+    CHKmalloc(pThis->remoteSNI = (uchar *)strdup((char *)remoteSNI));
+finalize_it:
+    RETiRet;
+}
+
+/* Return the remote server SNI */
+static uchar *GetDrvrRemoteSNI(netstrms_t *pThis) {
+    ISOBJ_TYPE_assert(pThis, netstrms);
+    return pThis->remoteSNI;
 }
 
 /* create an instance of a netstrm object. It is initialized with default
@@ -435,7 +467,11 @@ BEGINobjQueryInterface(netstrms)
     pIf->SetDrvrPrioritizeSAN = SetDrvrPrioritizeSAN;
     pIf->GetDrvrPrioritizeSAN = GetDrvrPrioritizeSAN;
     pIf->SetDrvrTlsVerifyDepth = SetDrvrTlsVerifyDepth;
+    pIf->SetDrvrTlsRevocationCheck = SetDrvrTlsRevocationCheck;
     pIf->GetDrvrTlsVerifyDepth = GetDrvrTlsVerifyDepth;
+    pIf->GetDrvrTlsRevocationCheck = GetDrvrTlsRevocationCheck;
+    pIf->SetDrvrRemoteSNI = SetDrvrRemoteSNI;
+    pIf->GetDrvrRemoteSNI = GetDrvrRemoteSNI;
     pIf->GetDrvrTlsCAFile = GetDrvrTlsCAFile;
     pIf->GetDrvrTlsCRLFile = GetDrvrTlsCRLFile;
     pIf->GetDrvrTlsKeyFile = GetDrvrTlsKeyFile;

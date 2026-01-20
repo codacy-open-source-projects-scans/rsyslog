@@ -1,3 +1,4 @@
+#!/bin/bash
 #
 # this shell script provides commands to the common diag system. It enables
 # test scripts to wait for certain conditions and initiate certain actions.
@@ -272,7 +273,7 @@ generate_conf() {
 		RSTB_ACTION_DEFAULT_Q_TO_SHUTDOWN="20000"
 	fi
 	if [ "$RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE" == "" ]; then
-		RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE="20000"
+		RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE="30000"
 	fi
 	export TCPFLOOD_PORT="$(get_free_port)"
 	if [ "$1" == "" ]; then
@@ -288,7 +289,7 @@ global(inputs.timeout.shutdown="'$RSTB_GLOBAL_INPUT_SHUTDOWN_TIMEOUT'"
        default.action.queue.timeoutEnqueue="'$RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE'"
        debug.abortOnProgramError="on")
 # use legacy-style for the following settings so that we can override if needed
-$MainmsgQueueTimeoutEnqueue 20000
+$MainmsgQueueTimeoutEnqueue '$RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE'
 $MainmsgQueueTimeoutShutdown '$RSTB_GLOBAL_QUEUE_SHUTDOWN_TIMEOUT'
 $IMDiagListenPortFileName '$RSYSLOG_DYNNAME.imdiag$1.port'
 $IMDiagServerRun 0
@@ -1368,10 +1369,21 @@ quit"
 	done
 	unset terminated
 	unset out_pid
-	if [ "$(ls core.* 2>/dev/null)" != "" ]; then
+	# Check for test-specific core files first (prevents Issue #6268 race condition)
+	core_found=0
+	if [ -n "$RSYSLOG_DYNNAME" ]; then
+		if [ "$(ls ${RSYSLOG_DYNNAME}.core core.${RSYSLOG_DYNNAME}.* 2>/dev/null)" != "" ]; then
+			core_found=1
+		fi
+	fi
+	# Also check generic cores (for backward compatibility)
+	if [ $core_found -eq 0 ] && [ "$(ls core.* 2>/dev/null)" != "" ]; then
+		core_found=1
+	fi
+	if [ $core_found -eq 1 ]; then
 	   printf 'ABORT! core file exists (maybe from a parallel run!)\n'
 	   pwd
-	   ls -l core.*
+	   ls -l core.* ${RSYSLOG_DYNNAME}.core core.${RSYSLOG_DYNNAME}.* 2>/dev/null
 	   error_exit  1
 	fi
 }
@@ -1667,6 +1679,18 @@ do_cleanup() {
 # for systems like Travis-CI where we cannot debug on the machine itself.
 # our $1 is the to-be-used exit code. if $2 is "stacktrace", call gdb.
 #
+# Core Dump Handling (Issue #6268):
+# - Test-specific cores (${RSYSLOG_DYNNAME}.core, core.${RSYSLOG_DYNNAME}.*)
+#   are checked FIRST to prevent race conditions in parallel test runs
+# - Generic cores are checked second for backward compatibility
+# - Duplicate detection prevents processing the same core file twice
+#
+# Verbosity Reduction:
+# - When no cores found: minimal output (just ulimit status)
+# - When cores found: full analysis with backtraces
+# - System info (uname, memory): only shown if cores found or VERBOSE mode
+# - Disk space warning: only shown if usage >= 90% and no cores found
+#
 # NOTE: if a function test_error_exit_handler is defined, error_exit will
 #       call it immediately before termination. This may be used to cleanup
 #       some things or emit additional diagnostic information.
@@ -1675,14 +1699,11 @@ error_exit() {
 		printf '%s Test %s exceeded max runtime of %d seconds\n' "$(tb_timestamp)" "$0" $TB_TEST_MAX_RUNTIME
 	fi
 	# Core dump analysis - always run when cores are detected
-	echo "=== Core Dump Detection and Analysis ==="
 	core_dumps_found=0
 
 	# Search for core dumps in multiple locations and patterns
-	echo "Searching for core dumps in:"
-	echo "  - Current directory: $(pwd)"
-	echo "  - /cores/ directory (macOS system cores)"
-	echo "  - Subdirectories (*.core, core.*)"
+	# Priority 1: Test-specific core files (prevents parallel test race condition)
+	# Priority 2: Generic core files (for older systems or non-test-specific cores)
 
 	# Process core files safely using while read to handle filenames with spaces/special chars
 	process_core_file() {
@@ -1738,59 +1759,51 @@ error_exit() {
 	}
 
 	# Process glob patterns (handle no-match cleanly via nullglob)
+	# Priority order: test-specific cores first to prevent race conditions in parallel tests
 	shopt -q nullglob; _had_nullglob=$?
 	[ $_had_nullglob -ne 0 ] && shopt -s nullglob
+	
+	# First, check for test-specific core files (prevents Issue #6268 race condition)
+	if [ -n "$RSYSLOG_DYNNAME" ]; then
+		for corefile in ${RSYSLOG_DYNNAME}.core core.${RSYSLOG_DYNNAME}.*; do
+			process_core_file "$corefile"
+		done
+	fi
+	
+	# Then check generic patterns (for backward compatibility)
 	for corefile in core* /cores/core-* /cores/core.*; do
+		# Skip if already processed as test-specific
+		if [ -n "$RSYSLOG_DYNNAME" ] && [[ "$corefile" == *"$RSYSLOG_DYNNAME"* ]]; then
+			continue
+		fi
 		process_core_file "$corefile"
 	done
 	[ $_had_nullglob -ne 0 ] && shopt -u nullglob
 
 	# Process find results safely using while read without subshell (process substitution)
 	while IFS= read -r corefile; do
+		# Skip if already processed
+		if [ -n "$RSYSLOG_DYNNAME" ] && [[ "$corefile" == *"$RSYSLOG_DYNNAME"* ]]; then
+			continue
+		fi
 		process_core_file "$corefile"
 	done < <(find . -name "core.*" -o -name "*.core" 2>/dev/null)
 
 	if [ $core_dumps_found -eq 0 ]; then
-		echo "No core dumps found. Checking possible reasons:"
-		echo "  - Core dump creation might be disabled"
-		echo "  - Insufficient disk space (check df -h output below)"
-		echo "  - Core dumps might be in unexpected locations"
-		if [ "$(uname)" == "Darwin" ]; then
-			echo "  - macOS core pattern: $(sysctl kern.corefile 2>/dev/null || echo 'unknown')"
-			echo "  - macOS core dump enabled: $(sysctl kern.coredump 2>/dev/null || echo 'unknown')"
-		fi
-		echo "  - Current ulimit -c: $(ulimit -c)"
-
-		# Look for evidence of recent segfaults in log output or dmesg
-		echo "  - Checking for segfault evidence:"
-		if [ "$(uname)" == "Darwin" ]; then
-			# Check Console.app style crash reports
-			if [ -d "/Library/Logs/CrashReporter" ]; then
-				echo "    Recent crash logs: $(find /Library/Logs/CrashReporter -name '*rsyslogd*' -mtime -1 2>/dev/null | wc -l) found"
-			fi
-			if [ -d "$HOME/Library/Logs/CrashReporter" ]; then
-				echo "    User crash logs: $(find "$HOME/Library/Logs/CrashReporter" -name '*rsyslogd*' -mtime -1 2>/dev/null | wc -l) found"
-			fi
-		else
-			# Check dmesg for segfault messages
-			if command -v dmesg >/dev/null 2>&1; then
-				recent_segfaults=$(dmesg 2>/dev/null | tail -50 | grep -i "segfault\|killed\|terminated" | wc -l)
-				echo "    Recent segfault messages in dmesg: $recent_segfaults"
-			fi
-		fi
+		# Reduced verbosity - only show essential information when no core found
+		printf 'No core dumps found (ulimit -c: %s)\n' "$(ulimit -c)"
 	else
 		echo "=== Analyzed $core_dumps_found core dump(s) ==="
 	fi
 
-	# Check disk space immediately after core dump analysis
-	echo "=== Disk Space Analysis ==="
-df -hP . | tail -1 | awk '{
-		usage=$5+0;
-		if (usage >= 95)
-			print "WARNING: Disk usage is " $5 " (Free: " $4 ") - This may prevent core dump creation!"
-		else
-			print "Disk usage: " $5 " (Free: " $4 ")"
-	}'
+	# Check disk space only if it might be an issue
+	if [ $core_dumps_found -eq 0 ]; then
+		df -hP . | tail -1 | awk '{
+			usage=$5+0;
+			if (usage >= 90)
+				print "WARNING: Disk usage is " $5 " (Free: " $4 ") - This may prevent core dump creation!"
+		}'
+	fi
 
 	if [[ ! -e IN_AUTO_DEBUG &&  "$USE_AUTO_DEBUG" == 'on' ]]; then
 		touch IN_AUTO_DEBUG
@@ -1816,30 +1829,33 @@ df -hP . | tail -1 | awk '{
 	#fi
 
 	# Comprehensive system and error information gathering
-	echo "=== System Information ==="
-	uname -a
-	if [ "$(uname)" == "Darwin" ]; then
-		if command -v sw_vers >/dev/null 2>&1; then
-			sw_vers
-		fi
-		# macOS-specific memory information
-		echo "=== macOS System Status ==="
-		echo "Memory usage:"
-		top -l 1 | grep "PhysMem" || echo "Memory info unavailable"
+	# Only show detailed system info if core dumps were found or verbose mode is on
+	if [ $core_dumps_found -gt 0 ] || [ "${TEST_OUTPUT}" == "VERBOSE" ]; then
+		echo "=== System Information ==="
+		uname -a
+		if [ "$(uname)" == "Darwin" ]; then
+			if command -v sw_vers >/dev/null 2>&1; then
+				sw_vers
+			fi
+			# macOS-specific memory information
+			echo "=== macOS System Status ==="
+			echo "Memory usage:"
+			top -l 1 | grep "PhysMem" || echo "Memory info unavailable"
 
-		# Recent system logs for rsyslogd (if available)
-		echo "=== Recent macOS System Logs ==="
-		if command -v log >/dev/null 2>&1; then
-			log show --predicate 'process == "rsyslogd"' --info --last 1h || echo "No recent rsyslogd logs found"
+			# Recent system logs for rsyslogd (if available)
+			echo "=== Recent macOS System Logs ==="
+			if command -v log >/dev/null 2>&1; then
+				log show --predicate 'process == "rsyslogd"' --info --last 1h || echo "No recent rsyslogd logs found"
+			else
+				echo "macOS log command not available"
+			fi
 		else
-			echo "macOS log command not available"
-		fi
-	else
-		# Linux-specific information
-		echo "=== Linux System Status ==="
-		if [ -f /proc/meminfo ]; then
-			echo "Memory info:"
-			grep -E "(MemTotal|MemFree|MemAvailable)" /proc/meminfo
+			# Linux-specific information
+			echo "=== Linux System Status ==="
+			if [ -f /proc/meminfo ]; then
+				echo "Memory info:"
+				grep -E "(MemTotal|MemFree|MemAvailable)" /proc/meminfo
+			fi
 		fi
 	fi
 
@@ -3080,7 +3096,17 @@ stop_elasticsearch() {
 		es_pid=$(cat $dep_work_es_pidfile)
 		printf 'stopping ES with pid %d\n' $es_pid
 		kill -SIGTERM $es_pid
-		wait_pid_termination $es_pid
+
+		i=0
+		while kill -0 $es_pid 2> /dev/null; do
+			$TESTTOOL_DIR/msleep 100 # wait 100 milliseconds
+                        if test $i -ge $TB_TIMEOUT_STARTSTOP; then
+				printf 'Elasticsearch (pid %d) still running - Performing hard shutdown (-9)\n' $es_pid
+				kill -9 $es_pid
+				break
+			fi
+			(( i++ ))
+		done
 	fi
 }
 
@@ -3250,19 +3276,19 @@ prepare_otel_collector() {
 		echo "ERROR: RSYSLOG_DYNNAME is not set when preparing OTEL Collector"
 		error_exit 1
 	fi
-	
+
 	dep_work_otel_collector_config="otel-collector-config.yaml"
 	dep_work_otel_collector_pidfile="otelcol.pid"
-	
+
 	# Create .dep_wrk directory first if it doesn't exist, then resolve path
 	if [ ! -d .dep_wrk ]; then
 		mkdir -p .dep_wrk
 	fi
 	dep_work_dir=$(readlink -f .dep_wrk 2>/dev/null || echo "$(pwd)/.dep_wrk")
-	
+
 	# Use per-test directory to allow parallel execution
 	otelcol_work_dir="$dep_work_dir/otelcol-${RSYSLOG_DYNNAME}"
-	
+
 	if [ ! -f $dep_otel_collector_cached_file ]; then
 		echo "Dependency-cache does not have OTEL Collector package, did you download dependencies?"
 		error_exit 77
@@ -3286,7 +3312,7 @@ prepare_otel_collector() {
 	echo "TEST USES OTEL COLLECTOR BINARY $dep_otel_collector_cached_file"
 	mkdir -p "$otelcol_work_dir"
 	(cd "$otelcol_work_dir" && tar -zxf $dep_otel_collector_cached_file) > /dev/null
-	
+
 	# Find the actual binary location (tarball may extract to subdirectory or root)
 	otelcol_binary=""
 	if [ -f "$otelcol_work_dir/otelcol-contrib" ]; then
@@ -3309,10 +3335,10 @@ prepare_otel_collector() {
 			otelcol_binary="$otelcol_work_dir/otelcol-contrib"
 		fi
 	fi
-	
+
 	# Make binary executable
 	chmod +x $otelcol_binary
-	
+
 	# Generate config file with dynamic port and output file path
 	# Use absolute path so OTEL Collector writes to test directory regardless of working directory
 	# Use srcdir if available (tests directory), otherwise use current directory
@@ -3323,22 +3349,22 @@ prepare_otel_collector() {
 	fi
 	otel_output_file="$test_dir/${RSYSLOG_DYNNAME}.otel-output.json"
 	export OTEL_OUTPUT_FILE="$otel_output_file"
-	
+
 	# Ensure the output directory exists (OTEL Collector file exporter may not create it)
 	mkdir -p "$(dirname "$otel_output_file")"
-	
+
 	# Get a free port for the collector (use existing get_free_port function for portability)
 	if [ -z "$OTEL_COLLECTOR_PORT" ]; then
 		OTEL_COLLECTOR_PORT=$(get_free_port)
 	fi
 	export OTEL_COLLECTOR_PORT
-	
+
 	# Get a free port for metrics/telemetry
 	if [ -z "$OTEL_METRICS_PORT" ]; then
 		OTEL_METRICS_PORT=$(get_free_port)
 	fi
 	export OTEL_METRICS_PORT
-	
+
 	if [ ! -f $srcdir/testsuites/$dep_work_otel_collector_config ]; then
 		echo "OTEL Collector config template not found: $srcdir/testsuites/$dep_work_otel_collector_config"
 		error_exit 1
@@ -3354,12 +3380,12 @@ prepare_otel_collector() {
 	sed -i "s|\${OTEL_OUTPUT_FILE}|$otel_output_file_escaped|g" "$otelcol_work_dir/config.yaml"
 	sed -i "s|\${OTEL_METRICS_PORT}|$OTEL_METRICS_PORT|g" "$otelcol_work_dir/config.yaml"
 	sed -i "s|endpoint: 0.0.0.0:0|endpoint: 0.0.0.0:$OTEL_COLLECTOR_PORT|g" "$otelcol_work_dir/config.yaml"
-	
+
 	if [ ! -f "$otelcol_work_dir/config.yaml" ]; then
 		echo "Failed to create OTEL Collector config file"
 		error_exit 1
 	fi
-	
+
 	echo "OTEL Collector prepared for use in test."
 	echo "OTEL Collector output file path: $otel_output_file"
 	echo "OTEL Collector config:"
@@ -3378,20 +3404,20 @@ start_otel_collector() {
 	dep_work_otel_collector_pidfile="$otelcol_work_dir/otelcol.pid"
 	dep_work_otel_collector_logfile="$otelcol_work_dir/otelcol.log"
 	otel_port_file="${RSYSLOG_DYNNAME}.otel_port.file"
-	
+
 	if [ ! -d "$otelcol_work_dir" ]; then
 		echo "OTEL Collector work-dir $otelcol_work_dir does not exist, did you prepare it?"
 		error_exit 1
 	fi
-	
+
 	echo "Starting OTEL Collector"
-	
+
 	# Verify config file exists
 	if [ ! -f "$otelcol_work_dir/config.yaml" ]; then
 		echo "OTEL Collector config file not found: $otelcol_work_dir/config.yaml"
 		error_exit 1
 	fi
-	
+
 	# Binary should be at known location after prepare_otel_collector()
 	otelcol_binary="$otelcol_work_dir/otelcol-contrib"
 	if [ ! -f "$otelcol_binary" ]; then
@@ -3399,26 +3425,26 @@ start_otel_collector() {
 		echo "Did you call prepare_otel_collector()?"
 		error_exit 1
 	fi
-	
+
 	# Verify binary is executable
 	if [ ! -x "$otelcol_binary" ]; then
 		chmod +x "$otelcol_binary"
 	fi
-	
+
 	otelcol_binary_rel="./otelcol-contrib"
-	
+
 	# Start collector in background and capture output (both stdout and stderr)
 	(cd "$otelcol_work_dir" && $otelcol_binary_rel --config=config.yaml > $dep_work_otel_collector_logfile 2>&1) &
 	otelcol_pid=$!
 	echo $otelcol_pid > $dep_work_otel_collector_pidfile
-	
+
 	# Wait a moment for the process to start
 	if [ -n "$TESTTOOL_DIR" ] && [ -f "$TESTTOOL_DIR/msleep" ]; then
 		$TESTTOOL_DIR/msleep 500
 	else
 		sleep 0.5
 	fi
-	
+
 	# Use the port we configured (no discovery needed)
 	otel_port="$OTEL_COLLECTOR_PORT"
 	if [ -z "$otel_port" ]; then
@@ -3427,14 +3453,14 @@ start_otel_collector() {
 	fi
 	echo $otel_port > $otel_port_file
 	echo "OTEL Collector configured to listen on port $otel_port"
-	
+
 	# Wait a bit more for collector to be fully ready
 	if [ -n "$TESTTOOL_DIR" ] && [ -f "$TESTTOOL_DIR/msleep" ]; then
 		$TESTTOOL_DIR/msleep 1000
 	else
 		sleep 1
 	fi
-	
+
 	# Verify port is listening using existing helper function
 	if ! wait_for_tcp_service "127.0.0.1" "$otel_port" 10 "OTEL Collector"; then
 		echo "OTEL Collector port $otel_port is not listening"
@@ -3445,7 +3471,7 @@ start_otel_collector() {
 		kill $otelcol_pid 2>/dev/null
 		error_exit 1
 	fi
-	
+
 	printf 'OTEL Collector pid is %s, listening on port %s\n' "$otelcol_pid" "$otel_port"
 }
 
@@ -3459,28 +3485,28 @@ stop_otel_collector() {
 	dep_work_dir=$(readlink -f .dep_wrk 2>/dev/null || echo "$(pwd)/.dep_wrk")
 	otelcol_work_dir="$dep_work_dir/otelcol-${RSYSLOG_DYNNAME}"
 	dep_work_otel_collector_pidfile="$otelcol_work_dir/otelcol.pid"
-	
+
 	if [ ! -f "$dep_work_otel_collector_pidfile" ]; then
 		echo "OTEL Collector pidfile does not exist, no action needed"
 		return
 	fi
-	
+
 	otelcol_pid=$(cat "$dep_work_otel_collector_pidfile" 2>/dev/null)
 	if [ -z "$otelcol_pid" ]; then
 		echo "OTEL Collector pidfile is empty, no action needed"
 		return
 	fi
-	
+
 	# Check if process is still running
 	if ! kill -0 $otelcol_pid 2>/dev/null; then
 		echo "OTEL Collector process $otelcol_pid is not running"
 		rm -f "$dep_work_otel_collector_pidfile"
 		return
 	fi
-	
+
 	echo "Stopping OTEL Collector (PID $otelcol_pid)"
 	kill -SIGTERM $otelcol_pid
-	
+
 	# Wait for graceful shutdown
 	i=0
 	while kill -0 $otelcol_pid 2>/dev/null; do
@@ -3492,7 +3518,7 @@ stop_otel_collector() {
 			break
 		fi
 	done
-	
+
 	rm -f "$dep_work_otel_collector_pidfile"
 }
 
@@ -3520,9 +3546,9 @@ otel_collector_get_data() {
 		echo "ERROR: OTEL_OUTPUT_FILE not set. Did you call prepare_otel_collector()?"
 		error_exit 1
 	fi
-	
+
 	otel_output_file="$OTEL_OUTPUT_FILE"
-	
+
 	# Wait for file to appear (OTEL Collector file exporter may buffer data)
 	i=0
 	timeout=10
@@ -3534,12 +3560,12 @@ otel_collector_get_data() {
 		fi
 		((i++))
 	done
-	
+
 	if [ ! -f "$otel_output_file" ]; then
 		echo "OTEL Collector output file does not exist: $otel_output_file"
 		error_exit 1
 	fi
-	
+
 	# Parse OTLP JSON structure and extract log records
 	# Structure: resourceLogs[].scopeLogs[].logRecords[]
 	# Extract body.stringValue from each log record
@@ -3576,7 +3602,7 @@ try:
                                                 body_value = base64.b64decode(body['bytesValue']).decode('utf-8', errors='ignore')
                                             except Exception:
                                                 pass
-                                        
+
                                         if body_value:
                                             # Extract just the numeric part for seq_check compatibility
                                             # chkseq expects just a number, not "msgnum:00000000"
@@ -3611,7 +3637,7 @@ try:
                                                     records.append((999999999, body_value))
             except json.JSONDecodeError:
                 continue
-        
+
         # Output records, one per line, sorted by numeric value
         # Extract just the numeric string (second element of tuple) for output
         for num_value, num_str in sorted(records):
@@ -4010,6 +4036,27 @@ file_size_check() {
     return 0
 }
 
+## Start the helper SNI server for omfwd tests.
+## Args: 1=library (openssl|gnutls), 2=port
+omfwd_sni_server() {
+	"./$1_sni_server" "$2" "$srcdir/tls-certs/cert.pem" "$srcdir/tls-certs/key.pem" \
+		1>"$RSYSLOG_DYNNAME.sni-server.stdout" &
+	echo "$!" >"$RSYSLOG_DYNNAME.sni-server.pid"
+}
+
+## Validate that the SNI server observed the expected name.
+## Args: 1=sni
+omfwd_sni_check() {
+	sni=${1}
+
+	wait_file_lines "$RSYSLOG_DYNNAME.sni-server.stdout" 1
+
+	if ! grep -q "^SNI: $sni\$" $RSYSLOG_DYNNAME.sni-server.stdout; then
+	    echo "Expected 'SNI: $sni', but got '"`cat $RSYSLOG_DYNNAME.sni-server.stdout`"'"
+		error_exit 1
+	fi
+}
+
 case $1 in
   'init')
     export srcdir # in case it was not yet in environment
@@ -4096,6 +4143,10 @@ make -j$(getconf _NPROCESSORS_ONLN) check TESTS="" || error_exit 100
 			export TZ=UTC
 		fi
 		ulimit -c unlimited  &> /dev/null # at least try to get core dumps
+		# Note: Setting per-process core_pattern would require root privileges via
+		# /proc/sys/kernel/core_pattern, which is not available in standard test environments.
+		# Instead, we detect test-specific cores using RSYSLOG_DYNNAME pattern matching
+		# in error_exit() to prevent race conditions in parallel test runs (Issue #6268).
 		export TB_STARTTEST=$(date +%s)
 		printf '%s\n' '------------------------------------------------------------'
 		printf '%s Test: %s\n' "$(tb_timestamp)" "$0"
@@ -4107,6 +4158,10 @@ make -j$(getconf _NPROCESSORS_ONLN) check TESTS="" || error_exit 100
 		rm -f rsyslog.empty imfile-state:* omkafka-failed.data
 		rm -f tmp.qi nocert
 		rm -f core.* vgcore.* core*
+		# Also clean up any test-specific core files from previous runs
+		if [ -n "$RSYSLOG_DYNNAME" ]; then
+			rm -f ${RSYSLOG_DYNNAME}.core core.${RSYSLOG_DYNNAME}.*
+		fi
 		# Note: rsyslog.action.*.include must NOT be deleted, as it
 		# is used to setup some parameters BEFORE calling init. This
 		# happens in chained test scripts. Delete on exit is fine,

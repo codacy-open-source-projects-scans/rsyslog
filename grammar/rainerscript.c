@@ -36,6 +36,9 @@
 #include <sys/types.h>
 #include <libestr.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "rsyslog.h"
 #include "rainerscript.h"
@@ -3104,6 +3107,247 @@ done:
     varFreeMembers(&srcVal[1]);
 }
 
+/**
+ * Applies a CIDR mask to an IPv6 address.
+ *
+ * @param[in,out] addr The IPv6 address to mask.
+ * @param[in] bits The number of bits in the mask (0-128).
+ */
+static void mask_ip6(struct in6_addr *addr, int bits) {
+    int i;
+    for (i = 0; i < 16; i++) {
+        if (bits >= 8) {
+            bits -= 8;
+        } else if (bits > 0) {
+            addr->s6_addr[i] &= (0xFF << (8 - bits));
+            bits = 0;
+        } else {
+            addr->s6_addr[i] = 0;
+        }
+    }
+}
+
+/**
+ * Applies a CIDR mask to an IPv4 address.
+ *
+ * @param[in,out] addr The IPv4 address to mask.
+ * @param[in] bits The number of bits in the mask (0-32).
+ */
+static void mask_ip4(struct in_addr *addr, int bits) {
+    if (bits == 0) {
+        addr->s_addr = 0;
+    } else if (bits < 32) {
+        uint32_t host_addr = ntohl(addr->s_addr);
+        host_addr &= (0xFFFFFFFFu << (32 - bits));
+        addr->s_addr = htonl(host_addr);
+    }
+}
+
+/**
+ * Checks if an IP address is in a given subnet (CIDR notation).
+ *
+ * @param[in] func The function object.
+ * @param[out] ret The return value (1 if in subnet, 0 otherwise).
+ * @param[in] usrptr User pointer (unused).
+ * @param[in] pWti Worker thread instance.
+ */
+static void ATTR_NONNULL() doFunct_is_in_subnet(struct cnffunc *__restrict__ const func,
+                                                struct svar *__restrict__ const ret,
+                                                void *__restrict__ const usrptr,
+                                                wti_t *__restrict__ const pWti) {
+    struct svar srcVal[2];
+    int bMustFree1, bMustFree2;
+    char *ip_str, *cidr_str;
+    char *cidr_ip_part;
+    char *cidr_mask_part;
+    struct in_addr ip4, net4;
+    struct in6_addr ip6, net6;
+    int ip_family, net_family;
+    int cidr_bits;
+    int result = 0;
+    char ip_buf[INET6_ADDRSTRLEN];
+
+    cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+    cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+
+    ip_str = (char *)var2CString(&srcVal[0], &bMustFree1);
+    cidr_str = (char *)var2CString(&srcVal[1], &bMustFree2);
+
+    if (ip_str == NULL || cidr_str == NULL) {
+        goto finalize_it;
+    }
+
+    /* 1. Parse IP address */
+    if (inet_pton(AF_INET, ip_str, &ip4) == 1) {
+        ip_family = AF_INET;
+    } else if (inet_pton(AF_INET6, ip_str, &ip6) == 1) {
+        ip_family = AF_INET6;
+    } else {
+        goto finalize_it; /* Invalid IP */
+    }
+
+    /* 2. Parse CIDR */
+    cidr_mask_part = strchr(cidr_str, '/');
+    if (cidr_mask_part == NULL) {
+        goto finalize_it; /* Invalid CIDR format */
+    }
+
+    // Copy IP part to buffer to avoid modifying cidr_str
+    size_t len = cidr_mask_part - cidr_str;
+    if (len >= sizeof(ip_buf)) {
+        goto finalize_it;  // Too long for IP address
+    }
+    memcpy(ip_buf, cidr_str, len);
+    ip_buf[len] = '\0';
+    cidr_ip_part = ip_buf;
+
+    cidr_mask_part++;  // Skip '/'
+
+    if (inet_pton(AF_INET, cidr_ip_part, &net4) == 1) {
+        net_family = AF_INET;
+    } else if (inet_pton(AF_INET6, cidr_ip_part, &net6) == 1) {
+        net_family = AF_INET6;
+    } else {
+        goto finalize_it; /* Invalid Subnet IP */
+    }
+
+    /* 3. Check Family Match */
+    if (ip_family != net_family) {
+        goto finalize_it; /* mismatch */
+    }
+
+    /* 4. Parse Mask bits */
+    char *endptr;
+    errno = 0;
+    long bits = strtol(cidr_mask_part, &endptr, 10);
+    if (errno != 0 || endptr == cidr_mask_part || *endptr != '\0' || bits < 0) {
+        goto finalize_it;
+    }
+    if (ip_family == AF_INET && bits > 32) goto finalize_it;
+    if (ip_family == AF_INET6 && bits > 128) goto finalize_it;
+    cidr_bits = (int)bits;
+
+    /* 5. Mask and Compare */
+    if (ip_family == AF_INET) {
+        mask_ip4(&ip4, cidr_bits);
+        mask_ip4(&net4, cidr_bits);
+        if (ip4.s_addr == net4.s_addr) {
+            result = 1;
+        }
+    } else {
+        mask_ip6(&ip6, cidr_bits);
+        mask_ip6(&net6, cidr_bits);
+        if (memcmp(&ip6, &net6, sizeof(struct in6_addr)) == 0) {
+            result = 1;
+        }
+    }
+
+finalize_it:
+    if (bMustFree1) free(ip_str);
+    if (bMustFree2) free(cidr_str);
+    varFreeMembers(&srcVal[0]);
+    varFreeMembers(&srcVal[1]);
+
+    ret->datatype = 'N';
+    ret->d.n = result;
+}
+
+static void ATTR_NONNULL() doFunct_append_json(struct cnffunc *__restrict__ const func,
+                                               struct svar *__restrict__ const ret,
+                                               void *const usrptr,
+                                               wti_t *const pWti) {
+    struct svar srcVal[3];
+    struct json_object *result = NULL;
+    struct json_object *input = NULL;
+    enum json_type type;
+    char *key = NULL;
+    int bMustFree = 0;
+    int bMustFree2 = 0;
+    int nParamsEvaluated = 0;
+
+    memset(srcVal, 0, sizeof(srcVal));
+
+    cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+
+    if (srcVal[0].datatype != 'J' || srcVal[0].d.json == NULL) {
+        goto finalize_it;
+    }
+
+    input = srcVal[0].d.json;
+    type = json_object_get_type(input);
+
+    if (type == json_type_array) {
+        cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+        nParamsEvaluated = 1;
+
+        result = jsonDeepCopy(input);
+        if (result == NULL) {
+            goto finalize_it;
+        }
+
+        struct json_object *newElem = NULL;
+        if (srcVal[1].datatype == 'J') {
+            newElem = jsonDeepCopy(srcVal[1].d.json);
+        } else if (srcVal[1].datatype == 'S') {
+            char *str = (char *)var2CString(&srcVal[1], &bMustFree2);
+            if (str != NULL) {
+                newElem = json_object_new_string(str);
+            }
+            if (bMustFree2) free(str);
+        } else if (srcVal[1].datatype == 'N') {
+            newElem = json_object_new_int64(srcVal[1].d.n);
+        }
+        if (newElem != NULL) {
+            if (json_object_array_add(result, newElem) != 0) {
+                json_object_put(newElem);
+                json_object_put(result);
+                result = NULL;
+            }
+        }
+
+    } else if (type == json_type_object && func->nParams >= 3) {
+        cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+        cnfexprEval(func->expr[2], &srcVal[2], usrptr, pWti);
+        nParamsEvaluated = 2;
+
+        key = (char *)var2CString(&srcVal[1], &bMustFree);
+        if (key == NULL) {
+            goto finalize_it;
+        }
+
+        result = jsonDeepCopy(input);
+        if (result == NULL) {
+            goto finalize_it;
+        }
+
+        struct json_object *newVal = NULL;
+        if (srcVal[2].datatype == 'J') {
+            newVal = jsonDeepCopy(srcVal[2].d.json);
+        } else if (srcVal[2].datatype == 'S') {
+            char *str = (char *)var2CString(&srcVal[2], &bMustFree2);
+            if (str != NULL) {
+                newVal = json_object_new_string(str);
+            }
+            if (bMustFree2) free(str);
+        } else if (srcVal[2].datatype == 'N') {
+            newVal = json_object_new_int64(srcVal[2].d.n);
+        }
+        if (newVal != NULL) {
+            json_object_object_add(result, key, newVal);
+        }
+    }
+
+finalize_it:
+    ret->datatype = 'J';
+    ret->d.json = result;
+
+    if (bMustFree) free(key);
+    varFreeMembers(&srcVal[0]);
+
+    if (nParamsEvaluated >= 1) varFreeMembers(&srcVal[1]);
+    if (nParamsEvaluated >= 2) varFreeMembers(&srcVal[2]);
+}
+
 static void evalVar(struct cnfvar *__restrict__ const var,
                     void *__restrict__ const usrptr,
                     struct svar *__restrict__ const ret) {
@@ -3883,6 +4127,8 @@ static struct scriptFunct functions[] = {
     {"previous_action_suspended", 0, 0, doFunct_PreviousActionSuspended, NULL, NULL},
     {"b64_decode", 1, 1, doFunct_Base64Dec, NULL, NULL},
     {"split", 2, 2, doFunct_split, NULL, NULL},
+    {"is_in_subnet", 2, 2, doFunct_is_in_subnet, NULL, NULL},
+    {"append_json", 2, 3, doFunct_append_json, NULL, NULL},
     {NULL, 0, 0, NULL, NULL, NULL}  // last element to check end of array
 };
 

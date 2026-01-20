@@ -447,6 +447,7 @@ TESTS +=  \
 	rscript_format_time.sh \
 	rscript_parse_time.sh \
 	rscript_is_time.sh \
+	rscript_is_in_subnet.sh \
 	rscript_script_error.sh \
 	rscript_parse_json.sh \
 	rscript_parse_json_issue.sh \
@@ -461,6 +462,7 @@ TESTS +=  \
 	rscript-config_enable-on.sh \
 	rscript_get_property.sh \
 	rscript_split.sh \
+	rscript_append_json.sh \
 	config_output-o-option.sh \
 	rs-cnum.sh \
 	rs-substring.sh \
@@ -561,10 +563,10 @@ if ENABLE_GNUTLS_TESTS
 TESTS +=  \
 	tcpflood_wrong_option_output.sh
 endif # ENABLE_GNUTLS_TESTS
-if ENABLE_OPENSSL
+if ENABLE_OSSL
 TESTS +=  \
 	tcpflood_wrong_option_output.sh
-endif # ENABLE_OPENSSL
+endif # ENABLE_OSSL
 TESTS +=  \
 	omusrmsg-noabort-vg.sh \
 	omfile_hup-vg.sh \
@@ -626,7 +628,8 @@ TESTS +=  \
 	threadingmqaq.sh \
 	func-substring-invld-startpos-vg.sh \
 	rscript_trim-vg.sh \
-	rscript_split-vg.sh
+	rscript_split-vg.sh \
+	rscript_append_json-vg.sh
 if ENABLE_LIBGCRYPT
 TESTS +=  \
 	queue-encryption-disk_keyfile-vg.sh
@@ -700,8 +703,9 @@ endif # if ENABLE_SNMP
 
 if ENABLE_MMUTF8FIX
 TESTS +=  \
-        mmutf8fix_no_error.sh
-endif # if ENABLE_MAIL
+        mmutf8fix_no_error.sh \
+        mmutf8fix_tag.sh
+endif # if ENABLE_MMUTF8FIX
 
 if ENABLE_MMAITAG
 TESTS +=  \
@@ -1298,6 +1302,7 @@ TESTS +=  \
 	stats-json-es.sh \
 	dynstats_reset_without_pstats_reset.sh \
 	dynstats_prevent_premature_eviction.sh \
+	dynstats-persist.sh \
 	omfwd-lb-2target-impstats.sh \
 	omfwd_fast_imuxsock.sh \
 	omfwd_impstats-udp.sh \
@@ -1311,7 +1316,8 @@ TESTS +=  \
 	dynstats-json-vg.sh \
 	stats-json-vg.sh \
 	stats-cee-vg.sh \
-	dynstats_prevent_premature_eviction-vg.sh
+	dynstats_prevent_premature_eviction-vg.sh \
+	dynstats-persist-vg.sh
 endif
 endif
 
@@ -1502,6 +1508,7 @@ endif
 
 if ENABLE_MMJSONPARSE
 TESTS += \
+	mmjsonparse_qradar.sh \
         mmjsonparse-w-o-cookie.sh \
         mmjsonparse-w-o-cookie-multi-spaces.sh \
         mmjsonparse-find-json-basic.sh \
@@ -1553,6 +1560,10 @@ if ENABLE_IMTCP_TESTS
 TESTS += \
         mmjsontransform-basic.sh
 endif
+if ENABLE_MMJSONPARSE
+TESTS += \
+	data_pipeline-qradar.sh
+endif
 endif
 
 if ENABLE_MMDBLOOKUP
@@ -1574,6 +1585,7 @@ TESTS +=  \
 	imtcp-tls-input-basic.sh \
 	imtcp-tls-input-2certs.sh \
 	imtcp-tls-basic-verifydepth.sh \
+	imtcp-tls-gtls-revocationcheck-error.sh \
 	imtcp_conndrop_tls.sh \
 	imtcp-tls-gibberish.sh \
 	sndrcv_tls_anon_rebind.sh \
@@ -1597,6 +1609,9 @@ TESTS +=  \
 	imtcp-tls-gtls-x509name-invld.sh \
 	imtcp-tls-gtls-x509name.sh \
 	imtcp-tls-gtls-x509name-legacy.sh \
+	omfwd-tls-gtls-no-sni.sh \
+	omfwd-tls-gtls-auto-sni.sh \
+	omfwd-tls-gtls-configured-sni.sh \
 	imtcp-drvr-in-input-basic.sh \
 	imtcp-multi-drvr-basic.sh \
 	imtcp-multi-drvr-basic-parallel.sh
@@ -1651,39 +1666,50 @@ TESTS += \
 endif
 endif
 
-if ENABLE_OPENSSL
+if ENABLE_OSSL
 TESTS +=  \
-	imtcp-tls-ossl-basic.sh \
-	imtcp-tls-ossl-input-basic.sh \
 	imtcp-tls-ossl-input-2certs.sh \
-	imtcp-tls-ossl-basic-tlscommands.sh \
 	imtcp-tls-ossl-basic-verifydepth.sh \
+	imtcp-tls-ossl-revocationcheck-off.sh \
 	imtcp-tls-ossl-invalid-verifydepth.sh \
-	sndrcv_tls_ossl_anon_ipv4.sh \
-	sndrcv_tls_ossl_anon_ipv6.sh \
-	sndrcv_tls_ossl_anon_rebind.sh \
-	sndrcv_tls_ossl_anon_ciphers.sh \
-	sndrcv_tls_ossl_serveranon_ossl_clientanon.sh \
-	sndrcv_tls_ossl_servercert_ossl_clientanon.sh \
 	sndrcv_tls_ossl_certvalid.sh \
 	sndrcv_tls_ossl_certvalid_action_level.sh \
-	sndrcv_tls_ossl_certvalid_expired.sh \
 	sndrcv_tls_ossl_certvalid_tlscommand.sh \
 	sndrcv_tls_ossl_certvalid_ciphers.sh \
-	sndrcv_tls_ossl_certvalid_revoked.sh \
 	sndrcv_tls_ossl_intermediate_ca_chain.sh \
 	imtcp-tls-ossl-x509valid.sh \
 	imtcp-tls-ossl-x509name.sh \
 	imtcp-tls-ossl-x509fingerprint.sh \
 	imtcp-tls-ossl-error-ca.sh \
 	imtcp-tls-ossl-error-cert.sh \
-	imtcp-tls-ossl-error-key.sh \
-	imtcp-tls-ossl-error-key2.sh
-#	imtcp-tls-ossl-basic-stress.sh
+	imtcp-tls-ossl-error-key.sh
+
+if ENABLE_OPENSSL
+TESTS +=  \
+	imtcp-tls-ossl-basic.sh \
+	imtcp-tls-ossl-input-basic.sh \
+	imtcp-tls-ossl-basic-tlscommands.sh \
+	imtcp-tls-ossl-error-key2.sh \
+	sndrcv_tls_ossl_anon_ipv4.sh \
+	sndrcv_tls_ossl_anon_ipv6.sh \
+	sndrcv_tls_ossl_anon_rebind.sh \
+	sndrcv_tls_ossl_anon_ciphers.sh \
+	sndrcv_tls_ossl_serveranon_ossl_clientanon.sh \
+	sndrcv_tls_ossl_servercert_ossl_clientanon.sh \
+	sndrcv_tls_ossl_certvalid_expired.sh \
+	sndrcv_tls_ossl_certvalid_revoked.sh
 if HAVE_VALGRIND
 TESTS += \
 	imtcp-tls-ossl-basic-vg.sh \
 	imtcp-tls-ossl-basic-brokenhandshake-vg.sh
+endif
+endif
+
+if ENABLE_OPENSSL
+TESTS +=  \
+	omfwd-tls-ossl-no-sni.sh \
+	omfwd-tls-ossl-auto-sni.sh \
+	omfwd-tls-ossl-configured-sni.sh
 endif
 endif
 
@@ -1929,6 +1955,10 @@ if ENABLE_MMNORMALIZE
 TESTS += \
 	imfile-endmsg.regex-with-example.sh
 endif
+if ENABLE_IMPSTATS
+TESTS += \
+	imfile-statistics.sh
+endif
 
 if HAVE_VALGRIND
 TESTS += \
@@ -2031,6 +2061,21 @@ TESTS += \
 	omfwd-srv-discovery-errors.sh
 endif # HAVE_SRV_DISCOVERY
 
+if ENABLE_GNUTLS
+check_PROGRAMS += gnutls_sni_server
+gnutls_sni_server_SOURCES = gnutls_sni_server.c
+gnutls_sni_server_CFLAGS = $(GNUTLS_CFLAGS)
+gnutls_sni_server_CPPFLAGS = $(GNUTLS_CFLAGS)
+gnutls_sni_server_LDADD = $(GNUTLS_LIBS) $(SOL_LIBS)
+endif
+if ENABLE_OPENSSL
+check_PROGRAMS += openssl_sni_server
+openssl_sni_server_SOURCES = openssl_sni_server.c
+openssl_sni_server_CFLAGS = $(OPENSSL_CFLAGS)
+openssl_sni_server_CPPFLAGS = $(OPENSSL_CFLAGS)
+openssl_sni_server_LDADD = $(OPENSSL_LIBS) $(SOL_LIBS)
+endif
+
 endif # if ENABLE_TESTBENCH
 
 TESTS_ENVIRONMENT = RSYSLOG_MODDIR='$(abs_top_builddir)'/runtime/.libs/
@@ -2051,6 +2096,12 @@ EXTRA_DIST= \
 	omfwd-srv-discovery-tcp.sh \
 	omfwd-srv-discovery-udp.sh \
 	omfwd-srv-discovery-errors.sh \
+	omfwd-tls-gtls-no-sni.sh \
+	omfwd-tls-gtls-auto-sni.sh \
+	omfwd-tls-gtls-configured-sni.sh \
+	omfwd-tls-ossl-no-sni.sh \
+	omfwd-tls-ossl-auto-sni.sh \
+	omfwd-tls-ossl-configured-sni.sh \
 	loadbalance.sh \
 	smtradfile.sh \
 	smtradfile-vg.sh \
@@ -2302,6 +2353,7 @@ EXTRA_DIST= \
 	rscript_parse_time.sh \
 	rscript_parse_time_get-ts.py \
 	rscript_is_time.sh \
+	rscript_is_in_subnet.sh \
 	rscript_script_error.sh \
 	rscript_parse_json.sh \
 	rscript_parse_json_issue.sh \
@@ -2340,6 +2392,8 @@ EXTRA_DIST= \
 	rscript_get_property-vg.sh \
 	rscript_split.sh \
 	rscript_split-vg.sh \
+	rscript_append_json.sh \
+	rscript_append_json-vg.sh \
 	rs-cnum.sh \
 	rs-int2hex.sh \
 	rs-substring.sh \
@@ -2353,6 +2407,7 @@ EXTRA_DIST= \
 	mmdarwin_errmsg_no_sock.sh \
 	mmdarwin_errmsg_no_sock-vg.sh \
 	mmutf8fix_no_error.sh \
+	mmutf8fix_tag.sh \
 	tcpflood_wrong_option_output.sh \
 	msleep_usage_output.sh \
 	mangle_qi_usage_output.sh \
@@ -2581,6 +2636,10 @@ EXTRA_DIST= \
 	cee_simple.sh \
 	cee_diskqueue.sh \
 	mmleefparse_basic.sh \
+	data_pipeline-qradar.sh \
+	validate_json_equality.py \
+	testsuites/qradar_json \
+	mmjsonparse_qradar.sh \
 	mmjsonparse-w-o-cookie.sh \
 	mmjsonparse-w-o-cookie-multi-spaces.sh \
     mmjsonparse-find-json-basic.sh \
@@ -2702,6 +2761,7 @@ EXTRA_DIST= \
 	imtcp-tls-input-basic.sh \
 	imtcp-tls-input-2certs.sh \
 	imtcp-tls-basic-verifydepth.sh \
+	imtcp-tls-gtls-revocationcheck-error.sh \
 	imtcp-tls-basic-vg.sh \
 	imtcp-tls-no-lstn-startup.sh \
 	imtcp_incomplete_frame_at_end.sh \
@@ -2716,6 +2776,7 @@ EXTRA_DIST= \
 	imtcp-tls-ossl-input-2certs.sh \
 	imtcp-tls-ossl-basic-tlscommands.sh \
 	imtcp-tls-ossl-basic-verifydepth.sh \
+imtcp-tls-ossl-revocationcheck-off.sh \
 	imtcp-tls-ossl-invalid-verifydepth.sh \
 	imtcp-tls-ossl-basic-stress.sh \
 	sndrcv_tls_ossl_anon_ipv4.sh \
@@ -3012,6 +3073,7 @@ EXTRA_DIST= \
 	complex1.sh \
 	random.sh \
 	testsuites/imfile-old-state-file_imfile-state_.-rsyslog.input \
+	imfile-statistics.sh \
 	imfile-readmode0-vg.sh \
 	imfile-readmode2.sh \
 	imfile-readmode2-polling.sh \
@@ -3217,6 +3279,8 @@ EXTRA_DIST= \
 	stats-json-es.sh \
 	dynstats-json.sh \
 	dynstats-json-vg.sh \
+	dynstats-persist.sh \
+	dynstats-persist-vg.sh \
 	mmnormalize_variable.sh \
 	mmnormalize_tokenized.sh \
 	testsuites/mmnormalize_variable.rulebase \
@@ -3231,6 +3295,7 @@ EXTRA_DIST= \
 	rscript_replace.sh \
 	rscript_replace_complex.sh \
 	rscript_split.sh \
+	rscript_append_json.sh \
 	testsuites/complex_replace_input \
 	rscript_unaffected_reset.sh \
 	rscript_wrap2.sh \
@@ -3464,10 +3529,16 @@ tcpflood_CFLAGS += $(GNUTLS_CFLAGS)
 tcpflood_CPPFLAGS += $(GNUTLS_CFLAGS)
 tcpflood_LDADD += $(GNUTLS_LIBS)
 endif
-if ENABLE_OPENSSL
+if ENABLE_OSSL
+if ENABLE_WOLFSSL
+tcpflood_CFLAGS += $(WOLFSSL_CFLAGS)
+tcpflood_CPPFLAGS += $(WOLFSSL_CFLAGS)
+tcpflood_LDADD += $(WOLFSSL_LIBS)
+else
 tcpflood_CFLAGS += $(OPENSSL_CFLAGS)
 tcpflood_CPPFLAGS += $(OPENSSL_CFLAGS)
 tcpflood_LDADD += $(OPENSSL_LIBS)
+endif
 endif
 
 minitcpsrv_SOURCES = minitcpsrvr.c

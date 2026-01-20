@@ -1459,6 +1459,7 @@ BEGINobjDestruct(nsd_gtls) /* be sure to specify the object type also in END and
     free(pThis->pszRcvBuf);
     free((void *)pThis->pszCAFile);
     free((void *)pThis->pszCRLFile);
+    free(pThis->remoteSNI);
 
     if (pThis->bOurCertIsInit)
         for (unsigned i = 0; i < pThis->nOurCerts; ++i) {
@@ -1736,6 +1737,42 @@ finalize_it:
     RETiRet;
 }
 
+/* Set the TLS SNI of the remote server */
+static rsRetVal SetRemoteSNI(nsd_t *pNsd, uchar *remoteSNI) {
+    DEFiRet;
+    nsd_gtls_t *pThis = (nsd_gtls_t *)pNsd;
+
+    ISOBJ_TYPE_assert((pThis), nsd_gtls);
+
+    free(pThis->remoteSNI);
+    if (remoteSNI == NULL) {
+        pThis->remoteSNI = NULL;
+    } else {
+        CHKmalloc(pThis->remoteSNI = (uchar *)strdup((char *)remoteSNI));
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal SetTlsRevocationCheck(nsd_t *pNsd, int enabled) {
+    DEFiRet;
+    nsd_gtls_t *pThis = (nsd_gtls_t *)pNsd;
+
+    ISOBJ_TYPE_assert(pThis, nsd_gtls);
+    pThis->DrvrTlsRevocationCheck = (enabled != 0) ? 1 : 0;
+
+    if (pThis->DrvrTlsRevocationCheck) {
+        LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
+                 "error: TLS revocation checking not supported by "
+                 "gtls netstream driver (GnuTLS does not implement OCSP checking)");
+        ABORT_FINALIZE(RS_RET_VALUE_NOT_SUPPORTED);
+    }
+
+finalize_it:
+    RETiRet;
+}
+
 /* Provide access to the underlying OS socket. This is primarily
  * useful for other drivers (like nsd_gtls) who utilize ourselfs
  * for some of their functionality. -- rgerhards, 2008-04-18
@@ -1750,6 +1787,16 @@ static rsRetVal SetSock(nsd_t *pNsd, int sock) {
     nsd_ptcp.SetSock(pThis->pTcp, sock);
 
     RETiRet;
+}
+
+static rsRetVal GetRemotePort(nsd_t *pNsd, int *port) {
+    nsd_gtls_t *pThis = (nsd_gtls_t *)pNsd;
+    ISOBJ_TYPE_assert((pThis), nsd_gtls);
+    return nsd_ptcp.GetRemotePort(pThis->pTcp, port);
+}
+
+static rsRetVal FmtRemotePortStr(const int port, uchar *const buf, const size_t len) {
+    return nsd_ptcp.FmtRemotePortStr(port, buf, len);
 }
 
 
@@ -1928,6 +1975,7 @@ static rsRetVal AcceptConnReq(nsd_t *pNsd, nsd_t **ppNew, char *const connInfo) 
     pNew->pPermPeers = pThis->pPermPeers;
     pNew->gnutlsPriorityString = pThis->gnutlsPriorityString;
     pNew->DrvrVerifyDepth = pThis->DrvrVerifyDepth;
+    pNew->DrvrTlsRevocationCheck = pThis->DrvrTlsRevocationCheck;
     pNew->dataTypeCheck = pThis->dataTypeCheck;
     pNew->bSANpriority = pThis->bSANpriority;
     pNew->pszCertFile = pThis->pszCertFile;
@@ -2199,8 +2247,14 @@ static rsRetVal EnableKeepAlive(nsd_t *pNsd) {
 static int SetServerNameIfPresent(nsd_gtls_t *pThis, uchar *host) {
     struct sockaddr_in sa;
     struct sockaddr_in6 sa6;
+    int inet_pton_ret;
 
-    int inet_pton_ret = inet_pton(AF_INET, CHAR_CONVERT(host), &(sa.sin_addr));
+    /* Always use the configured remote SNI if present */
+    if (pThis->remoteSNI != NULL) {
+        return gnutls_server_name_set(pThis->sess, GNUTLS_NAME_DNS, pThis->remoteSNI, ustrlen(pThis->remoteSNI));
+    }
+
+    inet_pton_ret = inet_pton(AF_INET, CHAR_CONVERT(host), &(sa.sin_addr));
 
     if (inet_pton_ret == 0) {  // host wasn't a bare IPv4 address: try IPv6
         inet_pton_ret = inet_pton(AF_INET6, CHAR_CONVERT(host), &(sa6.sin6_addr));
@@ -2412,6 +2466,10 @@ BEGINobjQueryInterface(nsd_gtls)
     pIf->SetTlsCRLFile = SetTlsCRLFile;
     pIf->SetTlsKeyFile = SetTlsKeyFile;
     pIf->SetTlsCertFile = SetTlsCertFile;
+    pIf->GetRemotePort = GetRemotePort;
+    pIf->FmtRemotePortStr = FmtRemotePortStr;
+    pIf->SetRemoteSNI = SetRemoteSNI;
+    pIf->SetTlsRevocationCheck = SetTlsRevocationCheck;
 
 finalize_it:
 ENDobjQueryInterface(nsd_gtls)

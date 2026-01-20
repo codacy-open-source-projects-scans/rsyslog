@@ -637,15 +637,16 @@ static rsRetVal getReturnCode(action_t *const pThis, wti_t *const pWti) {
 /* set the action to a new state
  * rgerhards, 2007-08-02
  */
-static void actionSetState(action_t *const pThis, wti_t *const pWti, uint8_t newState) {
+static void actionSetState(action_t *const pThis, const char *const callerName, wti_t *const pWti, uint8_t newState) {
     setActionState(pWti, pThis, newState);
-    DBGPRINTF("action[%s] transitioned to state: %s\n", pThis->pszName, getActStateName(pThis, pWti));
+    DBGPRINTF("action[%s] transitioned to state: %s (caller %s)\n", pThis->pszName, getActStateName(pThis, pWti),
+              callerName);
 }
 
 static void actionDisableForWorker(action_t *const pThis, wti_t *const pWti) {
     actionDisable(pThis);
     if (pWti != NULL && getActionState(pWti, pThis) != ACT_STATE_DISABLED) {
-        actionSetState(pThis, pWti, ACT_STATE_DISABLED);
+        actionSetState(pThis, __func__, pWti, ACT_STATE_DISABLED);
     }
 }
 
@@ -654,7 +655,7 @@ static void actionDisableForWorker(action_t *const pThis, wti_t *const pWti) {
  * rgerhards, 2007-08-02
  */
 static void actionCommitted(action_t *const pThis, wti_t *const pWti) {
-    actionSetState(pThis, pWti, ACT_STATE_RDY);
+    actionSetState(pThis, __func__, pWti, ACT_STATE_RDY);
 }
 
 
@@ -736,7 +737,7 @@ static void ATTR_NONNULL() actionRetry(action_t *const pThis, wti_t *const pWti)
     }
 
     setSuspendMessageConfVars(pThis);
-    actionSetState(pThis, pWti, ACT_STATE_RTRY);
+    actionSetState(pThis, __func__, pWti, ACT_STATE_RTRY);
     if (pThis->bReportSuspension) {
         LogMsg(0, RS_RET_SUSPENDED, LOG_WARNING,
                "action '%s' suspended (module '%s'), retry %d. There should "
@@ -771,7 +772,7 @@ static void ATTR_NONNULL() actionSuspend(action_t *const pThis, wti_t *const pWt
         suspendDuration = pThis->iResumeIntervalMax;
     }
     pThis->ttResumeRtry = ttNow + suspendDuration;
-    actionSetState(pThis, pWti, ACT_STATE_SUSP);
+    actionSetState(pThis, __func__, pWti, ACT_STATE_SUSP);
     pThis->ctrSuspendDuration += suspendDuration;
     if (getActionNbrResRtry(pWti, pThis) == 0) {
         STATSCOUNTER_INC(pThis->ctrSuspend, pThis->mutCtrSuspend);
@@ -841,7 +842,7 @@ static rsRetVal ATTR_NONNULL() actionDoRetry(action_t *const pThis, wti_t *const
                        "resumed (module '%s')",
                        pThis->pszName, pThis->pMod->pszName);
             }
-            actionSetState(pThis, pWti, ACT_STATE_RDY);
+            actionSetState(pThis, __func__, pWti, ACT_STATE_RDY);
         } else if (iRet == RS_RET_SUSPENDED || bTreatOKasSusp) {
             /* max retries reached? */
             DBGPRINTF(
@@ -906,7 +907,7 @@ static rsRetVal ATTR_NONNULL() actionDoRetry_extFile(action_t *const pThis, wti_
                        "resumed (module '%s') via external state file",
                        pThis->pszName, pThis->pMod->pszName);
             }
-            actionSetState(pThis, pWti, ACT_STATE_RDY);
+            actionSetState(pThis, __func__, pWti, ACT_STATE_RDY);
         } else if (iRet == RS_RET_SUSPENDED) {
             /* max retries reached? */
             DBGPRINTF(
@@ -941,11 +942,41 @@ finalize_it:
 
 static rsRetVal actionCheckAndCreateWrkrInstance(action_t *const pThis, const wti_t *const pWti) {
     int locked = 0;
+    void *existingInstance;
     DEFiRet;
     if (actionIsDisabled(pThis)) {
         FINALIZE;
     }
-    if (pWti->actWrkrInfo[pThis->iActionNbr].actWrkrData == NULL) {
+
+    /* Fast path: atomic read to check if instance already exists.
+     * This optimization avoids mutex contention in the common case where
+     * the worker instance has already been created. Uses atomic operations
+     * to ensure proper memory ordering and visibility across threads.
+     */
+#ifdef HAVE_ATOMIC_BUILTINS
+    existingInstance = ATOMIC_FETCH_PTR(&pWti->actWrkrInfo[pThis->iActionNbr].actWrkrData, &pThis->mutWrkrDataTable);
+    if (existingInstance != NULL) {
+        FINALIZE; /* Common case: instance exists, return immediately */
+    }
+#endif
+
+    /* Worker instance does not exist. Acquire lock to prevent race condition
+     * where multiple threads might try to create instances simultaneously.
+     * We use double-checked locking when atomic reads are available to
+     * confirm another thread did not create the instance between checks.
+     * On platforms without atomic builtins, we perform the full check under
+     * a single mutex to avoid nested locking in the fallback path.
+     */
+    pthread_mutex_lock(&pThis->mutWrkrDataTable);
+    locked = 1;
+
+#ifdef HAVE_ATOMIC_BUILTINS
+    /* Recheck under lock (double-checked locking pattern with atomics) */
+    existingInstance = ATOMIC_FETCH_PTR(&pWti->actWrkrInfo[pThis->iActionNbr].actWrkrData, &pThis->mutWrkrDataTable);
+#else
+    existingInstance = pWti->actWrkrInfo[pThis->iActionNbr].actWrkrData;
+#endif
+    if (existingInstance == NULL) {
         DBGPRINTF(
             "wti %p: we need to create a new action worker instance for "
             "action %d\n",
@@ -956,9 +987,6 @@ static rsRetVal actionCheckAndCreateWrkrInstance(action_t *const pThis, const wt
         setActionState(pWti, pThis, ACT_STATE_RDY); /* action is enabled */
 
         /* maintain worker data table -- only needed if wrkrHUP is requested! */
-
-        pthread_mutex_lock(&pThis->mutWrkrDataTable);
-        locked = 1;
         int freeSpot;
         for (freeSpot = 0; freeSpot < pThis->wrkrDataTableSize; ++freeSpot)
             if (pThis->wrkrDataTable[freeSpot] == NULL) break;
@@ -1011,7 +1039,7 @@ static rsRetVal actionTryResume(action_t *const pThis, wti_t *const pWti) {
          */
         datetime.GetTime(&ttNow); /* cache "now" */
         if (ttNow >= pThis->ttResumeRtry) {
-            actionSetState(pThis, pWti, ACT_STATE_RTRY); /* back to retries */
+            actionSetState(pThis, __func__, pWti, ACT_STATE_RTRY); /* back to retries */
         }
     }
 
@@ -1068,7 +1096,7 @@ static rsRetVal ATTR_NONNULL() actionPrepare(action_t *__restrict__ const pThis,
         iRet = pThis->pMod->mod.om.beginTransaction(pWti->actWrkrInfo[pThis->iActionNbr].actWrkrData);
         switch (iRet) {
             case RS_RET_OK:
-                actionSetState(pThis, pWti, ACT_STATE_ITX);
+                actionSetState(pThis, __func__, pWti, ACT_STATE_ITX);
                 break;
             case RS_RET_SUSPENDED:
                 actionRetry(pThis, pWti);
@@ -1236,7 +1264,7 @@ static rsRetVal handleActionExecResult(action_t *__restrict__ const pThis,
                      "message lost, could not be processed. Check for "
                      "additional error messages before this one.",
                      pThis->pszName, pThis->pMod->pszName);
-            actionSetState(pThis, pWti, ACT_STATE_DATAFAIL);
+            actionSetState(pThis, __func__, pWti, ACT_STATE_DATAFAIL);
             break;
     }
     iRet = getReturnCode(pThis, pWti);

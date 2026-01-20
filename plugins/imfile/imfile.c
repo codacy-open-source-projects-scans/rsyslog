@@ -66,6 +66,7 @@
 #include "srUtils.h"
 #include "parserif.h"
 #include "datetime.h"
+#include "statsobj.h"
 
 #include <regex.h>
 
@@ -89,12 +90,13 @@ MODULE_CNFNAME("imfile")
 /* Module static data */
 DEF_IMOD_STATIC_DATA /* must be present, starts static data */
     DEFobjCurrIf(glbl) DEFobjCurrIf(strm) DEFobjCurrIf(prop) DEFobjCurrIf(ruleset) DEFobjCurrIf(datetime)
+        DEFobjCurrIf(statsobj)
 
-        extern int rs_siphash(const uint8_t *in,
-                              const size_t inlen,
-                              const uint8_t *k,
-                              uint8_t *out,
-                              const size_t outlen); /* see siphash.c */
+            extern int rs_siphash(const uint8_t *in,
+                                  const size_t inlen,
+                                  const uint8_t *k,
+                                  uint8_t *out,
+                                  const size_t outlen); /* see siphash.c */
 
 static int bLegacyCnfModGlobalsPermitted; /* are legacy module-global config parameters permitted? */
 
@@ -210,6 +212,10 @@ struct act_obj_s {
     multi_submit_t multiSub;
     int is_symlink;
     time_t time_to_delete; /* Helper variable to DELAY the actual file delete in act_obj_unlink */
+    /* per-file statistics */
+    statsobj_t *stats; /* stats object for this file */
+    STATSCOUNTER_DEF(bytesProcessed, mutBytesProcessed); /* total bytes processed from this file */
+    STATSCOUNTER_DEF(linesProcessed, mutLinesProcessed); /* total lines processed from this file */
 };
 struct fs_edge_s {
     fs_node_t *parent; /* node pointing to this edge */
@@ -237,6 +243,7 @@ static void ATTR_NONNULL() act_obj_unlink(act_obj_t *act);
 static uchar *ATTR_NONNULL(1, 2) getStateFileName(const act_obj_t *, uchar *, const size_t);
 static int ATTR_NONNULL()
     getFullStateFileName(const uchar *const, const char *const, uchar *const pszout, const size_t ilenout);
+static void ATTR_NONNULL(1) getFileID(act_obj_t *const act);
 
 
 #define OPMODE_POLLING 0
@@ -249,6 +256,7 @@ struct modConfData_s {
     int iPollInterval; /* number of seconds to sleep when there was no file activity */
     int readTimeout;
     int timeoutGranularity; /* value in ms */
+    int maxiNotifyWatches;
     instanceConf_t *root, *tail;
     fs_node_t *conf_tree;
     uint8_t opMode;
@@ -312,6 +320,7 @@ static struct cnfparamdescr modpdescr[] = {
     {"normalizepath", eCmdHdlrBinary, 0},
     {"mode", eCmdHdlrGetWord, 0},
     {"deletestateonfilemove", eCmdHdlrBinary, 0},
+    {"maxinotifywatches", eCmdHdlrNonNegInt, 0},
 };
 static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / sizeof(struct cnfparamdescr), modpdescr};
 
@@ -697,6 +706,15 @@ static rsRetVal ATTR_NONNULL(1, 2) act_obj_add(fs_edge_t *const edge,
             }
         }
     }
+#ifdef HAVE_INOTIFY_INIT
+    if (runModConf->maxiNotifyWatches > 0 && nWdmap >= runModConf->maxiNotifyWatches) {
+        LogError(0, RS_RET_ERR,
+                 "imfile: act_obj_add: cannot add new active object '%s' - "
+                 "the module limit on the total number of inotify watches(%d) was reached",
+                 name, runModConf->maxiNotifyWatches);
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+#endif
     DBGPRINTF("need to add new active object '%s' in '%s' - checking if accessible\n", name, edge->path);
     fd = open(name, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -738,6 +756,19 @@ static rsRetVal ATTR_NONNULL(1, 2) act_obj_add(fs_edge_t *const edge,
         CHKmalloc(act->multiSub.ppMsgs = malloc(inst->nMultiSub * sizeof(smsg_t *)));
         act->multiSub.maxElem = inst->nMultiSub;
         act->multiSub.nElem = 0;
+        /* initialize per-file stats */
+        act->stats = NULL;
+        STATSCOUNTER_INIT(act->bytesProcessed, act->mutBytesProcessed);
+        STATSCOUNTER_INIT(act->linesProcessed, act->mutLinesProcessed);
+        /* set up per-file stats object */
+        CHKiRet(statsobj.Construct(&act->stats));
+        CHKiRet(statsobj.SetName(act->stats, (uchar *)name));
+        CHKiRet(statsobj.SetOrigin(act->stats, (uchar *)"imfile"));
+        CHKiRet(statsobj.AddCounter(act->stats, UCHAR_CONSTANT("bytes.processed"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                    &(act->bytesProcessed)));
+        CHKiRet(statsobj.AddCounter(act->stats, UCHAR_CONSTANT("lines.processed"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                    &(act->linesProcessed)));
+        CHKiRet(statsobj.ConstructFinalize(act->stats));
         pollFile(act);
     }
 
@@ -956,7 +987,7 @@ static void ATTR_NONNULL() poll_timeouts(fs_edge_t *const edge) {
 
 /* destruct a single act_obj object */
 static void act_obj_destroy(act_obj_t *const act, const int is_deleted) {
-    uchar *statefn;
+    uchar *statefn = NULL;
     uchar statefile[MAXFNAME];
     uchar toDel[MAXFNAME];
 
@@ -978,13 +1009,29 @@ static void act_obj_destroy(act_obj_t *const act, const int is_deleted) {
     if (act->pStrm != NULL) {
         const instanceConf_t *const inst = act->edge->instarr[0];  // TODO: same file, multiple instances?
         pollFile(act); /* get any left-over data */
-        if (inst->bRMStateOnDel) {
+        /* destroy per-file stats */
+        if (act->stats) {
+            statsobj.Destruct(&act->stats);
+            act->stats = NULL;
+        }
+        if (inst->bRMStateOnDel || (is_deleted && inst->bRMStateOnMove)) {
+            int lenout;
             statefn = getStateFileName(act, statefile, sizeof(statefile));
-            getFullStateFileName(statefn, act->file_id, toDel, sizeof(toDel));  // TODO: check!
-            statefn = toDel;
+            getFileID(act);
+            lenout = getFullStateFileName(statefn, act->file_id, toDel, sizeof(toDel));
+            if (lenout < 0 || (size_t)lenout >= sizeof(toDel)) {
+                LogError(0, RS_RET_ERR, "imfile: could not get full state file name for '%s'", act->name);
+                statefn = NULL;
+            } else {
+                statefn = toDel;
+            }
         }
         persistStrmState(act);
         strm.Destruct(&act->pStrm);
+
+        /* destroy stats counter mutexes to avoid leaks (only for file objects) */
+        DESTROY_ATOMIC_HELPER_MUT64(act->mutBytesProcessed);
+        DESTROY_ATOMIC_HELPER_MUT64(act->mutLinesProcessed);
 
         /*
          * We delete the state file after the destruct operation to ensure that any pending
@@ -995,7 +1042,7 @@ static void act_obj_destroy(act_obj_t *const act, const int is_deleted) {
          *   - If the configuration specifies not to preserve the state file after the file
          *     has been renamed. This prevents orphaned state files.
          */
-        if (is_deleted && ((!act->in_move && inst->bRMStateOnDel) || inst->bRMStateOnMove)) {
+        if (statefn != NULL && is_deleted && ((!act->in_move && inst->bRMStateOnDel) || inst->bRMStateOnMove)) {
             DBGPRINTF("act_obj_destroy: deleting state file %s\n", statefn);
             unlink((char *)statefn);
         }
@@ -1587,6 +1634,14 @@ static rsRetVal ATTR_NONNULL() pollFileReal(act_obj_t *act, cstr_t **pCStr) {
             startOffs = act->pStrm->iCurrOffs; /* disable check */
         }
         runModConf->bHadFileData = 1; /* this is just a flag, so set it and forget it */
+        /* account bytes and lines processed for this file */
+        if (act->pStrm != NULL) {
+            int64_t endOffs = act->pStrm->iCurrOffs;
+            if (endOffs > strtOffs) {
+                STATSCOUNTER_ADD(act->bytesProcessed, act->mutBytesProcessed, (uint64_t)(endOffs - strtOffs));
+            }
+            STATSCOUNTER_INC(act->linesProcessed, act->mutLinesProcessed);
+        }
         CHKiRet(enqLine(act, *pCStr, strtOffs)); /* process line */
         rsCStrDestruct(pCStr); /* discard string (must be done by us!) */
         if (inst->iPersistStateInterval > 0 && ++act->nRecords >= inst->iPersistStateInterval) {
@@ -1978,6 +2033,7 @@ BEGINbeginCnfLoad
     loadModConf->readTimeout = 0; /* default: no timeout */
     loadModConf->timeoutGranularity = 1000; /* default: 1 second */
     loadModConf->haveReadTimeouts = 0; /* default: no timeout */
+    loadModConf->maxiNotifyWatches = 0; /* default: no limit */
     loadModConf->normalizePath = 1;
     loadModConf->sortFiles = GLOB_NOSORT;
     loadModConf->stateFileDirectory = NULL;
@@ -2034,6 +2090,8 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "timeoutgranularity")) {
             /* note: we need ms, thus "* 1000" */
             loadModConf->timeoutGranularity = (int)pvals[i].val.d.n * 1000;
+        } else if (!strcmp(modpblk.descr[i].name, "maxinotifywatches")) {
+            loadModConf->maxiNotifyWatches = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "sortfiles")) {
             loadModConf->sortFiles = ((sbool)pvals[i].val.d.n) ? 0 : GLOB_NOSORT;
         } else if (!strcmp(modpblk.descr[i].name, "statefile.directory")) {
@@ -2758,6 +2816,7 @@ BEGINmodExit
     objRelease(prop, CORE_COMPONENT);
     objRelease(ruleset, CORE_COMPONENT);
     objRelease(datetime, CORE_COMPONENT);
+    objRelease(statsobj, CORE_COMPONENT);
 
 #ifdef HAVE_INOTIFY_INIT
     free(wdmap);
@@ -2825,6 +2884,7 @@ BEGINmodInit()
     CHKiRet(objUse(ruleset, CORE_COMPONENT));
     CHKiRet(objUse(prop, CORE_COMPONENT));
     CHKiRet(objUse(datetime, CORE_COMPONENT));
+    CHKiRet(objUse(statsobj, CORE_COMPONENT));
 
     DBGPRINTF("version %s initializing\n", VERSION);
     CHKiRet(omsdRegCFSLineHdlr((uchar *)"inputfilename", 0, eCmdHdlrGetWord, NULL, &cs.pszFileName,

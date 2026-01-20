@@ -116,7 +116,8 @@ void nsd_ossl_lastOpenSSLErrorMsg(
     errno = errno_store;
 }
 
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+#ifndef ENABLE_WOLFSSL
+    #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
 long BIO_debug_callback_ex(BIO *bio,
                            int cmd,
                            const char __attribute__((unused)) * argp,
@@ -125,10 +126,10 @@ long BIO_debug_callback_ex(BIO *bio,
                            long __attribute__((unused)) argl,
                            int ret,
                            size_t __attribute__((unused)) * processed)
-#else
+    #else
 long BIO_debug_callback(
     BIO *bio, int cmd, const char __attribute__((unused)) * argp, int argi, long __attribute__((unused)) argl, long ret)
-#endif
+    #endif
 {
     long ret2 = ret;  // Helper value to avoid printf compile errors long<>int
     long r = 1;
@@ -138,8 +139,8 @@ long BIO_debug_callback(
         case BIO_CB_FREE:
             dbgprintf("Free - %s\n", RSYSLOG_BIO_method_name(bio));
             break;
-/* Disabled due API changes for OpenSSL 1.1.0+ */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    /* Disabled due API changes for OpenSSL 1.1.0+ */
+    #if OPENSSL_VERSION_NUMBER < 0x10100000L
         case BIO_CB_READ:
             if (bio->method->type & BIO_TYPE_DESCRIPTOR)
                 dbgprintf("read(%d,%lu) - %s fd=%d\n", RSYSLOG_BIO_number_read(bio), (unsigned long)argi,
@@ -156,14 +157,14 @@ long BIO_debug_callback(
                 dbgprintf("write(%d,%lu) - %s\n", RSYSLOG_BIO_number_written(bio), (unsigned long)argi,
                           RSYSLOG_BIO_method_name(bio));
             break;
-#else
+    #else
         case BIO_CB_READ:
             dbgprintf("read %s\n", RSYSLOG_BIO_method_name(bio));
             break;
         case BIO_CB_WRITE:
             dbgprintf("write %s\n", RSYSLOG_BIO_method_name(bio));
             break;
-#endif
+    #endif
         case BIO_CB_PUTS:
             dbgprintf("puts() - %s\n", RSYSLOG_BIO_method_name(bio));
             break;
@@ -194,6 +195,54 @@ long BIO_debug_callback(
     }
 
     return (r);
+}
+#endif /* !ENABLE_WOLFSSL */
+
+/*
+ * SNI should not be used if the hostname is a bare IP address
+ */
+static rsRetVal SetServerNameIfPresent(nsd_ossl_t *pThis, uchar *host) {
+    struct sockaddr_in sa;
+    struct sockaddr_in6 sa6;
+    int inet_pton_ret;
+    DEFiRet;
+
+    /* Always use the configured remote SNI if present */
+    if (pThis->remoteSNI != NULL) {
+        if (SSL_set_tlsext_host_name(pThis->pNetOssl->ssl, (char *)pThis->remoteSNI) != 1) {
+            nsd_ossl_lastOpenSSLErrorMsg(pThis, 0, pThis->pNetOssl->ssl, LOG_ERR, "SetServerNameIfPresent",
+                                         "SSL_set_tlsext_host_name");
+            ABORT_FINALIZE(RS_RET_SYS_ERR);
+        }
+        FINALIZE;
+    }
+
+    /* Otherwise, figure out if host is an IP address */
+    inet_pton_ret = inet_pton(AF_INET, CHAR_CONVERT(host), &(sa.sin_addr));
+
+    if (inet_pton_ret == 0) {  // host wasn't a bare IPv4 address: try IPv6
+        inet_pton_ret = inet_pton(AF_INET6, CHAR_CONVERT(host), &(sa6.sin6_addr));
+    }
+
+    /* Then make a decision */
+    switch (inet_pton_ret) {
+        case 1:  // host is a valid IP address: don't use SNI
+            FINALIZE;
+        case 0:  // host isn't a valid IP address: assume it's a domain name, use SNI
+            if (SSL_set_tlsext_host_name(pThis->pNetOssl->ssl, (char *)host) != 1) {
+                nsd_ossl_lastOpenSSLErrorMsg(pThis, 0, pThis->pNetOssl->ssl, LOG_ERR, "SetServerNameIfPresent",
+                                             "SSL_set_tlsext_host_name");
+                ABORT_FINALIZE(RS_RET_SYS_ERR);
+            }
+            FINALIZE;
+        default:  // unexpected error
+            nsd_ossl_lastOpenSSLErrorMsg(pThis, 0, pThis->pNetOssl->ssl, LOG_ERR, "SetServerNameIfPresent",
+                                         "inet_pton");
+            ABORT_FINALIZE(RS_RET_INVALID_HNAME);
+    }
+
+finalize_it:
+    RETiRet;
 }
 
 /* try to receive a record from the remote peer. This works with
@@ -307,7 +356,9 @@ static rsRetVal osslInitSession(nsd_ossl_t *pThis, osslSslState_t osslType) /* ,
         }
     } else if (pThis->gnutlsPriorityString == NULL) {
 /* Allow ANON Ciphers only in ANON Mode and if no custom priority string is defined */
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+#ifdef ENABLE_WOLFSSL
+        strncpy(pristringBuf, "ADH-AES256-GCM-SHA384:ADH-AES128-SHA", sizeof(pristringBuf));
+#elif OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
         /* NOTE: do never use: +eNULL, it DISABLES encryption! */
         strncpy(pristringBuf, "ALL:+COMPLEMENTOFDEFAULT:+ADH:+ECDH:+aNULL@SECLEVEL=0", sizeof(pristringBuf));
 #else
@@ -316,7 +367,12 @@ static rsRetVal osslInitSession(nsd_ossl_t *pThis, osslSslState_t osslType) /* ,
 
         dbgprintf("osslInitSession: setting anon ciphers: %s\n", pristringBuf);
         if (SSL_set_cipher_list(pThis->pNetOssl->ssl, pristringBuf) == 0) {
+#ifdef ENABLE_WOLFSSL
+            LogMsg(0, RS_RET_SYS_ERR, LOG_ERR,
+                   "osslInitSession: Error setting anon ciphers '%s' (wolfSSL requires --enable-anon)\n", pristringBuf);
+#else
             dbgprintf("osslInitSession: Error setting ciphers '%s'\n", pristringBuf);
+#endif
             ABORT_FINALIZE(RS_RET_SYS_ERR);
         }
     }
@@ -511,6 +567,7 @@ BEGINobjDestruct(nsd_ossl) /* be sure to specify the object type also in END and
 
     free(pThis->pszConnectHost);
     free(pThis->pszRcvBuf);
+    free(pThis->remoteSNI);
 ENDobjDestruct(nsd_ossl)
 
 
@@ -822,7 +879,7 @@ rsRetVal osslPostHandshakeCheck(nsd_ossl_t *pNsd) {
     if (SSL_get_shared_ciphers(pNsd->pNetOssl->ssl, szDbg, sizeof szDbg) != NULL)
         dbgprintf("osslPostHandshakeCheck: Debug Shared ciphers = %s\n", szDbg);
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(ENABLE_WOLFSSL)
     if (SSL_get_shared_curve(pNsd->pNetOssl->ssl, -1) == 0) {
         // This is not a failure
         LogMsg(0, RS_RET_NO_ERRCODE, LOG_INFO,
@@ -990,14 +1047,18 @@ static rsRetVal AcceptConnReq(nsd_t *pNsd, nsd_t **ppNew, char *const connInfo) 
     pNew->pNetOssl->pPermPeers = pThis->pNetOssl->pPermPeers;
     pNew->pNetOssl->bSANpriority = pThis->pNetOssl->bSANpriority;
     pNew->DrvrVerifyDepth = pThis->DrvrVerifyDepth;
+    pNew->DrvrTlsRevocationCheck = pThis->DrvrTlsRevocationCheck;
     pNew->gnutlsPriorityString = pThis->gnutlsPriorityString;
     pNew->pNetOssl->ctx = pThis->pNetOssl->ctx;
     pNew->pNetOssl->ctx_is_copy = 1;  // do not free on pNew Destruction
     CHKiRet(osslInitSession(pNew, osslServer));
 
-    /* Store nsd_ossl_t* reference in SSL obj */
+    /* Store nsd_ossl_t* reference in SSL obj
+     * Index allocation: 0=pTcp, 1=permitExpiredCerts, 2=imdtls instance, 3=revocationCheck
+     */
     SSL_set_ex_data(pNew->pNetOssl->ssl, 0, pThis->pTcp);
     SSL_set_ex_data(pNew->pNetOssl->ssl, 1, &pThis->permitExpiredCerts);
+    SSL_set_ex_data(pNew->pNetOssl->ssl, 3, &pThis->DrvrTlsRevocationCheck);
 
     /* We now do the handshake */
     CHKiRet(osslHandshakeCheck(pNew));
@@ -1268,9 +1329,14 @@ static rsRetVal Connect(nsd_t *pNsd, int family, uchar *port, uchar *host, char 
     /* Do SSL Session init */
     CHKiRet(osslInitSession(pThis, osslClient));
 
-    /* Store nsd_ossl_t* reference in SSL obj */
+    CHKiRet(SetServerNameIfPresent(pThis, host));
+
+    /* Store nsd_ossl_t* reference in SSL obj
+     * Index allocation: 0=pTcp, 1=permitExpiredCerts, 2=imdtls instance, 3=revocationCheck
+     */
     SSL_set_ex_data(pThis->pNetOssl->ssl, 0, pThis->pTcp);
     SSL_set_ex_data(pThis->pNetOssl->ssl, 1, &pThis->permitExpiredCerts);
+    SSL_set_ex_data(pThis->pNetOssl->ssl, 3, &pThis->DrvrTlsRevocationCheck);
 
     /* We now do the handshake */
     iRet = osslHandshakeCheck(pThis);
@@ -1295,7 +1361,7 @@ static rsRetVal SetGnutlsPriorityString(nsd_t *const pNsd, uchar *const gnutlsPr
     nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
     ISOBJ_TYPE_assert(pThis, nsd_ossl);
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
     sbool ApplySettings = 0;
     if ((gnutlsPriorityString != NULL && pThis->gnutlsPriorityString == NULL) ||
         (gnutlsPriorityString != NULL &&
@@ -1327,7 +1393,7 @@ static rsRetVal applyGnutlsPriorityString(nsd_ossl_t *const pThis) {
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, nsd_ossl);
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
     /* Note: we disable unkonwn functions. The corresponding error message is
      * generated during SetGntuTLSPriorityString().
      */
@@ -1338,7 +1404,9 @@ static rsRetVal applyGnutlsPriorityString(nsd_ossl_t *const pThis) {
     }
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
 finalize_it:
+#endif
     RETiRet;
 }
 
@@ -1398,6 +1466,21 @@ static rsRetVal SetTlsVerifyDepth(nsd_t *pNsd, int verifyDepth) {
     pThis->DrvrVerifyDepth = verifyDepth;
 
 finalize_it:
+    RETiRet;
+}
+
+/* Set TLS revocation check (OCSP/CRL)
+ * 0 - disable revocation checking (default for compatibility)
+ * 1 - enable revocation checking via OCSP (and CRL when implemented)
+ */
+static rsRetVal SetTlsRevocationCheck(nsd_t *pNsd, int enabled) {
+    DEFiRet;
+    nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
+
+    ISOBJ_TYPE_assert((pThis), nsd_ossl);
+    pThis->DrvrTlsRevocationCheck = (enabled != 0) ? 1 : 0;
+    dbgprintf("SetTlsRevocationCheck: revocation check %s\n", pThis->DrvrTlsRevocationCheck ? "enabled" : "disabled");
+
     RETiRet;
 }
 
@@ -1467,6 +1550,34 @@ finalize_it:
     RETiRet;
 }
 
+/* Set the TLS SNI of the remote server */
+static rsRetVal SetRemoteSNI(nsd_t *pNsd, uchar *remoteSNI) {
+    DEFiRet;
+    nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
+
+    ISOBJ_TYPE_assert(pThis, nsd_ossl);
+
+    free(pThis->remoteSNI);
+    if (remoteSNI == NULL) {
+        pThis->remoteSNI = NULL;
+    } else {
+        CHKmalloc(pThis->remoteSNI = (uchar *)strdup((char *)remoteSNI));
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal GetRemotePort(nsd_t *pNsd, int *port) {
+    nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
+    ISOBJ_TYPE_assert((pThis), nsd_ossl);
+    return nsd_ptcp.GetRemotePort(pThis->pTcp, port);
+}
+
+static rsRetVal FmtRemotePortStr(const int port, uchar *const buf, const size_t len) {
+    return nsd_ptcp.FmtRemotePortStr(port, buf, len);
+}
+
 
 /* queryInterface function */
 BEGINobjQueryInterface(nsd_ossl)
@@ -1506,10 +1617,14 @@ BEGINobjQueryInterface(nsd_ossl)
     pIf->SetCheckExtendedKeyUsage = SetCheckExtendedKeyUsage; /* we don't NEED this interface! */
     pIf->SetPrioritizeSAN = SetPrioritizeSAN;
     pIf->SetTlsVerifyDepth = SetTlsVerifyDepth;
+    pIf->SetTlsRevocationCheck = SetTlsRevocationCheck;
     pIf->SetTlsCAFile = SetTlsCAFile;
     pIf->SetTlsCRLFile = SetTlsCRLFile;
     pIf->SetTlsKeyFile = SetTlsKeyFile;
     pIf->SetTlsCertFile = SetTlsCertFile;
+    pIf->GetRemotePort = GetRemotePort;
+    pIf->FmtRemotePortStr = FmtRemotePortStr;
+    pIf->SetRemoteSNI = SetRemoteSNI;
 
 finalize_it:
 ENDobjQueryInterface(nsd_ossl)
