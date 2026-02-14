@@ -339,6 +339,7 @@ EXTRA_DIST = \
     source/faq/etl_tool.rst \
     source/faq/faq_overall.rst \
     source/faq/imtcp-tls-gibberish.rst \
+    source/faq/impstats-push-mode.rst \
     source/faq/imudp-packet-loss.rst \
     source/faq/index.rst \
     source/faq/vespa-ai-integration.rst \
@@ -1169,6 +1170,7 @@ EXTRA_DIST = \
     source/tutorials/gelf_forwarding.rst \
     source/tutorials/hash_sampling.rst \
     source/tutorials/high_database_rate.rst \
+    source/tutorials/impstats_push_victoriametrics.rst \
     source/tutorials/index.rst \
     source/tutorials/log_rotation_fix_size.rst \
     source/tutorials/log_sampling.rst \
