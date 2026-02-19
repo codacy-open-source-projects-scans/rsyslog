@@ -13,6 +13,7 @@
 
 import json
 import os
+import re
 import sys
 from urllib.parse import urljoin
 
@@ -228,14 +229,27 @@ rst_epilog = """
 # real values will be generated dynamically from info in the repo. If the
 # user builds the docs from "bare" sources not yet processed
 ###############################################################################
-#version = '8.2512'
-release = '8.2602.0'
-#release = version + ' daily stable'
+version = '8.2604'
+#release = '8.2604.0'
+release = version + ' daily stable'
 
+# Allow override from environment (e.g. Docker/CI builds without .git)
+_env_version = os.environ.get('RSYSLOG_DOC_VERSION')
+_env_release_type = os.environ.get('RSYSLOG_DOC_RELEASE_TYPE')
+if _env_version and _env_release_type:
+    version = _env_version
+    release_type = _env_release_type
+    release = f"{version} daily {release_type}"
+    if release_type == 'dev':
+        release_string_detail = 'simple'
+    rst_prolog = rst_prolog.format(
+        doc_build=release,
+        doc_commit='N/A',
+        doc_branch='N/A')
 # For this to be true, it means that we are not attempting to build from
 # a release tarball, as otherwise the values above would have been replaced
 # with official stable release values.
-if version == '8':
+elif version == '8':
 
     # Confirm that a .git folder is available. If not, skip all
     # following steps intended to generate daily stable build values for
@@ -391,16 +405,22 @@ if tags.has('with_sitemap'):
 # Enable Google Analytics tracking when a tracking ID is provided via
 # the GOOGLE_ANALYTICS_ID environment variable.
 _ga_id = os.environ.get('GOOGLE_ANALYTICS_ID', '')
+if _ga_id and not re.match(r'^(UA-\d+-\d+|G-[A-Za-z0-9]+)$', _ga_id):
+    print("Warning: Invalid GOOGLE_ANALYTICS_ID format: '%s'. "
+          "Disabling GA." % _ga_id, file=sys.stderr)
+    _ga_id = ''
+_ga_use_extension = False
 if _ga_id:
     try:
         import sphinxcontrib.googleanalytics  # type: ignore  # noqa: F401
     except ImportError:
-        # Optional extension - analytics skipped if not installed
+        # Extension not installed – fall back to metatags injection in setup().
         pass
     else:
         extensions.append('sphinxcontrib.googleanalytics')
         googleanalytics_id = _ga_id
         googleanalytics_enabled = True
+        _ga_use_extension = True
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
@@ -598,6 +618,25 @@ def setup(app):
 
     if ENABLE_JSON_LD:
         app.connect('html-page-context', _add_json_ld_to_context)
+
+    # Google Analytics: inject gtag script via metatags when the
+    # sphinxcontrib.googleanalytics extension is not handling it.
+    if _ga_id and not _ga_use_extension:
+        def _inject_ga(app, pagename, templatename, context, doctree):
+            if app.builder.format == 'html':
+                m = context.get('metatags', '')
+                m += (
+                    '\n<script async src="https://www.googletagmanager.com/'
+                    'gtag/js?id=%s"></script>\n'
+                    '<script>\n'
+                    'window.dataLayer = window.dataLayer || [];\n'
+                    'function gtag(){dataLayer.push(arguments);}\n'
+                    'gtag("js", new Date());\n'
+                    'gtag("config", "%s");\n'
+                    '</script>\n'
+                ) % (_ga_id, _ga_id)
+                context['metatags'] = m
+        app.connect('html-page-context', _inject_ga)
 
 
 def _add_json_ld_to_context(app, pagename, templatename, context, doctree):
