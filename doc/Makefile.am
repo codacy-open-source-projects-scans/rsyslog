@@ -317,6 +317,7 @@ EXTRA_DIST = \
     source/development/coding_practices/externalized_helper_contracts.rst \
     source/development/config_data_model.rst \
     source/development/debugging.rst \
+    source/development/design_decisions.rst \
     source/development/dev_action_threads.rst \
     source/development/dev_codestyle.rst \
     source/development/dev_oplugins.rst \
@@ -328,6 +329,7 @@ EXTRA_DIST = \
     source/development/generic_design.rst \
     source/development/index.rst \
     source/development/internal_tooling.rst \
+    source/development/yaml_config_architecture.rst \
     source/development/queueWorkerLogic.jpg \
     source/direct_queue0.png \
     source/direct_queue1.png \
@@ -451,8 +453,14 @@ EXTRA_DIST = \
     source/rainerscript/variable_property_types.rst \
     source/reference/parameters/im3195-input3195listenport.rst \
     source/reference/parameters/imdiag-aborttimeout.rst \
+    source/reference/parameters/imdiag-defaultactionqueuetimeoutenqueue.rst \
+    source/reference/parameters/imdiag-defaultactionqueuetimeoutshutdown.rst \
     source/reference/parameters/imdiag-injectdelaymode.rst \
+    source/reference/parameters/imdiag-inputshutdowntimeout.rst \
     source/reference/parameters/imdiag-listenportfilename.rst \
+    source/reference/parameters/imdiag-listenportfilename-module.rst \
+    source/reference/parameters/imdiag-mainmsgqueuetimeoutenqueue.rst \
+    source/reference/parameters/imdiag-mainmsgqueuetimeoutshutdown.rst \
     source/reference/parameters/imdiag-maxsessions.rst \
     source/reference/parameters/imdiag-serverinputname.rst \
     source/reference/parameters/imdiag-serverrun.rst \
