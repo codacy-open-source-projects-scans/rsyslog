@@ -10,6 +10,13 @@ agents.
 - The directory implements the Automake testbench that exercises rsyslog.
 - Each `.sh` script is a standalone scenario that can be executed directly or
   through `make check`.
+- Treat `tests/` as the single recursive test-owning subtree. Keep new unit
+  test sources under `tests/unit/` or similar subfolders, but register and run
+  them from `tests/Makefile.am` instead of creating another recursive
+  `tests/.../Makefile.am` harness. Recursive Automake propagates
+  `make check TESTS=...` into every subdirectory, so splitting test ownership
+  across multiple subdirs creates fragile name collisions and selection
+  failures.
 - Use this guide together with the top-level `AGENTS.md` and the component
   guide that matches the module you are testing.
 
@@ -28,13 +35,15 @@ agents.
   as its RainerScript counterpart.  See the `rsyslog_config` skill for full
   conventions.
 - Name Valgrind-enabled wrappers with the `-vg.sh` suffix and toggle Valgrind by
-  exporting `USE_VALGRIND` before sourcing the non-`vg` script. Use
-  `tests/timereported-utc-vg.sh` as the reference layout: it sources the base
-  scenario instead of copying it and demonstrates paring back emitted messages
-  when the underlying test is slow—especially important under Valgrind. Older
-  wrappers still duplicate logic; prefer the modern pattern when touching them.
+  exporting `USE_VALGRIND` before including the non-`vg` script using the `.`
+  command. Use `tests/timereported-utc-vg.sh` as the reference layout: it
+  includes the base scenario using the `.` command instead of copying it and
+  demonstrates paring back emitted messages when the underlying test is
+  slow—especially important under Valgrind. Older wrappers still duplicate
+  logic; prefer the modern pattern when touching them.
 - Put auxiliary binaries next to their scripts (e.g. `*.c` programs compiled via
-  the Automake harness) and list them in `tests/Makefile.am`.
+  the Automake harness) and list them in `tests/Makefile.am`. Unit-test sources
+  may live in `tests/unit/`, but the owning harness remains `tests/Makefile.am`.
 - Keep long-lived configuration snippets in `tests/testsuites/` and reuse them
   instead of copying large config blocks into multiple scripts.
 - Document new environment flags or helper functions inside `diag.sh` so other
@@ -51,6 +60,9 @@ agents.
   (`./tests/imfile-basic.sh`).
 - Use `make check TESTS='script.sh'` when you need Automake logging,
   parallelisation control, or to exercise the Valgrind wrappers.
+- For unit binaries registered in `tests/Makefile.am`, use
+  `make check TESTS='binary_name'` from the repository root so Automake builds
+  the required runtime libraries before entering `tests/`.
 
 ### Multi-Module Test Guards
 When adding a test that requires multiple modules (e.g., `imtcp` AND `imptcp`), you **MUST** wrap the test definition in `tests/Makefile.am` with significantly separate conditionals for **ALL** required modules. Do not assume one implies the others.
