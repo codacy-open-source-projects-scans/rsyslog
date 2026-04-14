@@ -104,6 +104,7 @@ TESTS_DEFAULT = \
 	hostname-with-slash-dflt-slash-valid.sh \
 	empty-app-name.sh \
 	endswith-basic.sh \
+	contains-longer-needle.sh \
 	stop-localvar.sh \
 	stop-msgvar.sh \
 	glbl-ruleset-queue-defaults.sh \
@@ -576,6 +577,7 @@ TESTS_LIBYAML = \
 	yaml-script-msgvar.sh \
 	yaml-imfile-basic.sh \
 	yaml-propfilt-basic.sh \
+	yaml-propfilt-contains-longer-needle.sh \
 	yaml-statements-basic.sh \
 	yaml-statements-stop.sh \
 	yaml-statements-call.sh \
@@ -658,6 +660,9 @@ TESTS_SNMP_FULL = \
 TESTS_MMUTF8FIX = \
         mmutf8fix_no_error.sh \
         mmutf8fix_tag.sh
+
+TESTS_MMUTF8FIX_SD = \
+        mmutf8fix_sd.sh
 
 TESTS_MMAITAG = \
         mmaitag-basic.sh \
@@ -1751,6 +1756,7 @@ EXTRA_DIST += $(TESTS_RATELIMIT)
 EXTRA_DIST += $(TESTS_SNMP_MINIMAL)
 EXTRA_DIST += $(TESTS_SNMP_FULL)
 EXTRA_DIST += $(TESTS_MMUTF8FIX)
+EXTRA_DIST += $(TESTS_MMUTF8FIX_SD)
 EXTRA_DIST += $(TESTS_MMAITAG)
 EXTRA_DIST += $(TESTS_MAIL)
 EXTRA_DIST += $(TESTS_MMANON)
@@ -1918,11 +1924,14 @@ liboverride_getaddrinfo_la_CFLAGS =
 liboverride_getaddrinfo_la_LDFLAGS = -avoid-version -shared
 
 # TODO: reenable TESTRUNS = rt_init rscript
-check_PROGRAMS = runtime_unit_linkedlist
-TESTS = runtime_unit_linkedlist
+check_PROGRAMS = runtime_unit_linkedlist runtime_unit_stringbuf
+TESTS = runtime_unit_linkedlist runtime_unit_stringbuf
 
 runtime_unit_linkedlist_SOURCES = \
 	unit/linkedlist_test.c
+
+runtime_unit_stringbuf_SOURCES = \
+	unit/stringbuf_test.c
 
 runtime_unit_linkedlist_CPPFLAGS = \
 	-DSD_EXPORT_SYMBOLS \
@@ -1939,10 +1948,15 @@ runtime_unit_linkedlist_CPPFLAGS = \
 	-I$(top_srcdir)/runtime \
 	-I$(top_srcdir)/tools
 
+runtime_unit_stringbuf_CPPFLAGS = \
+	$(runtime_unit_linkedlist_CPPFLAGS)
+
 runtime_unit_linkedlist_LDADD = $(RSRT_LIBS) $(PTHREADS_LIBS) $(SOL_LIBS)
+runtime_unit_stringbuf_LDADD = $(LIBESTR_LIBS) $(LIBFASTJSON_LIBS) $(LIBSYSTEMD_LIBS) $(PTHREADS_LIBS) $(SOL_LIBS)
 
 if ENABLE_LIBLOGGING_STDLOG
 runtime_unit_linkedlist_CPPFLAGS += $(LIBLOGGING_STDLOG_CFLAGS)
+runtime_unit_stringbuf_CPPFLAGS += $(LIBLOGGING_STDLOG_CFLAGS)
 endif
 
 if ENABLE_TESTBENCH
@@ -2153,6 +2167,12 @@ endif # if ENABLE_SNMP
 
 if ENABLE_MMUTF8FIX
 TESTS += $(TESTS_MMUTF8FIX)
+endif # if ENABLE_MMUTF8FIX
+
+if ENABLE_MMUTF8FIX
+if ENABLE_MMPSTRUCDATA
+TESTS += $(TESTS_MMUTF8FIX_SD)
+endif # if ENABLE_MMPSTRUCDATA
 endif # if ENABLE_MMUTF8FIX
 
 
