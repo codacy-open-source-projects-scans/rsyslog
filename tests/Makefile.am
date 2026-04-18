@@ -17,6 +17,13 @@ EXTRA_DIST = \
 TESTS_JSON_OMITIFZERO = json-omitifzero.sh json-omitifzero-subtree.sh json-whitespace.sh
 EXTRA_DIST += $(TESTS_JSON_OMITIFZERO)
 
+TESTS_GSSAPI = \
+	imgssapi-listen-port-file.sh \
+	imgssapi-maxsessions.sh
+TESTS_GSSAPI_LIBYAML = \
+	imgssapi-yaml-include-listen-port-file.sh
+EXTRA_DIST += $(TESTS_GSSAPI) $(TESTS_GSSAPI_LIBYAML) unit/gss_token_util_test.c
+
 TESTS_IMPTCP_TABESCAPE = \
 	tabescape_dflt.sh \
 	tabescape_dflt-udp.sh \
@@ -229,6 +236,8 @@ TESTS_DEFAULT = \
 	diskqueue-fsync.sh \
 	diskqueue-full.sh \
 	diskqueue-fail.sh \
+	queue-invalid-spooldirectory-empty.sh \
+	queue-invalid-workerthreads-zero.sh \
 	diskqueue-oncorruption-missing-segment.sh \
 	diskqueue-non-unique-prefix.sh \
 	rulesetmultiqueue.sh \
@@ -584,7 +593,6 @@ TESTS_LIBYAML = \
 	yaml-statements-stop.sh \
 	yaml-statements-call.sh \
 	yaml-statements-unset.sh \
-	yaml-statements-foreach.sh \
 	yaml-template-list.sh \
 	yaml-template-subtree.sh \
 	yaml-statements-reload-lookup.sh
@@ -595,6 +603,10 @@ TESTS_RATELIMIT_WATCH = \
 	ratelimit_policy_watch_invalid.sh \
 	ratelimit_policy_watch_multi.sh \
 	yaml-ratelimit-policywatch.sh
+
+TESTS_LIBYAML_IMPTCP_MMJSONPARSE = \
+	yaml-statements-foreach.sh \
+	yaml-statements-complex.sh
 
 TESTS_IMTCP = \
 	fromhost-port.sh \
@@ -811,6 +823,7 @@ TESTS_OMHTTP_FLAKY_VALGRIND = \
 TESTS_IMJOURNAL = \
 	imjournal-basic.sh \
 	imjournal-statefile.sh \
+	imjournal-statefile-symlink.sh \
 	imjournal_ratelimit_name.sh
 
 TESTS_IMJOURNAL_VALGRIND = \
@@ -983,6 +996,9 @@ TESTS_IMDOCKER_VALGRIND = \
 TESTS_IMHTTP = \
 	imhttp-post-payload.sh \
 	imhttp-post-payload-basic-auth.sh \
+	imhttp-post-payload-api-key-auth.sh \
+	imhttp-post-payload-auth-header-limits.sh \
+	imhttp-post-payload-mixed-auth.sh \
 	imhttp-post-payload-query-params.sh \
 	imhttp-post-payload-large.sh \
 	imhttp-post-payload-multi.sh \
@@ -991,6 +1007,8 @@ TESTS_IMHTTP = \
 	imhttp-getrequest-file.sh \
 	imhttp-healthcheck.sh \
 	imhttp-metrics.sh \
+	imhttp-healthcheck-api-key-auth.sh \
+	imhttp-metrics-api-key-auth.sh \
 	imhttp_ratelimit_name.sh
 
 TESTS_IMHTTP_VALGRIND = \
@@ -1237,6 +1255,10 @@ TESTS_OMSTDOUT = \
 TESTS_LIBYAML_IMTCP = \
 	config-translate-rs-roundtrip.sh \
 	config-translate-yaml-roundtrip.sh
+
+TESTS_LIBYAML_IMHTTP = \
+	yaml-imhttp-apikeyfile.sh \
+	yaml-imhttp-metrics-apikeyfile.sh
 
 TESTS_LIBYAML_OMSTDOUT = \
 	config-translate-legacy-warning.sh
@@ -1760,7 +1782,9 @@ EXTRA_DIST += $(TESTS_DEFAULT_VALGRIND)
 EXTRA_DIST += $(TESTS_LIBGCRYPT_VALGRIND)
 EXTRA_DIST += $(TESTS_LIBYAML)
 EXTRA_DIST += $(TESTS_RATELIMIT_WATCH)
+EXTRA_DIST += $(TESTS_LIBYAML_IMPTCP_MMJSONPARSE)
 EXTRA_DIST += $(TESTS_LIBYAML_IMTCP)
+EXTRA_DIST += $(TESTS_LIBYAML_IMHTTP)
 EXTRA_DIST += $(TESTS_LIBYAML_OMSTDOUT)
 EXTRA_DIST += $(TESTS_IMTCP)
 EXTRA_DIST += $(TESTS_IMTCP_YAML)
@@ -1950,6 +1974,18 @@ runtime_unit_linkedlist_SOURCES = \
 runtime_unit_stringbuf_SOURCES = \
 	unit/stringbuf_test.c
 
+if ENABLE_GSSAPI
+check_PROGRAMS += runtime_unit_gss_token_util
+TESTS += runtime_unit_gss_token_util
+
+runtime_unit_gss_token_util_SOURCES = \
+	unit/gss_token_util_test.c
+
+runtime_unit_gss_token_util_CPPFLAGS = \
+	$(runtime_unit_linkedlist_CPPFLAGS)
+runtime_unit_gss_token_util_LDADD = $(PTHREADS_LIBS) $(SOL_LIBS)
+endif
+
 runtime_unit_linkedlist_CPPFLAGS = \
 	-DSD_EXPORT_SYMBOLS \
 	-D_PATH_MODDIR=\"$(pkglibdir)/\" \
@@ -1992,6 +2028,13 @@ check_PROGRAMS += journal_print
 endif
 endif # if ENABLE_JOURNAL_TESTS
 TESTS += $(TESTRUNS)
+
+if ENABLE_GSSAPI
+TESTS += $(TESTS_GSSAPI)
+if HAVE_LIBYAML
+TESTS += $(TESTS_GSSAPI_LIBYAML)
+endif # HAVE_LIBYAML
+endif
 
 
 
@@ -2138,9 +2181,17 @@ TESTS += $(TESTS_LIBYAML)
 if ENABLE_INOTIFY
 TESTS += $(TESTS_RATELIMIT_WATCH)
 endif # ENABLE_INOTIFY
+if ENABLE_IMPTCP
+if ENABLE_MMJSONPARSE
+TESTS += $(TESTS_LIBYAML_IMPTCP_MMJSONPARSE)
+endif # ENABLE_MMJSONPARSE
+endif # ENABLE_IMPTCP
 if ENABLE_IMTCP_TESTS
 TESTS += $(TESTS_LIBYAML_IMTCP)
 endif # ENABLE_IMTCP_TESTS
+if ENABLE_IMHTTP
+TESTS += $(TESTS_LIBYAML_IMHTTP)
+endif # ENABLE_IMHTTP
 if ENABLE_OMSTDOUT
 TESTS += $(TESTS_LIBYAML_OMSTDOUT)
 endif # ENABLE_OMSTDOUT
@@ -3042,6 +3093,7 @@ EXTRA_DIST += \
 	testsuites/tokenized_input \
 	testsuites/complex_replace_input \
 	testsuites/wrap3_input\
+	testsuites/yaml_complex_input \
 	testsuites/json_array_input \
 	testsuites/json_object_input \
 	testsuites/json_nonarray_input \
@@ -3101,6 +3153,7 @@ EXTRA_DIST += \
 	testsuites/action-tx-errfile.result \
 	improg-multiline-test.py \
 	testsuites/imhttp-large-data.txt \
+	testsuites/imhttp-apikeys.txt \
 	testsuites/docroot/file.txt \
 	testsuites/htpasswd \
 	omhttp_server.py \
