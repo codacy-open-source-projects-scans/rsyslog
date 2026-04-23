@@ -1172,6 +1172,15 @@ TESTS_IMPTCP = \
 	omfile-sizelimitcmd-many.sh \
 	omfile-outchannel-many.sh
 
+TESTS_IMPTCP_STREAM_ALWAYS = \
+	imptcp-stream-always-basic.sh \
+	imptcp-stream-always-flushoff.sh \
+	imptcp-stream-always-corrupt.sh \
+	imptcp-stream-always-truncated.sh
+
+TESTS_IMPTCP_STREAM_ALWAYS_IMPSTATS = \
+	imptcp-stream-always-impstats.sh
+
 TESTS_IMPTCP_VALGRIND = \
 	imptcp-octet-framing-too-long-vg.sh \
 	imptcp_conndrop-vg.sh
@@ -1651,6 +1660,7 @@ TESTS_IMFILE = \
 	imfile-statefile-no-file_id.sh \
 	imfile-statefile-no-file_id-TO-file_id.sh \
 	imfile-statefile-directory.sh \
+	imfile-bad-state-file.sh \
 	imfile-statefile-delete.sh \
 	imfile-statefile-no-delete.sh \
 	imfile-persist-state-1.sh \
@@ -1860,6 +1870,8 @@ EXTRA_DIST += $(TESTS_IMPSTATS)
 EXTRA_DIST += $(TESTS_IMPSTATS_PUSH)
 EXTRA_DIST += $(TESTS_IMPSTATS_VALGRIND)
 EXTRA_DIST += $(TESTS_IMPTCP)
+EXTRA_DIST += $(TESTS_IMPTCP_STREAM_ALWAYS)
+EXTRA_DIST += $(TESTS_IMPTCP_STREAM_ALWAYS_IMPSTATS)
 EXTRA_DIST += $(TESTS_IMPTCP_VALGRIND)
 EXTRA_DIST += $(TESTS_IMPTCP_FMHASH_VALGRIND)
 EXTRA_DIST += $(TESTS_IMPTCP_FMUNFLATTEN)
@@ -2615,6 +2627,7 @@ if ENABLE_IMPTCP
 # note that some tests simply USE imptcp, but they also
 # need to be disabled if we do not have this module
 TESTS += $(TESTS_IMPTCP)
+TESTS += $(TESTS_IMPTCP_STREAM_ALWAYS)
 if HAVE_VALGRIND
 TESTS += $(TESTS_IMPTCP_VALGRIND)
 if ENABLE_FMHASH
@@ -2633,6 +2646,9 @@ if HAVE_VALGRIND
 TESTS += $(TESTS_IMPTCP_FFAUP_VALGRIND)
 endif # HAVE_VALGRIND
 endif # ENABLE_FFAUP
+if ENABLE_IMPSTATS
+TESTS += $(TESTS_IMPTCP_STREAM_ALWAYS_IMPSTATS)
+endif # ENABLE_IMPSTATS
 endif
 
 

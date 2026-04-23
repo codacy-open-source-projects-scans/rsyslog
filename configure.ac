@@ -2,9 +2,9 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-AC_INIT([rsyslog],[8.2604.0],[rsyslog@lists.adiscon.com])     # UPDATE on release
+AC_INIT([rsyslog],[8.2606.0.daily],[rsyslog@lists.adiscon.com])     # UPDATE on release
 AC_DEFINE(VERSION_YEAR,  26, [year part of real rsyslog version])   # UPDATE on release
-AC_DEFINE(VERSION_MONTH,  4, [month part of real rsyslog version])  # UPDATE on release
+AC_DEFINE(VERSION_MONTH,  6, [month part of real rsyslog version])  # UPDATE on release
 
 AM_INIT_AUTOMAKE([tar-pax subdir-objects])
 
@@ -244,7 +244,8 @@ AC_TYPE_SIGNAL
 AC_FUNC_STAT
 AC_FUNC_STRERROR_R
 AC_FUNC_VPRINTF
-AC_CHECK_FUNCS([flock recvmmsg basename alarm clock_gettime gethostbyname gethostname gettimeofday localtime_r memset mkdir regcomp select setsid socket strcasecmp strchr strdup strerror strndup strnlen strrchr strstr strtol strtoul uname ttyname_r getline malloc_trim prctl epoll_create epoll_create1 fdatasync syscall lseek64 asprintf close_range pthread_setname_np])
+AC_CHECK_FUNCS([flock recvmmsg basename alarm clock_gettime gethostbyname gethostname gettimeofday localtime_r memset mkdir regcomp select setsid socket strcasecmp strchr strdup strerror strndup strnlen strrchr strstr strtol strtoul uname ttyname_r getline malloc_trim prctl epoll_create epoll_create1 fdatasync syscall lseek64 asprintf vasprintf close_range pthread_setname_np])
+AC_CHECK_DECLS([asprintf, vasprintf], [], [], [[#include <stdio.h>]])
 AC_CHECK_FUNC([setns], [AC_DEFINE([HAVE_SETNS], [1], [Define if setns exists.])])
 AC_CHECK_TYPES([off64_t])
 
