@@ -29,6 +29,7 @@
 #include "config.h"
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -88,6 +89,7 @@ static uchar *LocalFQDNName = NULL; /* our hostname as FQDN - read-only after st
 static uchar *LocalDomain = NULL; /* our local domain name  - read-only after startup, except HUP */
 static int iMaxLine = 8096;
 int bTerminateInputs = 0; /* global switch that inputs shall terminate ASAP (1=> terminate) */
+volatile sig_atomic_t bTerminateInputsSigSafe = 0;
 int glblUnloadModules = 1;
 int glblAbortOnProgramError = 0;
 char **glblDbgFiles = NULL;
@@ -110,6 +112,7 @@ DEF_ATOMIC_HELPER_MUT(mutTerminateInputs);
 static int iFdSetSize = howmany(FD_SETSIZE, __NFDBITS) * sizeof(fd_mask); /* size of select() bitmask in bytes */
 #endif
 static uchar *SourceIPofLocalClient = NULL; /* [ar] Source IP for local client to be used on multihomed host */
+static uchar *GetDfltNetstrmDrvr(rsconf_t *cnf);
 
 /* tables for interfacing with the v6 config system */
 static struct cnfparamdescr cnfparamdescr[] = {
@@ -140,6 +143,7 @@ static struct cnfparamdescr cnfparamdescr[] = {
     {"action.reportsuspensioncontinuation", eCmdHdlrBinary, 0},
     {"parser.controlcharacterescapeprefix", eCmdHdlrGetChar, 0},
     {"parser.droptrailinglfonreception", eCmdHdlrBinary, 0},
+    {"parser.droptrailingcronreception", eCmdHdlrBinary, 0},
     {"parser.escapecontrolcharactersonreceive", eCmdHdlrBinary, 0},
     {"parser.spacelfonreceive", eCmdHdlrBinary, 0},
     {"parser.escape8bitcharactersonreceive", eCmdHdlrBinary, 0},
@@ -164,6 +168,12 @@ static struct cnfparamdescr cnfparamdescr[] = {
     {"net.aclresolvehostname", eCmdHdlrBinary, 0},
     {"net.enabledns", eCmdHdlrBinary, 0},
     {"net.permitACLwarning", eCmdHdlrBinary, 0},
+    {"maxopenfiles", eCmdHdlrPositiveInt, 0},
+    {"compatibility.configformat.legacy", eCmdHdlrGetWord, 0},
+    {"compatibility.configformat.syslogd", eCmdHdlrGetWord, 0},
+    {"compatibility.configformat.property", eCmdHdlrGetWord, 0},
+    {"compatibility.defaults.secure", eCmdHdlrGetWord, 0},
+    {"systemd.notifyreadydelay", eCmdHdlrBinary, 0},
     {"abortonuncleanconfig", eCmdHdlrBinary, 0},
     {"abortonfailedqueuestartup", eCmdHdlrBinary, 0},
     {"variables.casesensitive", eCmdHdlrBinary, 0},
@@ -212,7 +222,14 @@ int glblGetMaxLine(rsconf_t *cnf) {
 
 
 int GetGnuTLSLoglevel(rsconf_t *cnf) {
-    return (cnf->globals.iGnuTLSLoglevel);
+    /*
+     * Loadable netstream drivers can be initialized while a configuration is
+     * still being parsed, before runConf points at an active configuration.
+     */
+    if (cnf == NULL) {
+        cnf = loadConf;
+    }
+    return ((cnf != NULL) ? cnf->globals.iGnuTLSLoglevel : 0);
 }
 
 /* define a macro for the simple properties' set and get functions
@@ -272,6 +289,7 @@ SIMP_PROP_GET(DfltNetstrmDrvrKeyFile, pszDfltNetstrmDrvrKeyFile, uchar *)
 SIMP_PROP_GET(NetstrmDrvrCAExtraFiles, pszNetstrmDrvrCAExtraFiles, uchar *)
 SIMP_PROP_GET(ParserControlCharacterEscapePrefix, parser.cCCEscapeChar, uchar)
 SIMP_PROP_GET(ParserDropTrailingLFOnReception, parser.bDropTrailingLF, int)
+SIMP_PROP_GET(ParserDropTrailingCROnReception, parser.bDropTrailingCR, int)
 SIMP_PROP_GET(ParserEscapeControlCharactersOnReceive, parser.bEscapeCCOnRcv, int)
 SIMP_PROP_GET(ParserSpaceLFOnReceive, parser.bSpaceLFOnRcv, int)
 SIMP_PROP_GET(ParserEscape8BitCharactersOnReceive, parser.bEscape8BitChars, int)
@@ -285,7 +303,7 @@ SIMP_PROP_GET(ParserEscapeControlCharacterTab, parser.bEscapeTab, int)
  * rgerhards, 2009-07-20
  */
 static int GetGlobalInputTermState(void) {
-    return ATOMIC_FETCH_32BIT(&bTerminateInputs, &mutTerminateInputs);
+    return ATOMIC_LOAD_32BIT(&bTerminateInputs, &mutTerminateInputs);
 }
 
 
@@ -293,7 +311,12 @@ static int GetGlobalInputTermState(void) {
  * "once in a lifetime" action which can not be undone. -- gerhards, 2009-07-20
  */
 static void SetGlobalInputTermination(void) {
-    ATOMIC_STORE_1_TO_INT(&bTerminateInputs, &mutTerminateInputs);
+    /* Signal handlers must not take mutTerminateInputs in no-atomic builds.
+     * Publish this one-way mirror first so a shutdown signal delivered during
+     * termination setup may already break input-side blocking calls.
+     */
+    PREFER_STORE_INT(&bTerminateInputsSigSafe, 1);
+    ATOMIC_STORE_32BIT(&bTerminateInputs, &mutTerminateInputs, 1);
 }
 
 
@@ -556,6 +579,38 @@ static rsRetVal setDfltOpensslEngine(void __attribute__((unused)) * pVal, uchar 
     RETiRet;
 }
 
+/* Set the maximum number of files the rsyslog process may open. */
+rsRetVal glblSetMaxOpenFiles(void __attribute__((unused)) * pVal, int iFiles) {
+    struct rlimit maxFiles;
+    struct rlimit currentLimit;
+
+    DEFiRet;
+
+    if (getrlimit(RLIMIT_NOFILE, &currentLimit) < 0) {
+        currentLimit.rlim_max = 0;
+    }
+
+    maxFiles.rlim_cur = iFiles;
+    maxFiles.rlim_max = iFiles;
+
+    if (setrlimit(RLIMIT_NOFILE, &maxFiles) < 0) {
+        /* NOTE: under valgrind, we seem to be unable to extend the size! */
+        LogError(errno, RS_RET_ERR_RLIM_NOFILE,
+                 "could not set process file limit to %d "
+                 "[current hard limit %llu]",
+                 iFiles, (unsigned long long)currentLimit.rlim_max);
+        ABORT_FINALIZE(RS_RET_ERR_RLIM_NOFILE);
+    }
+#ifdef USE_UNLIMITED_SELECT
+    SetFdSetSize(howmany(iFiles, __NFDBITS) * sizeof(fd_mask));
+#endif
+    DBGPRINTF("Max number of files set to %d [current hard limit %llu].\n", iFiles,
+              (unsigned long long)currentLimit.rlim_max);
+
+finalize_it:
+    RETiRet;
+}
+
 
 static rsRetVal setParserControlCharacterEscapePrefix(void __attribute__((unused)) * pVal, uchar *pNewVal) {
     DEFiRet;
@@ -566,6 +621,12 @@ static rsRetVal setParserControlCharacterEscapePrefix(void __attribute__((unused
 static rsRetVal setParserDropTrailingLFOnReception(void __attribute__((unused)) * pVal, int pNewVal) {
     DEFiRet;
     loadConf->globals.parser.bDropTrailingLF = pNewVal;
+    RETiRet;
+}
+
+static rsRetVal setParserDropTrailingCROnReception(void __attribute__((unused)) * pVal, int pNewVal) {
+    DEFiRet;
+    loadConf->globals.parser.bDropTrailingCR = pNewVal;
     RETiRet;
 }
 
@@ -662,6 +723,127 @@ static rsRetVal ATTR_NONNULL() setReportChildProcessExits(const uchar *const mod
         iRet = RS_RET_CONF_PARAM_INVLD;
     }
     RETiRet;
+}
+
+/** Convert enable/warn/disable config-format policy text to its internal enum. */
+static rsRetVal ATTR_NONNULL()
+    setCompatConfigFormatMode(const char *const param, const uchar *const mode, int *const dst) {
+    DEFiRet;
+    if (!strcmp((const char *)mode, "enable")) {
+        *dst = COMPAT_CONFIGFORMAT_ENABLE;
+    } else if (!strcmp((const char *)mode, "warn")) {
+        *dst = COMPAT_CONFIGFORMAT_WARN;
+    } else if (!strcmp((const char *)mode, "disable")) {
+        *dst = COMPAT_CONFIGFORMAT_DISABLE;
+    } else {
+        parser_errmsg("invalid value '%s' for global parameter %s", mode, param);
+        iRet = RS_RET_CONF_PARAM_INVLD;
+    }
+    RETiRet;
+}
+
+/** Convert strict/backward-compatible/warn secure-defaults policy text to its internal enum. */
+static rsRetVal ATTR_NONNULL() setCompatDefaultsSecure(const uchar *const mode) {
+    DEFiRet;
+    if (!strcmp((const char *)mode, "strict")) {
+        loadConf->globals.compatDefaultsSecure = COMPAT_DEFAULTS_SECURE_STRICT;
+        loadConf->globals.bAbortOnUncleanConfig = 1;
+    } else if (!strcmp((const char *)mode, "backward-compatible")) {
+        loadConf->globals.compatDefaultsSecure = COMPAT_DEFAULTS_SECURE_BACKWARD_COMPATIBLE;
+    } else if (!strcmp((const char *)mode, "warn")) {
+        loadConf->globals.compatDefaultsSecure = COMPAT_DEFAULTS_SECURE_WARN;
+    } else {
+        parser_errmsg("invalid value '%s' for global parameter compatibility.defaults.secure", mode);
+        iRet = RS_RET_CONF_PARAM_INVLD;
+    }
+    RETiRet;
+}
+
+/** Apply a global compatibility enum string during config parsing. */
+static rsRetVal ATTR_NONNULL() processCompatGlobalParam(const char *const name, struct cnfparamvals *const pval) {
+    char *mode;
+    DEFiRet;
+
+    mode = es_str2cstr(pval->val.d.estr, NULL);
+    if (mode == NULL) {
+        parser_errmsg("out of memory processing global parameter %s", name);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+    if (!strcmp(name, "compatibility.configformat.legacy")) {
+        CHKiRet(setCompatConfigFormatMode(name, (uchar *)mode, &loadConf->globals.compatConfigFormatLegacy));
+    } else if (!strcmp(name, "compatibility.configformat.syslogd")) {
+        CHKiRet(setCompatConfigFormatMode(name, (uchar *)mode, &loadConf->globals.compatConfigFormatSyslogd));
+    } else if (!strcmp(name, "compatibility.configformat.property")) {
+        CHKiRet(setCompatConfigFormatMode(name, (uchar *)mode, &loadConf->globals.compatConfigFormatProperty));
+    } else if (!strcmp(name, "compatibility.defaults.secure")) {
+        CHKiRet(setCompatDefaultsSecure((uchar *)mode));
+    }
+
+finalize_it:
+    free(mode);
+    RETiRet;
+}
+
+/** Emit a compatibility warning through the parser diagnostics path. */
+static void ATTR_NONNULL() compatParserWarnmsg(const char *const msg) {
+    parser_warnmsg("%s", msg);
+}
+
+/** Emit warning/error for compatibility-controlled legacy syntax and say how to re-enable it. */
+static int ATTR_NONNULL()
+    permitCompatSyntax(const int mode, const char *const kind, const char *const text, const char *const option) {
+    int permitted = 1;
+
+    if (mode == COMPAT_CONFIGFORMAT_WARN) {
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "obsolete %s syntax encountered: '%s'", kind, text);
+        msg[sizeof(msg) - 1] = '\0';
+        compatParserWarnmsg(msg);
+    } else if (mode == COMPAT_CONFIGFORMAT_DISABLE) {
+        parser_errmsg("obsolete %s syntax disabled: '%s'; use global(%s=\"enable\") to enable it", kind, text, option);
+        permitted = 0;
+    }
+
+    return permitted;
+}
+
+int glblPermitLegacyConfigDirective(rsconf_t *cnf, const char *directive) {
+    return permitCompatSyntax(cnf->globals.compatConfigFormatLegacy, "$-directive", directive,
+                              "compatibility.configformat.legacy");
+}
+
+int glblPermitSyslogdConfigFilter(rsconf_t *cnf, const char *filter) {
+    return permitCompatSyntax(cnf->globals.compatConfigFormatSyslogd, "classic syslogd filter", filter,
+                              "compatibility.configformat.syslogd");
+}
+
+int glblPermitPropertyConfigFilter(rsconf_t *cnf, const char *filter) {
+    return permitCompatSyntax(cnf->globals.compatConfigFormatProperty, "classic property-based filter", filter,
+                              "compatibility.configformat.property");
+}
+
+void glblWarnIfInsecureDefault(rsconf_t *cnf, const char *detail) {
+    if (cnf != NULL && cnf->globals.compatDefaultsSecure == COMPAT_DEFAULTS_SECURE_WARN) {
+        parser_warnmsg(
+            "backward-compatible insecure default in use: %s; "
+            "use global(compatibility.defaults.secure=\"strict\") to enable the secure default",
+            detail);
+    }
+}
+
+const uchar *glblGetEffectiveNetstrmDrvr(rsconf_t *cnf, const uchar *localDrvr) {
+    if (localDrvr != NULL) {
+        return localDrvr;
+    }
+    if (cnf == NULL) {
+        return DFLT_NETSTRM_DRVR;
+    }
+    return GetDfltNetstrmDrvr(cnf);
+}
+
+int glblIsTlsCapableNetstrmDrvr(const uchar *drvr) {
+    return drvr != NULL && (!strcasecmp((const char *)drvr, "ossl") || !strcasecmp((const char *)drvr, "gtls") ||
+                            !strcasecmp((const char *)drvr, "mbedtls"));
 }
 
 static int getDefPFFamily(rsconf_t *cnf) {
@@ -943,6 +1125,7 @@ BEGINobjQueryInterface(glbl)
     pIf->GetNetstrmDrvrCAExtraFiles = GetNetstrmDrvrCAExtraFiles;
     pIf->GetParserControlCharacterEscapePrefix = GetParserControlCharacterEscapePrefix;
     pIf->GetParserDropTrailingLFOnReception = GetParserDropTrailingLFOnReception;
+    pIf->GetParserDropTrailingCROnReception = GetParserDropTrailingCROnReception;
     pIf->GetParserEscapeControlCharactersOnReceive = GetParserEscapeControlCharactersOnReceive;
     pIf->GetParserSpaceLFOnReceive = GetParserSpaceLFOnReceive;
     pIf->GetParserEscape8BitCharactersOnReceive = GetParserEscape8BitCharactersOnReceive;
@@ -993,11 +1176,13 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
     free((void *)loadConf->globals.operatingStateFile);
     loadConf->globals.operatingStateFile = NULL;
     loadConf->globals.bDropMalPTRMsgs = 0;
+    loadConf->globals.systemdNotifyReadyDelay = 0;
     bPreserveFQDN = 0;
     loadConf->globals.iMaxLine = 8192;
     loadConf->globals.reportOversizeMsg = 1;
     loadConf->globals.parser.cCCEscapeChar = '#';
     loadConf->globals.parser.bDropTrailingLF = 1;
+    loadConf->globals.parser.bDropTrailingCR = 0;
     loadConf->globals.parser.bEscapeCCOnRcv = 1; /* default is to escape control characters */
     loadConf->globals.parser.bSpaceLFOnRcv = 0;
     loadConf->globals.parser.bEscape8BitChars = 0; /* default is not to escape control characters */
@@ -1088,6 +1273,20 @@ void glblProcessCnf(struct cnfobj *o) {
         } else if (!strcmp(paramblk.descr[i].name, "security.abortonidresolutionfail")) {
             loadConf->globals.abortOnIDResolutionFail = (int)cnfparamvals[i].val.d.n;
             cnfparamvals[i].bUsed = TRUE;
+        } else if (!strcmp(paramblk.descr[i].name, "defaultnetstreamdriver")) {
+            uchar *const cstr = (uchar *)es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
+            if (cstr == NULL) {
+                LogError(0, RS_RET_OUT_OF_MEMORY, "out of memory processing defaultnetstreamdriver");
+            } else {
+                setDfltNetstrmDrvr(NULL, cstr);
+            }
+            cnfparamvals[i].bUsed = TRUE;
+        } else if (!strncmp(paramblk.descr[i].name, "compatibility.", 14)) {
+            if (processCompatGlobalParam(paramblk.descr[i].name, &cnfparamvals[i]) == RS_RET_OK) {
+                cnfparamvals[i].bUsed = 1;
+            } else {
+                dbgprintf("glblProcessCnf: failed to process early global parameter '%s'\n", paramblk.descr[i].name);
+            }
         }
     }
 done:
@@ -1222,9 +1421,6 @@ rsRetVal glblDoneLoadCnf(void) {
         } else if (!strcmp(paramblk.descr[i].name, "defaultnetstreamdrivercrlfile")) {
             cstr = (uchar *)es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
             setDfltNetstrmDrvrCRLF(NULL, cstr);
-        } else if (!strcmp(paramblk.descr[i].name, "defaultnetstreamdriver")) {
-            cstr = (uchar *)es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
-            setDfltNetstrmDrvr(NULL, cstr);
         } else if (!strcmp(paramblk.descr[i].name, "defaultopensslengine")) {
             cstr = (uchar *)es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
             setDfltOpensslEngine(NULL, cstr);
@@ -1243,6 +1439,8 @@ rsRetVal glblDoneLoadCnf(void) {
             loadConf->globals.bActionReportSuspensionCont = (int)cnfparamvals[i].val.d.n;
         } else if (!strcmp(paramblk.descr[i].name, "maxmessagesize")) {
             setMaxLine(cnfparamvals[i].val.d.n);
+        } else if (!strcmp(paramblk.descr[i].name, "maxopenfiles")) {
+            loadConf->globals.iMaxOpenFiles = (int)cnfparamvals[i].val.d.n;
         } else if (!strcmp(paramblk.descr[i].name, "oversizemsg.errorfile")) {
             free(loadConf->globals.oversizeMsgErrorFile);
             loadConf->globals.oversizeMsgErrorFile = (uchar *)es_str2cstr(cnfparamvals[i].val.d.estr, NULL);
@@ -1258,7 +1456,7 @@ rsRetVal glblDoneLoadCnf(void) {
             free((void *)tmp);
         } else if (!strcmp(paramblk.descr[i].name, "debug.onshutdown")) {
             loadConf->globals.debugOnShutdown = (int)cnfparamvals[i].val.d.n;
-            LogError(0, RS_RET_OK, "debug: onShutdown set to %d", loadConf->globals.debugOnShutdown);
+            LogMsg(0, RS_RET_OK, LOG_INFO, "debug: onShutdown set to %d", loadConf->globals.debugOnShutdown);
         } else if (!strcmp(paramblk.descr[i].name, "debug.gnutls")) {
             loadConf->globals.iGnuTLSLoglevel = (int)cnfparamvals[i].val.d.n;
         } else if (!strcmp(paramblk.descr[i].name, "debug.abortonprogramerror")) {
@@ -1272,6 +1470,9 @@ rsRetVal glblDoneLoadCnf(void) {
         } else if (!strcmp(paramblk.descr[i].name, "parser.droptrailinglfonreception")) {
             const int tmp = (int)cnfparamvals[i].val.d.n;
             setParserDropTrailingLFOnReception(NULL, tmp);
+        } else if (!strcmp(paramblk.descr[i].name, "parser.droptrailingcronreception")) {
+            const int tmp = (int)cnfparamvals[i].val.d.n;
+            setParserDropTrailingCROnReception(NULL, tmp);
         } else if (!strcmp(paramblk.descr[i].name, "parser.escapecontrolcharactersonreceive")) {
             const int tmp = (int)cnfparamvals[i].val.d.n;
             setParserEscapeControlCharactersOnReceive(NULL, tmp);
@@ -1304,7 +1505,7 @@ rsRetVal glblDoneLoadCnf(void) {
                     LogError(0, RS_RET_ERR, "debug log file '%s' could not be opened", pszAltDbgFileName);
                 }
             }
-            LogError(0, RS_RET_OK, "debug log file is '%s', fd %d", pszAltDbgFileName, altdbg);
+            LogMsg(0, RS_RET_OK, LOG_INFO, "debug log file is '%s', fd %d", pszAltDbgFileName, altdbg);
         } else if (!strcmp(paramblk.descr[i].name, "janitor.interval")) {
             loadConf->globals.janitorInterval = (int)cnfparamvals[i].val.d.n;
         } else if (!strcmp(paramblk.descr[i].name, "net.ipprotocol")) {
@@ -1352,6 +1553,10 @@ rsRetVal glblDoneLoadCnf(void) {
             SetDisableDNS(!((int)cnfparamvals[i].val.d.n));
         } else if (!strcmp(paramblk.descr[i].name, "net.permitwarning")) {
             SetOptionDisallowWarning(!((int)cnfparamvals[i].val.d.n));
+        } else if (!strncmp(paramblk.descr[i].name, "compatibility.", 14)) {
+            /* processed immediately by glblProcessCnf(), as later syntax depends on it */
+        } else if (!strcmp(paramblk.descr[i].name, "systemd.notifyreadydelay")) {
+            loadConf->globals.systemdNotifyReadyDelay = (int)cnfparamvals[i].val.d.n;
         } else if (!strcmp(paramblk.descr[i].name, "abortonuncleanconfig")) {
             loadConf->globals.bAbortOnUncleanConfig = cnfparamvals[i].val.d.n;
         } else if (!strcmp(paramblk.descr[i].name, "abortonfailedqueuestartup")) {
@@ -1427,6 +1632,12 @@ rsRetVal glblDoneLoadCnf(void) {
         stddbg = -1;
     }
 
+    if (loadConf->globals.compatDefaultsSecure == COMPAT_DEFAULTS_SECURE_STRICT) {
+        loadConf->globals.bAbortOnUncleanConfig = 1;
+    } else if (!loadConf->globals.bAbortOnUncleanConfig) {
+        glblWarnIfInsecureDefault(loadConf, "global(abortOnUncleanConfig=\"off\")");
+    }
+
 finalize_it:
     /* we have now read the config. We need to query the local host name now
      * as it was set by the config.
@@ -1480,6 +1691,8 @@ BEGINAbstractObjClassInit(glbl, 1, OBJ_IS_CORE_MODULE) /* class, version */
                              setParserControlCharacterEscapePrefix, NULL, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"droptrailinglfonreception", 0, eCmdHdlrBinary,
                              setParserDropTrailingLFOnReception, NULL, NULL));
+    CHKiRet(regCfSysLineHdlr((uchar *)"droptrailingcronreception", 0, eCmdHdlrBinary,
+                             setParserDropTrailingCROnReception, NULL, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"escapecontrolcharactersonreceive", 0, eCmdHdlrBinary,
                              setParserEscapeControlCharactersOnReceive, NULL, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"spacelfonreceive", 0, eCmdHdlrBinary, setParserSpaceLFOnReceive, NULL, NULL));

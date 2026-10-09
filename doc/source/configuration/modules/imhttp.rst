@@ -57,6 +57,21 @@ the format ``IP:Port``. For IPv6 addresses, enclose the IP in brackets, e.g., ``
 
 - `Civetweb listening_ports <https://github.com/civetweb/civetweb/blob/master/docs/UserManual.md#listening_ports-8080>`_
 
+listenPortFileName
+^^^^^^^^^^^^^^^^^^
+
+.. csv-table::
+   :header: "type", "mandatory", "format", "default"
+   :widths: auto
+   :class: parameter-table
+
+   "string", "no", "filename", "none"
+
+When ``ports`` configures exactly one listener, writes the actual port number
+selected by CivetWeb to the named file after startup. This is useful with
+``ports="0"`` so tests and automation can avoid preselecting a free port before
+the listener binds.
+
 
 documentroot
 ^^^^^^^^^^^^^^^
@@ -368,6 +383,14 @@ text exposition format. The endpoint provides counters such as
 ``imhttp_submitted_total``, ``imhttp_failed_total`` and
 ``imhttp_discarded_total``.
 
+Metric names that already use the legacy Prometheus character set remain
+unchanged. When an rsyslog statistics object or counter name contains other
+characters, rsyslog emits a reversible ``U__``-prefixed values escape instead
+of the raw name. This keeps the exposition compatible with Prometheus while
+avoiding collisions such as a dot and a hyphen both becoming an underscore.
+Names beginning with ``U__`` are also escaped because that prefix is reserved
+by this encoding.
+
 The handler sends a ``Content-Length`` header and closes the connection.
 Proxies or load balancers must allow such responses. An ``imhttp_up`` gauge is exported
 alongside the full rsyslog statistics. Name collisions with other
@@ -388,6 +411,7 @@ Caveats/Known Bugs
 ==================
 
 -  module currently only a single HTTP instance, however multiple ports may be bound.
+-  For security reasons, symbolic links are not followed (opened with ``O_NOFOLLOW``) when reading configured basic authentication or API key files.
 
 
 Examples

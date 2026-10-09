@@ -47,6 +47,7 @@
 #include <libgen.h>
 #include <unistd.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #ifdef HAVE_ATOMIC_BUILTINS
     #include <pthread.h>
@@ -57,6 +58,7 @@
 #include "syslogd-types.h"
 #include "srUtils.h"
 #include "template.h"
+#include "action.h"
 #include "outchannel.h"
 #include "omfile.h"
 #include "cfsysline.h"
@@ -79,6 +81,11 @@ MODULE_CNFNAME("omfile")
 /* forward definitions */
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __attribute__((unused)) * pVal);
 static rsRetVal normalizeDynaFileCacheSize(int *const pNewVal);
+
+typedef struct pathComponent_s {
+    const char *ptr;
+    size_t len;
+} pathComponent_t;
 
 /* internal structures
  */
@@ -156,6 +163,9 @@ typedef struct _instanceData {
     pthread_mutex_t mutWrite; /**< guard against multiple instances writing to single file */
     uchar *fname; /**< file or template name (display only) */
     uchar *tplName; /**< name of assigned template */
+    uchar *dynaFileBasePath; /**< normalized constant base path for dynafile templates */
+    sbool bPermitDynaFilePathEscape; /**< permit dynafile paths outside the derived base */
+    sbool bRestrictDynaFileTplType; /**< reject template types without an inspectable fixed prefix */
     strm_t *pStrm; /**< our output stream */
     short nInactive; /**< number of minutes not writen (STATIC files only) */
     char bDynamicName; /**< 0 - static name, 1 - dynamic name (with properties) */
@@ -201,6 +211,8 @@ typedef struct _instanceData {
     sbool bUseAsyncWriter; /**< use async stream writer? */
     sbool bVeryRobustZip;
     sbool bAddLF; /**< append LF to records that are missing it? */
+    int bFollowSymlinks; /**< allow final output path component to be a symlink? */
+    sbool bFollowSymlinksExplicit; /**< was symlink policy configured explicitly? */
     statsobj_t *stats; /**< dynafile, primarily cache stats */
     STATSCOUNTER_DEF(ctrRequests, mutCtrRequests);
     STATSCOUNTER_DEF(ctrLevel0, mutCtrLevel0);
@@ -220,6 +232,292 @@ typedef struct _instanceData {
 typedef struct wrkrInstanceData {
     instanceData *pData;
 } wrkrInstanceData_t;
+
+static int pathIsMeaningfulBase(const uchar *const path) {
+    return path != NULL && path[0] != '\0' && ustrcmp(path, (uchar *)".");
+}
+
+static int pathStartsWithParentRef(const uchar *const path) {
+    return path[0] == '.' && path[1] == '.' && (path[2] == '\0' || path[2] == '/');
+}
+
+/**
+ * @brief Normalize a path syntactically without touching the filesystem.
+ *
+ * omfile may create missing directories and files, so realpath(3) cannot be
+ * used here. This helper removes duplicate separators and "." components, and
+ * resolves standalone ".." path components lexically. Relative paths that still
+ * escape above their starting point keep leading ".." components so callers can
+ * reject them.
+ *
+ * @param path Path string to normalize.
+ * @param ppNorm Receives a newly allocated normalized path on success.
+ * @return RS_RET_OK on success, RS_RET_OUT_OF_MEMORY on allocation failure.
+ */
+static rsRetVal normalizePathLexically(const uchar *const path, uchar **const ppNorm) {
+    pathComponent_t *components = NULL;
+    uchar *norm = NULL;
+    const char *pszPath;
+    const char *p;
+    const char *start;
+    uchar *dst;
+    size_t lenPath;
+    size_t maxComponents;
+    size_t nComponents = 0;
+    size_t lenComponent;
+    size_t lenNorm;
+    size_t i;
+    int isAbsolute;
+    DEFiRet;
+
+    assert(path != NULL);
+    assert(ppNorm != NULL);
+
+    pszPath = (const char *)path;
+    lenPath = strlen(pszPath);
+    maxComponents = lenPath / 2 + 2;
+    isAbsolute = pszPath[0] == '/';
+
+    CHKmalloc(components = calloc(maxComponents, sizeof(pathComponent_t)));
+
+    p = pszPath;
+    while (*p != '\0') {
+        while (*p == '/') {
+            ++p;
+        }
+        start = p;
+        while (*p != '\0' && *p != '/') {
+            ++p;
+        }
+        lenComponent = (size_t)(p - start);
+
+        if (lenComponent == 0 || (lenComponent == 1 && start[0] == '.')) {
+            continue;
+        }
+        if (lenComponent == 2 && start[0] == '.' && start[1] == '.') {
+            if (nComponents > 0 &&
+                !(components[nComponents - 1].len == 2 && components[nComponents - 1].ptr[0] == '.' &&
+                  components[nComponents - 1].ptr[1] == '.')) {
+                --nComponents;
+            } else if (!isAbsolute) {
+                components[nComponents].ptr = start;
+                components[nComponents].len = lenComponent;
+                ++nComponents;
+            }
+            continue;
+        }
+
+        components[nComponents].ptr = start;
+        components[nComponents].len = lenComponent;
+        ++nComponents;
+    }
+
+    if (nComponents == 0) {
+        CHKmalloc(norm = (uchar *)strdup(isAbsolute ? "/" : "."));
+        FINALIZE;
+    }
+
+    lenNorm = isAbsolute ? 1 : 0;
+    for (i = 0; i < nComponents; ++i) {
+        lenNorm += components[i].len;
+        if (i > 0) {
+            ++lenNorm;
+        }
+    }
+
+    CHKmalloc(norm = malloc(lenNorm + 1));
+    dst = norm;
+    if (isAbsolute) {
+        *dst++ = '/';
+    }
+    for (i = 0; i < nComponents; ++i) {
+        if (i > 0) {
+            *dst++ = '/';
+        }
+        memcpy(dst, components[i].ptr, components[i].len);
+        dst += components[i].len;
+    }
+    *dst = '\0';
+
+finalize_it:
+    free(components);
+    if (iRet == RS_RET_OK) {
+        *ppNorm = norm;
+    } else {
+        free(norm);
+    }
+    RETiRet;
+}
+
+static int normalizedPathIsBelowBase(const uchar *const normPath, const uchar *const normBase) {
+    const size_t lenBase = ustrlen(normBase);
+
+    if (!ustrcmp(normBase, (uchar *)"/")) {
+        return normPath[0] == '/';
+    }
+    if (!ustrcmp(normPath, normBase)) {
+        return 1;
+    }
+    return !strncmp((const char *)normPath, (const char *)normBase, lenBase) && normPath[lenBase] == '/';
+}
+
+/**
+ * @brief Validate a rendered dynamic file name before it can be opened.
+ *
+ * If the dynafile template had a meaningful static directory prefix, the
+ * rendered path must normalize to that directory or a child of it. For templates
+ * where no useful base can be derived, absolute paths and leading parent
+ * traversal are rejected as a fallback. Installations that intentionally rely
+ * on those legacy forms can opt in with dangerousPermitPathEscape.
+ *
+ * @param pData omfile action instance data.
+ * @param newFileName Rendered dynafile path.
+ * @return RS_RET_OK if the path is acceptable, RS_RET_DISCARDMSG if it is blocked.
+ */
+static rsRetVal validateDynaFilePath(instanceData *const pData, const uchar *const newFileName) {
+    uchar *normPath = NULL;
+    DEFiRet;
+
+    assert(pData != NULL);
+    assert(newFileName != NULL);
+
+    CHKiRet(normalizePathLexically(newFileName, &normPath));
+    if (pathIsMeaningfulBase(pData->dynaFileBasePath)) {
+        if (!normalizedPathIsBelowBase(normPath, pData->dynaFileBasePath)) {
+            LogError(0, RS_RET_ERR, "omfile: dynafile path traversal blocked: '%s' resolves outside base '%s'",
+                     newFileName, pData->dynaFileBasePath);
+            ABORT_FINALIZE(RS_RET_DISCARDMSG);
+        }
+    } else if (normPath[0] == '/' || pathStartsWithParentRef(normPath)) {
+        LogError(0, RS_RET_ERR, "omfile: dynafile path traversal blocked: '%s'", newFileName);
+        ABORT_FINALIZE(RS_RET_DISCARDMSG);
+    }
+
+finalize_it:
+    free(normPath);
+    RETiRet;
+}
+
+/**
+ * @brief Derive the immutable base directory from a dynafile template.
+ *
+ * The trusted part of a dynafile template is the contiguous run of constant
+ * template entries before the first property field. The last slash in that
+ * trusted prefix defines the directory base that rendered file names may not
+ * escape. For example, `/var/log/%HOSTNAME%/%APP-NAME%.log` derives `/var/log`.
+ *
+ * Templates backed by string generators or subtree output are intentionally not
+ * inspected; in those cases runtime validation falls back to rejecting absolute
+ * paths and leading parent traversal.
+ *
+ * @param pData omfile action instance data to receive the normalized base.
+ * @param pTpl Resolved dynafile template.
+ * @return RS_RET_OK on success, RS_RET_OUT_OF_MEMORY on allocation failure.
+ */
+static rsRetVal deriveDynaFileBasePath(instanceData *const pData, const struct template *const pTpl) {
+    const struct templateEntry *entry;
+    uchar *prefix = NULL;
+    uchar *base = NULL;
+    uchar *normBase = NULL;
+    uchar *lastSlash;
+    size_t prefixLen = 0;
+    size_t baseLen;
+    uchar *dst;
+    DEFiRet;
+
+    assert(pData != NULL);
+
+    free(pData->dynaFileBasePath);
+    pData->dynaFileBasePath = NULL;
+
+    if (pTpl == NULL || pTpl->pStrgen != NULL || pTpl->bHaveSubtree) {
+        FINALIZE;
+    }
+
+    /* Only constants before the first field are trusted as admin-authored path. */
+    for (entry = pTpl->pEntryRoot; entry != NULL && entry->eEntryType == CONSTANT; entry = entry->pNext) {
+        prefixLen += (size_t)entry->data.constant.iLenConstant;
+    }
+    if (prefixLen == 0) {
+        FINALIZE;
+    }
+
+    CHKmalloc(prefix = malloc(prefixLen + 1));
+    dst = prefix;
+    for (entry = pTpl->pEntryRoot; entry != NULL && entry->eEntryType == CONSTANT; entry = entry->pNext) {
+        memcpy(dst, entry->data.constant.pConstant, (size_t)entry->data.constant.iLenConstant);
+        dst += entry->data.constant.iLenConstant;
+    }
+    *dst = '\0';
+
+    /* The base is the deepest complete directory in the trusted prefix. */
+    lastSlash = (uchar *)strrchr((const char *)prefix, '/');
+    if (lastSlash == NULL) {
+        FINALIZE;
+    }
+
+    baseLen = (size_t)(lastSlash - prefix);
+    if (baseLen == 0) {
+        baseLen = 1;
+    }
+    CHKmalloc(base = malloc(baseLen + 1));
+    memcpy(base, prefix, baseLen);
+    base[baseLen] = '\0';
+
+    CHKiRet(normalizePathLexically(base, &normBase));
+    if (pathIsMeaningfulBase(normBase)) {
+        pData->dynaFileBasePath = normBase;
+        normBase = NULL;
+    }
+
+finalize_it:
+    free(prefix);
+    free(base);
+    free(normBase);
+    RETiRet;
+}
+
+/**
+ * @brief Reject dynafile templates whose fixed prefix cannot be inspected.
+ *
+ * Dynafile path hardening depends on inspecting the static template entries
+ * before the first message-derived field. Rsyslog string and list templates
+ * both use the template entry list and can be checked this way. Subtree and
+ * plugin/string-generator templates bypass that representation, so omfile
+ * cannot derive a trusted base directory from their configured form.
+ *
+ * @param pData omfile action instance data.
+ * @param pTpl Resolved dynafile template.
+ * @return RS_RET_OK if the template type is accepted, RS_RET_ERR otherwise.
+ */
+static rsRetVal checkDynaFileTemplateType(instanceData *const pData, const struct template *const pTpl) {
+    DEFiRet;
+
+    assert(pData != NULL);
+
+    if (pData->bRestrictDynaFileTplType && (pTpl == NULL || pTpl->pStrgen != NULL || pTpl->bHaveSubtree)) {
+        LogError(0, RS_RET_ERR,
+                 "omfile: dynafile template '%s' uses a template type that cannot be "
+                 "safely inspected for path traversal; use type=\"string\" or "
+                 "type=\"list\", or set module parameter "
+                 "dynafile.restrictTemplateType=\"off\" to use the legacy "
+                 "template subject to the fallback path guards",
+                 pData->fname);
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static void warnDynaFilePathEscapeEnabled(const char *const scope) {
+    parser_warnmsg(
+        "omfile: %s dynafile.dangerousPermitPathEscape permits dynafile "
+        "paths to escape the configured base directory. This is dangerous "
+        "with untrusted message properties and can overwrite any file "
+        "permitted by OS permissions.",
+        scope);
+}
 
 /**
  * @brief Module-global configuration settings.
@@ -262,6 +560,10 @@ struct modConfData_s {
     gid_t fileGID;
     gid_t dirGID;
     int bDynafileDoNotSuspend;
+    int bFollowSymlinks;
+    sbool bFollowSymlinksExplicit;
+    sbool bPermitDynaFilePathEscape;
+    sbool bRestrictDynaFileTplType;
     strm_compressionDriver_t compressionDriver;
     int compressionDriver_workers;
     sbool bAddLF; /**< default setting for addLF action parameter */
@@ -287,6 +589,9 @@ static struct cnfparamdescr modpdescr[] = {
     {"fileownernum", eCmdHdlrInt, 0},
     {"filegroup", eCmdHdlrGID, 0},
     {"dynafile.donotsuspend", eCmdHdlrBinary, 0},
+    {"followsymlinks", eCmdHdlrBinary, 0},
+    {"dynafile.dangerouspermitpathescape", eCmdHdlrBinary, 0},
+    {"dynafile.restricttemplatetype", eCmdHdlrBinary, 0},
     {"filegroupnum", eCmdHdlrInt, 0},
 };
 static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / sizeof(struct cnfparamdescr), modpdescr};
@@ -314,6 +619,7 @@ static struct cnfparamdescr actpdescr[] = {{"dynafilecachesize", eCmdHdlrInt, 0}
                                            {"sync", eCmdHdlrBinary, 0}, /* legacy: actionfileenablesync */
                                            {"file", eCmdHdlrString, 0}, /* either "file" or ... */
                                            {"dynafile", eCmdHdlrString, 0}, /* "dynafile" MUST be present */
+                                           {"followsymlinks", eCmdHdlrBinary, 0},
                                            {"sig.provider", eCmdHdlrGetWord, 0},
                                            {"cry.provider", eCmdHdlrGetWord, 0},
                                            {"closetimeout", eCmdHdlrPositiveInt, 0},
@@ -321,6 +627,7 @@ static struct cnfparamdescr actpdescr[] = {{"dynafilecachesize", eCmdHdlrInt, 0}
                                            {"rotation.sizelimitcommand", eCmdHdlrString, 0},
                                            {"rotation.sizelimitcommandpassfilename", eCmdHdlrBinary, 0},
                                            {"template", eCmdHdlrGetWord, 0},
+                                           {"dynafile.dangerouspermitpathescape", eCmdHdlrBinary, 0},
                                            {"addlf", eCmdHdlrBinary, 0}};
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
@@ -629,6 +936,27 @@ static rsRetVal sigprovPrepare(instanceData *__restrict__ const pData, uchar *__
     RETiRet;
 }
 
+static int getCompatDefaultFollowSymlinks(const rsconf_t *const cnf) {
+    return cnf == NULL || cnf->globals.compatDefaultsSecure != COMPAT_DEFAULTS_SECURE_STRICT;
+}
+
+static void warnIfFollowingSymlink(const instanceData *__restrict__ const pData,
+                                   const uchar *__restrict__ const fileName) {
+    struct stat st;
+
+    if (!pData->bFollowSymlinks || pData->bFollowSymlinksExplicit || runModConf == NULL || runModConf->pConf == NULL ||
+        runModConf->pConf->globals.compatDefaultsSecure != COMPAT_DEFAULTS_SECURE_WARN) {
+        return;
+    }
+    if (lstat((const char *)fileName, &st) == 0 && S_ISLNK(st.st_mode)) {
+        LogMsg(0, RS_RET_OK, LOG_WARNING,
+               "omfile: following symbolic link output file '%s'; "
+               "set action(type=\"omfile\" followSymlinks=\"off\") or "
+               "global(compatibility.defaults.secure=\"strict\") to reject final-component symlinks",
+               fileName);
+    }
+}
+
 /**
  * @brief Prepares file access for a given file name.
  *
@@ -643,7 +971,9 @@ static rsRetVal sigprovPrepare(instanceData *__restrict__ const pData, uchar *__
  * @return RS_RET_OK on success, or an error code if file creation,
  * directory creation, or stream construction fails.
  */
-static rsRetVal prepareFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName) {
+static rsRetVal prepareFile(instanceData *__restrict__ const pData,
+                            const uchar *__restrict__ const newFileName,
+                            const int bFailOnOpenErr) {
     int fd;
     char errStr[1024]; /* buffer for strerr() */
     DEFiRet;
@@ -669,7 +999,13 @@ static rsRetVal prepareFile(instanceData *__restrict__ const pData, const uchar 
         /* no matter if we needed to create directories or not, we now try to create
          * the file. -- rgerhards, 2008-12-18 (based on patch from William Tisater)
          */
-        fd = open((char *)newFileName, O_WRONLY | O_APPEND | O_CREAT | O_NOCTTY | O_CLOEXEC, pData->fCreateMode);
+        int openFlags = O_WRONLY | O_APPEND | O_CREAT | O_NOCTTY | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+        if (!pData->bFollowSymlinks) {
+            openFlags |= O_NOFOLLOW;
+        }
+#endif
+        fd = open((char *)newFileName, openFlags, pData->fCreateMode);
         if (fd != -1) {
             /* check and set uid/gid */
             if (pData->fileUID != (uid_t)-1 || pData->fileGID != (gid_t)-1) {
@@ -687,8 +1023,14 @@ static rsRetVal prepareFile(instanceData *__restrict__ const pData, const uchar 
                 }
             }
             close(fd); /* close again, as we need a stream further on */
+        } else if (bFailOnOpenErr) {
+            const int openErrno = errno;
+            rs_strerror_r(openErrno, errStr, sizeof(errStr));
+            parser_errmsg("omfile: open file '%s' failed: %s", newFileName, errStr);
+            ABORT_FINALIZE((openErrno == ENOENT) ? RS_RET_FILE_NOT_FOUND : RS_RET_FILE_OPEN_ERROR);
         }
     }
+    warnIfFollowingSymlink(pData, newFileName);
 
     /* the copies below are clumpsy, but there is no way around given the
      * anomalies in dirname() and basename() [they MODIFY the provided buffer...]
@@ -713,6 +1055,7 @@ static rsRetVal prepareFile(instanceData *__restrict__ const pData, const uchar 
     CHKiRet(strm.SetsIOBufSize(pData->pStrm, (size_t)pData->iIOBufSize));
     CHKiRet(strm.SettOperationsMode(pData->pStrm, STREAMMODE_WRITE_APPEND));
     CHKiRet(strm.SettOpenMode(pData->pStrm, cs.fCreateMode));
+    CHKiRet(strm.SetbNoFollowFinal(pData->pStrm, !pData->bFollowSymlinks));
     CHKiRet(strm.SetcompressionDriver(pData->pStrm, runModConf->compressionDriver));
     CHKiRet(strm.SetCompressionWorkers(pData->pStrm, runModConf->compressionDriver_workers));
     CHKiRet(strm.SetbSync(pData->pStrm, pData->bSyncFile));
@@ -762,6 +1105,7 @@ static rsRetVal ATTR_NONNULL()
     int iOldest;
     int i;
     int iFirstFree;
+    int bNewCacheSlot;
     rsRetVal localRet;
     dynaFileCacheEntry **pCache;
     DEFiRet;
@@ -778,12 +1122,19 @@ static rsRetVal ATTR_NONNULL()
     pCache = pData->dynCache;
 
     /* first check, if we still have the current file */
-    if ((pData->iCurrElt != -1) && !ustrcmp(newFileName, pCache[pData->iCurrElt]->pName)) {
+    if ((pData->iCurrElt != -1) && (pCache[pData->iCurrElt] != NULL) && (pCache[pData->iCurrElt]->pName != NULL) &&
+        !ustrcmp(newFileName, pCache[pData->iCurrElt]->pName)) {
         /* great, we are all set */
         pCache[pData->iCurrElt]->clkTickAccessed = getClockFileAccess();
         STATSCOUNTER_INC(pData->ctrLevel0, pData->mutCtrLevel0);
         /* LRU needs only a strictly monotonically increasing counter, so such a one could do */
         FINALIZE;
+    }
+
+    /* Cached names were checked before insertion. Validate only paths that
+     * may need a cache lookup or a new file, preserving the level-0 fast path. */
+    if (!pData->bPermitDynaFilePathEscape) {
+        CHKiRet(validateDynaFilePath(pData, newFileName));
     }
 
     /* ok, no luck - current file cannot be re-used */
@@ -802,6 +1153,7 @@ static rsRetVal ATTR_NONNULL()
      */
     pData->iCurrElt = -1; /* invalid current element pointer */
     iFirstFree = -1; /* not yet found */
+    bNewCacheSlot = 0;
     iOldest = 0; /* we assume the first element to be the oldest - that will change as we loop */
     ctOldest = getClockFileAccess(); /* there must always be an older one */
     for (i = 0; i < pData->iCurrCacheSize; ++i) {
@@ -836,8 +1188,8 @@ static rsRetVal ATTR_NONNULL()
 
     if (iFirstFree == -1 && (pData->iCurrCacheSize < pData->iDynaFileCacheSize)) {
         /* there is space left, so set it to that index */
-        iFirstFree = pData->iCurrCacheSize++;
-        STATSCOUNTER_SETMAX_NOMUT(pData->ctrMax, (unsigned)pData->iCurrCacheSize);
+        iFirstFree = pData->iCurrCacheSize;
+        bNewCacheSlot = 1;
     }
 
     /* Note that the following code sequence does not work with the cache entry itself,
@@ -848,16 +1200,21 @@ static rsRetVal ATTR_NONNULL()
         dynaFileDelCacheEntry(pData, iOldest, 0);
         STATSCOUNTER_INC(pData->ctrEvict, pData->mutCtrEvict);
         iFirstFree = iOldest; /* this one *is* now free ;) */
-    } else {
+    }
+    if (pCache[iFirstFree] == NULL) {
         /* we need to allocate memory for the cache structure */
         CHKmalloc(pCache[iFirstFree] = (dynaFileCacheEntry *)calloc(1, sizeof(dynaFileCacheEntry)));
     }
 
     /* Ok, we finally can open the file */
-    localRet = prepareFile(pData, newFileName); /* ignore exact error, we check fd below */
+    localRet = prepareFile(pData, newFileName, 1);
 
     /* check if we had an error */
     if (localRet != RS_RET_OK) {
+        dynaFileDelCacheEntry(pData, iFirstFree, 1);
+        pData->iCurrElt = -1;
+        pData->pStrm = NULL;
+        pData->sigprovFileData = NULL;
         /* We do no longer care about internal messages. The errmsg rate limiter
          * will take care of too-frequent error messages.
          */
@@ -870,12 +1227,20 @@ static rsRetVal ATTR_NONNULL()
 
     if ((pCache[iFirstFree]->pName = ustrdup(newFileName)) == NULL) {
         closeFile(pData); /* need to free failed entry! */
+        dynaFileDelCacheEntry(pData, iFirstFree, 1);
+        pData->iCurrElt = -1;
+        pData->pStrm = NULL;
+        pData->sigprovFileData = NULL;
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     }
     pCache[iFirstFree]->pStrm = pData->pStrm;
     if (pData->useSigprov) pCache[iFirstFree]->sigprovFileData = pData->sigprovFileData;
     pCache[iFirstFree]->clkTickAccessed = getClockFileAccess();
     pData->iCurrElt = iFirstFree;
+    if (bNewCacheSlot) {
+        pData->iCurrCacheSize++;
+        STATSCOUNTER_SETMAX_NOMUT(pData->ctrMax, (unsigned)pData->iCurrCacheSize);
+    }
     DBGPRINTF("Added new entry %d for file cache, file '%s'.\n", iFirstFree, newFileName);
 
 finalize_it:
@@ -974,10 +1339,17 @@ static rsRetVal writeFile(instanceData *__restrict__ const pData,
      */
     if (pData->bDynamicName) {
         DBGPRINTF("omfile: file to log to: %s\n", actParam(pParam, pData->iNumTpls, iMsg, 1).param);
-        CHKiRet(prepareDynFile(pData, actParam(pParam, pData->iNumTpls, iMsg, 1).param));
+        iRet = prepareDynFile(pData, actParam(pParam, pData->iNumTpls, iMsg, 1).param);
+        if (iRet == RS_RET_DISCARDMSG) {
+            /* A blocked message was not written; keep processing this batch so
+             * successfully written records are not retried by the action core. */
+            iRet = RS_RET_OK;
+            FINALIZE;
+        }
+        CHKiRet(iRet);
     } else { /* "regular", non-dynafile */
         if (pData->pStrm == NULL) {
-            CHKiRet(prepareFile(pData, pData->fname));
+            CHKiRet(prepareFile(pData, pData->fname, 0));
             if (pData->pStrm == NULL) {
                 parser_errmsg("Could not open output file '%s'", pData->fname);
             }
@@ -1005,7 +1377,11 @@ BEGINbeginCnfLoad
     pModConf->fileGID = -1;
     pModConf->dirGID = -1;
     pModConf->bDynafileDoNotSuspend = 1;
+    pModConf->bPermitDynaFilePathEscape = 0;
+    pModConf->bRestrictDynaFileTplType = 0;
     pModConf->bAddLF = 1;
+    pModConf->bFollowSymlinks = -1;
+    pModConf->bFollowSymlinksExplicit = 0;
 ENDbeginCnfLoad
 
 BEGINsetModCnf
@@ -1031,7 +1407,7 @@ BEGINsetModCnf
         }
 
         if (!strcmp(modpblk.descr[i].name, "template")) {
-            loadModConf->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             if (pszFileDfltTplName != NULL) {
                 parser_errmsg(
                     "omfile: warning: default template was already "
@@ -1075,6 +1451,16 @@ BEGINsetModCnf
             loadModConf->fileGID = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "dynafile.donotsuspend")) {
             loadModConf->bDynafileDoNotSuspend = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "followsymlinks")) {
+            loadModConf->bFollowSymlinks = (int)pvals[i].val.d.n;
+            loadModConf->bFollowSymlinksExplicit = 1;
+        } else if (!strcmp(modpblk.descr[i].name, "dynafile.dangerouspermitpathescape")) {
+            loadModConf->bPermitDynaFilePathEscape = pvals[i].val.d.n;
+            if (loadModConf->bPermitDynaFilePathEscape) {
+                warnDynaFilePathEscapeEnabled("module parameter");
+            }
+        } else if (!strcmp(modpblk.descr[i].name, "dynafile.restricttemplatetype")) {
+            loadModConf->bRestrictDynaFileTplType = pvals[i].val.d.n;
         } else {
             dbgprintf(
                 "omfile: program error, non-handled "
@@ -1183,6 +1569,7 @@ BEGINfreeInstance
     CODESTARTfreeInstance;
     free(pData->tplName);
     free(pData->fname);
+    free(pData->dynaFileBasePath);
     free(pData->pszSizeLimitCmd);
     if (pData->iCloseTimeout > 0) janitorDelEtry(pData->janitorID);
     if (pData->bDynamicName) {
@@ -1211,6 +1598,18 @@ BEGINfreeWrkrInstance
 ENDfreeWrkrInstance
 
 
+BEGINsetActionInfo
+    CODESTARTsetActionInfo;
+    if (pData->bDynamicName && pAction->iNumTpls > 1) {
+        iRet = checkDynaFileTemplateType(pData, pAction->ppTpl[1]);
+        if (iRet != RS_RET_OK) {
+            RETiRet;
+        }
+        iRet = deriveDynaFileBasePath(pData, pAction->ppTpl[1]);
+    }
+ENDsetActionInfo
+
+
 BEGINtryResume
     CODESTARTtryResume;
 ENDtryResume
@@ -1223,6 +1622,7 @@ ENDbeginTransaction
 
 BEGINcommitTransaction
     instanceData *__restrict__ const pData = pWrkrData->pData;
+    rsRetVal localRet;
     unsigned i;
     CODESTARTcommitTransaction;
 
@@ -1233,7 +1633,10 @@ BEGINcommitTransaction
     pthread_mutex_lock(&pData->mutWrite);
 
     for (i = 0; i < nParams; ++i) {
-        writeFile(pData, pParams, i);
+        localRet = writeFile(pData, pParams, i);
+        if (localRet != RS_RET_OK && iRet == RS_RET_OK) {
+            iRet = localRet;
+        }
     }
     /* Note: pStrm may be NULL if there was an error opening the stream */
     /* if bFlushOnTXEnd is set, we need to flush on transaction end - in
@@ -1245,7 +1648,10 @@ BEGINcommitTransaction
      * rgerhards, 2017-01-13
      */
     if (pData->bFlushOnTXEnd && pData->pStrm != NULL) {
-        CHKiRet(strm.Flush(pData->pStrm));
+        localRet = strm.Flush(pData->pStrm);
+        if (localRet != RS_RET_OK && iRet == RS_RET_OK) {
+            CHKiRet(localRet);
+        }
     }
 
 finalize_it:
@@ -1269,6 +1675,9 @@ ENDcommitTransaction
 static void setInstParamDefaults(instanceData *__restrict__ const pData) {
     pData->fname = NULL;
     pData->tplName = NULL;
+    pData->dynaFileBasePath = NULL;
+    pData->bPermitDynaFilePathEscape = loadModConf->bPermitDynaFilePathEscape;
+    pData->bRestrictDynaFileTplType = loadModConf->bRestrictDynaFileTplType;
     pData->fileUID = loadModConf->fileUID;
     pData->fileGID = loadModConf->fileGID;
     pData->dirUID = loadModConf->dirUID;
@@ -1286,6 +1695,11 @@ static void setInstParamDefaults(instanceData *__restrict__ const pData) {
     pData->iFlushInterval = FLUSH_INTRVL_DFLT;
     pData->bUseAsyncWriter = USE_ASYNCWRITER_DFLT;
     pData->bAddLF = loadModConf->bAddLF;
+    pData->bFollowSymlinks = loadModConf->bFollowSymlinks;
+    pData->bFollowSymlinksExplicit = loadModConf->bFollowSymlinksExplicit;
+    if (pData->bFollowSymlinks == -1) {
+        pData->bFollowSymlinks = getCompatDefaultFollowSymlinks(loadConf);
+    }
     pData->sigprovName = NULL;
     pData->cryprovName = NULL;
     pData->useSigprov = 0;
@@ -1521,28 +1935,36 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "addlf")) {
             pData->bAddLF = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "file")) {
-            pData->fname = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->fname = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             CODE_STD_STRING_REQUESTnewActInst(1);
             pData->bDynamicName = 0;
         } else if (!strcmp(actpblk.descr[i].name, "dynafile")) {
             if (pData->fname != NULL) {
                 parser_errmsg("omfile: both \"file\" and \"dynafile\" set, will use dynafile");
             }
-            pData->fname = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->fname = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             CODE_STD_STRING_REQUESTnewActInst(2);
             pData->bDynamicName = 1;
+        } else if (!strcmp(actpblk.descr[i].name, "followsymlinks")) {
+            pData->bFollowSymlinks = (int)pvals[i].val.d.n;
+            pData->bFollowSymlinksExplicit = 1;
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(actpblk.descr[i].name, "dynafile.dangerouspermitpathescape")) {
+            pData->bPermitDynaFilePathEscape = pvals[i].val.d.n;
+            if (pData->bPermitDynaFilePathEscape) {
+                warnDynaFilePathEscapeEnabled("action parameter");
+            }
         } else if (!strcmp(actpblk.descr[i].name, "sig.provider")) {
-            pData->sigprovName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->sigprovName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "cry.provider")) {
-            pData->cryprovName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->cryprovName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "closetimeout")) {
             pData->iCloseTimeout = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "rotation.sizelimit")) {
             pData->iSizeLimit = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "rotation.sizelimitcommand")) {
-            pData->pszSizeLimitCmd = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszSizeLimitCmd = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "rotation.sizelimitcommandpassfilename")) {
             pData->bSizeLimitCmdPassFileName = (int)pvals[i].val.d.n;
         } else {
@@ -1594,7 +2016,7 @@ BEGINnewActInst
         /* "filename" is actually a template name, we need this as string 1. So let's add it
          * to the pOMSR. -- rgerhards, 2007-07-27
          */
-        CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData->fname), OMSR_NO_RQD_TPL_OPTS));
+        CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData->fname), OMSR_TPL_AS_DYNAFILE));
         pData->iNumTpls = 2;
         // TODO: create unified code for this (legacy+v6 system)
         /* we now allocate the cache table */
@@ -1635,6 +2057,16 @@ BEGINparseSelectorAct
 
     CHKiRet(createInstance(&pData));
 
+    /* Legacy selector actions bypass newActInst(), so copy the dynafile
+     * module defaults explicitly when a v6 module block was provided. */
+    pData->dynaFileBasePath = NULL;
+    pData->bPermitDynaFilePathEscape = 0;
+    pData->bRestrictDynaFileTplType = 0;
+    if (loadModConf != NULL) {
+        pData->bPermitDynaFilePathEscape = loadModConf->bPermitDynaFilePathEscape;
+        pData->bRestrictDynaFileTplType = loadModConf->bRestrictDynaFileTplType;
+    }
+
     if (*p == '-') {
         pData->bSyncFile = 0;
         p++;
@@ -1669,7 +2101,7 @@ BEGINparseSelectorAct
             /* "filename" is actually a template name, we need this as string 1. So let's add it
              * to the pOMSR. -- rgerhards, 2007-07-27
              */
-            CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData->fname), OMSR_NO_RQD_TPL_OPTS));
+            CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData->fname), OMSR_TPL_AS_DYNAFILE));
             /* we now allocate the cache table */
             CHKmalloc(pData->dynCache =
                           (dynaFileCacheEntry **)calloc(cs.iDynaFileCacheSize, sizeof(dynaFileCacheEntry *)));
@@ -1769,6 +2201,7 @@ BEGINqueryEtryPt
     CODEqueryEtryPt_STD_CONF2_QUERIES;
     CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES;
     CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES;
+    CODEqueryEtryPt_SetActionInfo_IF_OMOD_QUERIES;
     CODEqueryEtryPt_doHUP
 ENDqueryEtryPt
 

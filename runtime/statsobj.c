@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
@@ -82,9 +83,27 @@ static struct hashtable *stats_senders = NULL;
 
 /* ------------------------------ statsobj linked list maintenance  ------------------------------ */
 
-static void addToObjList(statsobj_t *pThis) {
-    pthread_mutex_lock(&mutStats);
-    if (pThis->flags && STATSOBJ_FLAG_DO_PREPEND) {
+static rsRetVal statsobjLock(pthread_mutex_t *mutex, const char *lockName) {
+    const int ret = pthread_mutex_lock(mutex);
+    if (ret != 0) {
+        LogError(ret, RS_RET_CONC_CTRL_ERR, "statsobj: error locking %s mutex", lockName);
+        return RS_RET_CONC_CTRL_ERR;
+    }
+    return RS_RET_OK;
+}
+
+static void statsobjUnlock(pthread_mutex_t *mutex, const char *lockName) {
+    const int ret = pthread_mutex_unlock(mutex);
+    if (ret != 0) {
+        LogError(ret, RS_RET_CONC_CTRL_ERR, "statsobj: error unlocking %s mutex", lockName);
+        abort();
+    }
+}
+
+static rsRetVal addToObjList(statsobj_t *pThis) {
+    DEFiRet;
+    CHKiRet(statsobjLock(&mutStats, "stats object list"));
+    if (pThis->flags & STATSOBJ_FLAG_DO_PREPEND) {
         pThis->next = objRoot;
         if (objRoot != NULL) {
             objRoot->prev = pThis;
@@ -97,27 +116,39 @@ static void addToObjList(statsobj_t *pThis) {
         objLast = pThis;
         if (objRoot == NULL) objRoot = pThis;
     }
-    pthread_mutex_unlock(&mutStats);
+    /* Unlock failures happen after shared state was already updated.  Log them,
+     * but do not make callers roll back objects that are now visible.
+     */
+    statsobjUnlock(&mutStats, "stats object list");
+finalize_it:
+    RETiRet;
 }
 
 
-static void removeFromObjList(statsobj_t *pThis) {
-    pthread_mutex_lock(&mutStats);
+static rsRetVal removeFromObjList(statsobj_t *pThis) {
+    DEFiRet;
+    CHKiRet(statsobjLock(&mutStats, "stats object list"));
     if (pThis->prev != NULL) pThis->prev->next = pThis->next;
     if (pThis->next != NULL) pThis->next->prev = pThis->prev;
     if (objLast == pThis) objLast = pThis->prev;
     if (objRoot == pThis) objRoot = pThis->next;
-    pthread_mutex_unlock(&mutStats);
+    statsobjUnlock(&mutStats, "stats object list");
+finalize_it:
+    RETiRet;
 }
 
 
-static void addCtrToList(statsobj_t *pThis, ctr_t *pCtr) {
-    pthread_mutex_lock(&pThis->mutCtr);
+static rsRetVal addCtrToList(statsobj_t *pThis, ctr_t *pCtr) {
+    DEFiRet;
+    CHKiRet(statsobjLock(&pThis->mutCtr, "counter list"));
     pCtr->prev = pThis->ctrLast;
     if (pThis->ctrLast != NULL) pThis->ctrLast->next = pCtr;
     pThis->ctrLast = pCtr;
     if (pThis->ctrRoot == NULL) pThis->ctrRoot = pCtr;
-    pthread_mutex_unlock(&pThis->mutCtr);
+    /* See addToObjList(): rollback after successful list mutation is unsafe. */
+    statsobjUnlock(&pThis->mutCtr, "counter list");
+finalize_it:
+    RETiRet;
 }
 
 /* ------------------------------ methods ------------------------------ */
@@ -126,11 +157,12 @@ static void addCtrToList(statsobj_t *pThis, ctr_t *pCtr) {
 /* Standard-Constructor
  */
 BEGINobjConstruct(statsobj) /* be sure to specify the object type also in END macro! */
-    pthread_mutex_init(&pThis->mutCtr, NULL);
+    CHKiConcCtrl(pthread_mutex_init(&pThis->mutCtr, NULL));
     pThis->ctrLast = NULL;
     pThis->ctrRoot = NULL;
     pThis->read_notifier = NULL;
     pThis->flags = 0;
+finalize_it:
 ENDobjConstruct(statsobj)
 
 
@@ -139,7 +171,8 @@ ENDobjConstruct(statsobj)
 static rsRetVal statsobjConstructFinalize(statsobj_t *pThis) {
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, statsobj);
-    addToObjList(pThis);
+    CHKiRet(addToObjList(pThis));
+finalize_it:
     RETiRet;
 }
 
@@ -226,7 +259,7 @@ static rsRetVal addManagedCounter(statsobj_t *pThis,
             break;
     }
     if (linked) {
-        addCtrToList(pThis, ctr);
+        CHKiRet(addCtrToList(pThis, ctr));
     }
     *entryRef = ctr;
 
@@ -240,10 +273,10 @@ finalize_it:
     RETiRet;
 }
 
-static void addPreCreatedCounter(statsobj_t *pThis, ctr_t *pCtr) {
+static rsRetVal addPreCreatedCounter(statsobj_t *pThis, ctr_t *pCtr) {
     pCtr->next = NULL;
     pCtr->prev = NULL;
-    addCtrToList(pThis, pCtr);
+    return addCtrToList(pThis, pCtr);
 }
 
 static rsRetVal addCounter(statsobj_t *pThis, const uchar *ctrName, statsCtrType_t ctrType, int8_t flags, void *pCtr) {
@@ -276,14 +309,34 @@ static void destructCounter(statsobj_t *pThis, ctr_t *pCtr) {
     destructUnlinkedCounter(pCtr);
 }
 
+static intctr_t getIntCtrValue(const intctr_t *const ctr) {
+    return PREFER_LOAD_uint64(ctr);
+}
+
+
+static void resetIntCtrValue(intctr_t *const ctr) {
+    PREFER_STORE_uint64(ctr, 0);
+}
+
+
+static int getIntValue(const int *const ctr) {
+    return PREFER_LOAD_INT(ctr);
+}
+
+
+static void resetIntValue(int *const ctr) {
+    PREFER_STORE_INT(ctr, 0);
+}
+
+
 static void resetResettableCtr(ctr_t *pCtr, int8_t bResetCtrs) {
     if ((bResetCtrs && (pCtr->flags & CTR_FLAG_RESETTABLE)) || (pCtr->flags & CTR_FLAG_MUST_RESET)) {
         switch (pCtr->ctrType) {
             case ctrType_IntCtr:
-                *(pCtr->val.pIntCtr) = 0;
+                resetIntCtrValue(pCtr->val.pIntCtr);
                 break;
             case ctrType_Int:
-                *(pCtr->val.pInt) = 0;
+                resetIntValue(pCtr->val.pInt);
                 break;
             default:
                 // No action needed for other cases
@@ -323,9 +376,9 @@ finalize_it:
 static intctr_t accumulatedValue(ctr_t *pCtr) {
     switch (pCtr->ctrType) {
         case ctrType_IntCtr:
-            return *(pCtr->val.pIntCtr);
+            return getIntCtrValue(pCtr->val.pIntCtr);
         case ctrType_Int:
-            return *(pCtr->val.pInt);
+            return (intctr_t)getIntValue(pCtr->val.pInt);
         default:
             // No action needed for other cases
             break;
@@ -437,10 +490,10 @@ static rsRetVal getStatsLine(statsobj_t *pThis, cstr_t **ppcstr, int8_t bResetCt
         cstrAppendChar(pcstr, '=');
         switch (pCtr->ctrType) {
             case ctrType_IntCtr:
-                rsCStrAppendInt(pcstr, *(pCtr->val.pIntCtr));  // TODO: OK?????
+                rsCStrAppendInt(pcstr, getIntCtrValue(pCtr->val.pIntCtr));
                 break;
             case ctrType_Int:
-                rsCStrAppendInt(pcstr, *(pCtr->val.pInt));
+                rsCStrAppendInt(pcstr, getIntValue(pCtr->val.pInt));
                 break;
             default:
                 // No action needed for other cases
@@ -501,6 +554,150 @@ static void getSenderStats(rsRetVal (*cb)(void *, const char *),
 }
 
 
+/*
+ * Prometheus values escaping reserves the U__ prefix. Ordinary legacy-safe
+ * names remain unchanged; all other names use a reversible U__ encoding.
+ */
+static int prometheusLegacySafeName(const uchar *name) {
+    const uchar *p;
+
+    if (name == NULL || name[0] == '\0') return 0;
+    if (!((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z') || name[0] == '_' ||
+          name[0] == ':')) {
+        return 0;
+    }
+    if (name[0] == 'U' && strncmp((const char *)name, "U__", 3) == 0) return 0;
+    for (p = name + 1; *p != '\0'; ++p) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_' ||
+              *p == ':')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int decodeUtf8Codepoint(const uchar *input, size_t len, size_t *consumed, uint32_t *codepoint) {
+    const uint32_t b0 = input[0];
+
+    if (b0 < 0x80) {
+        *consumed = 1;
+        *codepoint = b0;
+        return 1;
+    }
+    if (b0 >= 0xc2 && b0 <= 0xdf && len >= 2 && (input[1] & 0xc0) == 0x80) {
+        *consumed = 2;
+        *codepoint = ((b0 & 0x1f) << 6) | (input[1] & 0x3f);
+        return 1;
+    }
+    if (b0 >= 0xe0 && b0 <= 0xef && len >= 3 && (input[1] & 0xc0) == 0x80 && (input[2] & 0xc0) == 0x80) {
+        *codepoint = ((b0 & 0x0f) << 12) | ((input[1] & 0x3f) << 6) | (input[2] & 0x3f);
+        if (*codepoint >= 0x800 && !(*codepoint >= 0xd800 && *codepoint <= 0xdfff)) {
+            *consumed = 3;
+            return 1;
+        }
+    }
+    if (b0 >= 0xf0 && b0 <= 0xf4 && len >= 4 && (input[1] & 0xc0) == 0x80 && (input[2] & 0xc0) == 0x80 &&
+        (input[3] & 0xc0) == 0x80) {
+        *codepoint = ((b0 & 0x07) << 18) | ((input[1] & 0x3f) << 12) | ((input[2] & 0x3f) << 6) | (input[3] & 0x3f);
+        if (*codepoint >= 0x10000 && *codepoint <= 0x10ffff) {
+            *consumed = 4;
+            return 1;
+        }
+    }
+    *consumed = 1;
+    *codepoint = b0;
+    return 0;
+}
+
+static rsRetVal encodePrometheusMetricName(const uchar *raw_name, char **encoded_name) {
+    const size_t raw_len = raw_name == NULL ? 0 : strlen((const char *)raw_name);
+    size_t offset = 0;
+    size_t out_len = 0;
+    size_t remaining;
+    int written;
+    char *out = NULL;
+    DEFiRet;
+
+    if (encoded_name == NULL || raw_name == NULL) ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    *encoded_name = NULL;
+    if (prometheusLegacySafeName(raw_name)) {
+        CHKmalloc(out = strdup((const char *)raw_name));
+        *encoded_name = out;
+        out = NULL;
+        FINALIZE;
+    }
+    if (raw_len > (SIZE_MAX - 4) / 10) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    CHKmalloc(out = malloc(raw_len * 10 + 4));
+    memcpy(out, "U__", 3);
+    out_len = 3;
+    while (offset < raw_len) {
+        size_t consumed;
+        uint32_t codepoint;
+        const int valid = decodeUtf8Codepoint(raw_name + offset, raw_len - offset, &consumed, &codepoint);
+        if (valid && ((codepoint >= 'a' && codepoint <= 'z') || (codepoint >= 'A' && codepoint <= 'Z') ||
+                      (codepoint >= '0' && codepoint <= '9') || codepoint == ':')) {
+            out[out_len++] = (char)codepoint;
+        } else if (valid && codepoint == '_') {
+            out[out_len++] = '_';
+            out[out_len++] = '_';
+        } else if (valid) {
+            remaining = raw_len * 10 + 4 - out_len;
+            written = snprintf(out + out_len, remaining, "_%X_", codepoint);
+            if (written < 0 || (size_t)written >= remaining) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+            out_len += (size_t)written;
+        } else {
+            remaining = raw_len * 10 + 4 - out_len;
+            written = snprintf(out + out_len, remaining, "_x%02X_", codepoint);
+            if (written < 0 || (size_t)written >= remaining) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+            out_len += (size_t)written;
+        }
+        offset += consumed;
+    }
+    out[out_len] = '\0';
+    *encoded_name = out;
+    out = NULL;
+finalize_it:
+    free(out);
+    RETiRet;
+}
+
+static rsRetVal escapePrometheusHelp(const char *input, const char **escaped, char **allocated) {
+    size_t i;
+    size_t len;
+    size_t out_len = 0;
+    char *out = NULL;
+    DEFiRet;
+
+    if (input == NULL || escaped == NULL || allocated == NULL) ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    *escaped = input;
+    *allocated = NULL;
+    len = strlen(input);
+    for (i = 0; i < len; ++i) {
+        if (input[i] == '\\' || input[i] == '"' || input[i] == '\n') break;
+    }
+    if (i == len) FINALIZE;
+    if (len > (SIZE_MAX - 1) / 2) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    CHKmalloc(out = malloc(len * 2 + 1));
+    for (i = 0; i < len; ++i) {
+        if (input[i] == '\\' || input[i] == '"') {
+            out[out_len++] = '\\';
+            out[out_len++] = input[i];
+        } else if (input[i] == '\n') {
+            out[out_len++] = '\\';
+            out[out_len++] = 'n';
+        } else {
+            out[out_len++] = input[i];
+        }
+    }
+    out[out_len] = '\0';
+    *escaped = out;
+    *allocated = out;
+    out = NULL;
+finalize_it:
+    free(out);
+    RETiRet;
+}
+
 /**
  * Helper: For a single statsobj_t (named o->name), iterate its counters
  * and emit Prometheus lines via cb.  We generate, for each counter:
@@ -519,8 +716,16 @@ static ATTR_NO_SANITIZE_THREAD rsRetVal emitPrometheusForObject(statsobj_t *o,
                                                                 void *usrptr,
                                                                 int8_t bResetCtrs) {
     ctr_t *pCtr;
-    char linebuf[512];
-    int len;
+    char *raw_name = NULL;
+    char *metric_name = NULL;
+    const char *escaped_origin;
+    const char *escaped_object;
+    const char *escaped_counter;
+    char *escaped_origin_alloc = NULL;
+    char *escaped_object_alloc = NULL;
+    char *escaped_counter_alloc = NULL;
+    char *line = NULL;
+    rsRetVal iRet;
     uint64_t value;
     const char *objName = (const char *)o->name;
     const char *origin = o->origin ? (const char *)o->origin : "";
@@ -531,10 +736,10 @@ static ATTR_NO_SANITIZE_THREAD rsRetVal emitPrometheusForObject(statsobj_t *o,
         /* 1) Read the current accumulated value.  Might be IntCtr or Int. */
         switch (pCtr->ctrType) {
             case ctrType_IntCtr:
-                value = *(pCtr->val.pIntCtr);
+                value = getIntCtrValue(pCtr->val.pIntCtr);
                 break;
             case ctrType_Int:
-                value = (uint64_t)(*(pCtr->val.pInt));
+                value = (uint64_t)getIntValue(pCtr->val.pInt);
                 break;
             default:
                 value = 0;
@@ -545,10 +750,10 @@ static ATTR_NO_SANITIZE_THREAD rsRetVal emitPrometheusForObject(statsobj_t *o,
         if ((bResetCtrs && (pCtr->flags & CTR_FLAG_RESETTABLE)) || (pCtr->flags & CTR_FLAG_MUST_RESET)) {
             switch (pCtr->ctrType) {
                 case ctrType_IntCtr:
-                    *(pCtr->val.pIntCtr) = 0;
+                    resetIntCtrValue(pCtr->val.pIntCtr);
                     break;
                 case ctrType_Int:
-                    *(pCtr->val.pInt) = 0;
+                    resetIntValue(pCtr->val.pInt);
                     break;
                 default:
                     break;
@@ -556,21 +761,45 @@ static ATTR_NO_SANITIZE_THREAD rsRetVal emitPrometheusForObject(statsobj_t *o,
         }
         pthread_mutex_unlock(&o->mutCtr);
 
-        /* 3) Build the metric name: "<object>_<counter>_total" */
-        /*    It is conventional in Prometheus to append "_total" to counters. */
-        len = snprintf(linebuf, sizeof(linebuf),
-                       "# HELP %s_%s_total rsyslog stats: origin=\"%s\" object=\"%s\", counter=\"%s\"\n"
-                       "# TYPE %s_%s_total counter\n"
-                       "%s_%s_total %llu\n",
-                       /* HELP */ objName, pCtr->name, origin, objName, pCtr->name,
-                       /* TYPE */ objName, pCtr->name,
-                       /* VALUE */ objName, pCtr->name, (unsigned long long)value);
-        if (len < 0 || len >= (int)sizeof(linebuf)) {
-            /* In case our buffer is too small, just skip emitting this counter. */
-        } else {
-            /* Emit this chunk (all three lines) in one callback */
-            cb(usrptr, linebuf);
+        /* 3) Build the metric name: "<object>_<counter>_total". */
+        if (asprintf(&raw_name, "%s_%s_total", objName, pCtr->name) < 0) {
+            raw_name = NULL;
+            return RS_RET_OUT_OF_MEMORY;
         }
+        if (raw_name == NULL || encodePrometheusMetricName((const uchar *)raw_name, &metric_name) != RS_RET_OK ||
+            escapePrometheusHelp(origin, &escaped_origin, &escaped_origin_alloc) != RS_RET_OK ||
+            escapePrometheusHelp(objName, &escaped_object, &escaped_object_alloc) != RS_RET_OK ||
+            escapePrometheusHelp((const char *)pCtr->name, &escaped_counter, &escaped_counter_alloc) != RS_RET_OK) {
+            free(raw_name);
+            free(metric_name);
+            free(escaped_origin_alloc);
+            free(escaped_object_alloc);
+            free(escaped_counter_alloc);
+            return RS_RET_OUT_OF_MEMORY;
+        }
+        if (asprintf(&line,
+                     "# HELP %s rsyslog stats: origin=\"%s\" object=\"%s\", counter=\"%s\"\n"
+                     "# TYPE %s counter\n"
+                     "%s %llu\n",
+                     metric_name, escaped_origin, escaped_object, escaped_counter, metric_name, metric_name,
+                     (unsigned long long)value) < 0) {
+            line = NULL;
+            free(raw_name);
+            free(metric_name);
+            free(escaped_origin_alloc);
+            free(escaped_object_alloc);
+            free(escaped_counter_alloc);
+            return RS_RET_OUT_OF_MEMORY;
+        }
+        iRet = cb(usrptr, line);
+        free(raw_name);
+        free(metric_name);
+        free(escaped_origin_alloc);
+        free(escaped_object_alloc);
+        free(escaped_counter_alloc);
+        free(line);
+        raw_name = metric_name = escaped_origin_alloc = escaped_object_alloc = escaped_counter_alloc = line = NULL;
+        if (iRet != RS_RET_OK) return iRet;
 
         /* Acquire the lock again before advancing to the next counter */
         pthread_mutex_lock(&o->mutCtr);
@@ -582,9 +811,12 @@ static ATTR_NO_SANITIZE_THREAD rsRetVal emitPrometheusForObject(statsobj_t *o,
 
 static rsRetVal generatePrometheusStats(rsRetVal (*cb)(void *, const char *), void *usrptr, int8_t bResetCtrs) {
     statsobj_t *o;
+    int listLocked = 0;
     DEFiRet;
 
     /* For each statsobj in our linked list, emit Prometheus lines. */
+    pthread_mutex_lock(&mutStats);
+    listLocked = 1;
     for (o = objRoot; o != NULL; o = o->next) {
         CHKiRet(emitPrometheusForObject(o, cb, usrptr, bResetCtrs));
         /* If the object has a read_notifier, call it now */
@@ -592,10 +824,15 @@ static rsRetVal generatePrometheusStats(rsRetVal (*cb)(void *, const char *), vo
             o->read_notifier(o, o->read_notifier_ctx);
         }
     }
+    pthread_mutex_unlock(&mutStats);
+    listLocked = 0;
     /* Optionally, handle sender stats as additional metrics:
      * e.g. emit "rsyslog_sender_<sender> <nMsgs>" lines.
      * For simplicity, we skip this, or you can extend similarly. */
 finalize_it:
+    if (listLocked) {
+        pthread_mutex_unlock(&mutStats);
+    }
     RETiRet;
 }
 
@@ -611,6 +848,7 @@ static rsRetVal getAllStatsLines(rsRetVal (*cb)(void *, const char *),
                                  const int8_t bResetCtrs) {
     statsobj_t *o;
     cstr_t *cstr = NULL;
+    int listLocked = 0;
     DEFiRet;
 
 
@@ -619,6 +857,8 @@ static rsRetVal getAllStatsLines(rsRetVal (*cb)(void *, const char *),
         FINALIZE;
     }
 
+    pthread_mutex_lock(&mutStats);
+    listLocked = 1;
     for (o = objRoot; o != NULL; o = o->next) {
         switch (fmt) {
             case statsFmt_Legacy:
@@ -642,10 +882,15 @@ static rsRetVal getAllStatsLines(rsRetVal (*cb)(void *, const char *),
             o->read_notifier(o, o->read_notifier_ctx);
         }
     }
+    pthread_mutex_unlock(&mutStats);
+    listLocked = 0;
 
     getSenderStats(cb, usrptr, fmt, bResetCtrs);
 
 finalize_it:
+    if (listLocked) {
+        pthread_mutex_unlock(&mutStats);
+    }
     if (cstr != NULL) {
         rsCStrDestruct(&cstr);
     }
@@ -666,12 +911,15 @@ static rsRetVal getAllCounters(statsobj_counter_cb_t cb, void *ctx) {
     DEFiRet;
     statsobj_t *o;
     ctr_t *ctr;
+    int listLocked = 0;
 
     if (cb == NULL) {
         ABORT_FINALIZE(RS_RET_PARAM_ERROR);
     }
 
     /* Iterate through all statsobj instances */
+    pthread_mutex_lock(&mutStats);
+    listLocked = 1;
     for (o = objRoot; o != NULL; o = o->next) {
         /* Iterate through all counters in this object */
         pthread_mutex_lock(&o->mutCtr);
@@ -681,8 +929,7 @@ static rsRetVal getAllCounters(statsobj_counter_cb_t cb, void *ctx) {
             /* Read counter value based on type */
             switch (ctr->ctrType) {
                 case ctrType_IntCtr:
-                    /* Atomic uint64 - safe to read directly */
-                    value = *(ctr->val.pIntCtr);
+                    value = getIntCtrValue(ctr->val.pIntCtr);
                     break;
 
                 case ctrType_Int:
@@ -690,7 +937,7 @@ static rsRetVal getAllCounters(statsobj_counter_cb_t cb, void *ctx) {
                      * behavior. Value may be stale but acceptable for monitoring.
                      * Most ctrType_Int counters are gauges (queue size, open files)
                      * protected by application-level mutexes. */
-                    value = (uint64_t)(*(ctr->val.pInt));
+                    value = (uint64_t)getIntValue(ctr->val.pInt);
                     break;
 
                 default:
@@ -715,8 +962,13 @@ static rsRetVal getAllCounters(statsobj_counter_cb_t cb, void *ctx) {
             o->read_notifier(o, o->read_notifier_ctx);
         }
     }
+    pthread_mutex_unlock(&mutStats);
+    listLocked = 0;
 
 finalize_it:
+    if (listLocked) {
+        pthread_mutex_unlock(&mutStats);
+    }
     RETiRet;
 }
 
@@ -724,7 +976,7 @@ finalize_it:
  * again, as this is right now not needed.
  */
 static rsRetVal enableStats(void) {
-    GatherStats = 1;
+    PREFER_STORE_1_TO_INT(&GatherStats);
     return RS_RET_OK;
 }
 
@@ -826,7 +1078,12 @@ void checkGoneAwaySenders(const time_t tCurr) {
 /* destructor for the statsobj object */
 BEGINobjDestruct(statsobj) /* be sure to specify the object type also in END and CODESTART macros! */
     CODESTARTobjDestruct(statsobj);
-    removeFromObjList(pThis);
+    iRet = removeFromObjList(pThis);
+    /* Do not enter ENDobjDestruct on unlink failure: that macro frees pThis
+     * and would leave objRoot/objLast pointing at released memory. There is no
+     * safe recovery path once we cannot lock the global list for destruction.
+     */
+    if (iRet != RS_RET_OK) abort();
 
     /* destruct counters */
     destructUnlinkedCounters(unlinkAllCounters(pThis));
@@ -869,6 +1126,7 @@ BEGINobjQueryInterface(statsobj)
     pIf->SetStatsObjFlags = setStatsObjFlags;
     pIf->GetAllStatsLines = getAllStatsLines;
     pIf->GetAllCounters = getAllCounters;
+    pIf->EncodePrometheusMetricName = encodePrometheusMetricName;
     pIf->AddCounter = addCounter;
     pIf->AddManagedCounter = addManagedCounter;
     pIf->AddPreCreatedCtr = addPreCreatedCounter;
@@ -891,8 +1149,8 @@ BEGINAbstractObjClassInit(statsobj, 1, OBJ_IS_CORE_MODULE) /* class, version */
     OBJSetMethodHandler(objMethod_CONSTRUCTION_FINALIZER, statsobjConstructFinalize);
 
     /* init other data items */
-    pthread_mutex_init(&mutStats, NULL);
-    pthread_mutex_init(&mutSenders, NULL);
+    CHKiConcCtrl(pthread_mutex_init(&mutStats, NULL));
+    CHKiConcCtrl(pthread_mutex_init(&mutSenders, NULL));
 
     if ((stats_senders = create_hashtable(100, hash_from_string, key_equals_string, NULL)) == NULL) {
         LogError(0, RS_RET_INTERNAL_ERROR,

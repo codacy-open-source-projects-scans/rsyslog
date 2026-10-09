@@ -41,6 +41,7 @@
 #include "template.h"
 #include "module-template.h"
 #include "errmsg.h"
+#include "omazuredce_utils.h"
 
 MODULE_TYPE_OUTPUT;
 MODULE_TYPE_NOKEEP;
@@ -90,6 +91,8 @@ typedef struct wrkrInstanceData {
     char *batchBuf; /* active JSON array, always starts with '[' */
     size_t batchLen;
     size_t recordCount;
+    size_t *recordEnds; /* exclusive end offset for each record; any following comma starts at this offset */
+    size_t recordEndsCap;
     unsigned char *compressedBuf;
     size_t compressedBufCap;
     uint64_t lastMessageTimeMs;
@@ -165,21 +168,37 @@ finalize_it:
     RETiRet;
 }
 
+#define AZURE_MAX_TOKEN_RESPONSE_BYTES (1024 * 1024)
+#define AZURE_MAX_INGEST_RESPONSE_BYTES (16 * 1024)
+
 typedef struct tokenRespBuf_s {
     char *data;
     size_t len;
+    size_t maxLen;
 } tokenRespBuf_t;
 
 static size_t tokenWriteCb(void *contents, size_t size, size_t nmemb, void *userp) {
-    const size_t realsz = size * nmemb;
+    size_t realsz;
+    size_t newLen;
     tokenRespBuf_t *buf = (tokenRespBuf_t *)userp;
-    char *newData = realloc(buf->data, buf->len + realsz + 1);
+    char *newData;
+
+    if (size != 0 && nmemb > SIZE_MAX / size) {
+        return 0;
+    }
+    realsz = size * nmemb;
+    newLen = buf->len + realsz;
+    if (newLen > buf->maxLen || newLen < buf->len) {
+        return 0;
+    }
+
+    newData = realloc(buf->data, newLen + 1);
     if (newData == NULL) {
         return 0;
     }
     buf->data = newData;
     memcpy(buf->data + buf->len, contents, realsz);
-    buf->len += realsz;
+    buf->len = newLen;
     buf->data[buf->len] = '\0';
     return realsz;
 }
@@ -235,7 +254,7 @@ static rsRetVal requestAccessToken(instanceData *pData) {
     long httpCode = 0;
     size_t bodyLen;
     struct curl_slist *headers = NULL;
-    tokenRespBuf_t response = {NULL, 0};
+    tokenRespBuf_t response = {NULL, 0, AZURE_MAX_TOKEN_RESPONSE_BYTES};
     char *token = NULL;
     struct json_object *tokenResp = NULL;
     struct json_object *tokenField = NULL;
@@ -295,7 +314,12 @@ static rsRetVal requestAccessToken(instanceData *pData) {
               safeStr(pData->clientID));
     curlRes = curl_easy_perform(curl);
     if (curlRes != CURLE_OK) {
-        LogError(0, RS_RET_IO_ERROR, "omazuredce: token request failed: %s", curl_easy_strerror(curlRes));
+        if (curlRes == CURLE_WRITE_ERROR) {
+            LogError(0, RS_RET_IO_ERROR, "omazuredce: token response exceeded %zu bytes or failed while buffering",
+                     response.maxLen);
+        } else {
+            LogError(0, RS_RET_IO_ERROR, "omazuredce: token request failed: %s", curl_easy_strerror(curlRes));
+        }
         ABORT_FINALIZE(RS_RET_IO_ERROR);
     }
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
@@ -413,16 +437,17 @@ static size_t decimalDigits(size_t v) {
     return n;
 }
 
+#define GZIP_WRAPPER_OVERHEAD 32U
+
 static size_t estimatePayloadBytesForRequest(instanceData *pData, size_t payloadLen) {
     if (pData->compressionLevel != 0) {
-        return (size_t)compressBound((uLong)payloadLen);
+        return (size_t)compressBound((uLong)payloadLen) + GZIP_WRAPPER_OVERHEAD;
     }
 
     return payloadLen;
 }
 
-static size_t estimateHttpRequestBytesForBody(instanceData *pData, size_t bodyLen) {
-    size_t tokenLen = getAccessTokenLen(pData);
+static size_t estimateHttpRequestBytesForBody(instanceData *pData, size_t bodyLen, size_t tokenLen) {
     size_t total;
     size_t urlLen = pData->requestURLLen;
 
@@ -443,7 +468,8 @@ static size_t estimateHttpRequestBytesForBody(instanceData *pData, size_t bodyLe
 
 /* Estimate total HTTP request bytes (headers + body) for max_batch_bytes enforcement. */
 static size_t estimateHttpRequestBytes(instanceData *pData, size_t payloadLen) {
-    return estimateHttpRequestBytesForBody(pData, estimatePayloadBytesForRequest(pData, payloadLen));
+    return estimateHttpRequestBytesForBody(pData, estimatePayloadBytesForRequest(pData, payloadLen),
+                                           getAccessTokenLen(pData));
 }
 
 static rsRetVal gzipCompressBuffer(const uint8_t *input,
@@ -465,7 +491,7 @@ static rsRetVal gzipCompressBuffer(const uint8_t *input,
 
     *out = NULL;
     *outLen = 0;
-    bound = (size_t)compressBound((uLong)inputLen);
+    bound = (size_t)compressBound((uLong)inputLen) + GZIP_WRAPPER_OVERHEAD;
     if (*bufferCap < bound) {
         CHKmalloc(tmpBuf = (uint8_t *)realloc(*buffer, bound));
         *buffer = tmpBuf;
@@ -499,13 +525,14 @@ finalize_it:
     RETiRet;
 }
 
-static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrData, size_t payloadLen) {
+static rsRetVal postBatchToAzure(
+    instanceData *pData, wrkrInstanceData_t *pWrkrData, size_t payloadLen, size_t recordCount, sbool allowOverLimit) {
     char *authHeader = NULL;
     const unsigned char *payload = (const unsigned char *)pWrkrData->batchBuf;
     size_t sendLen = payloadLen;
     CURLcode curlRes;
     long httpCode = 0;
-    tokenRespBuf_t response = {NULL, 0};
+    tokenRespBuf_t response = {NULL, 0, AZURE_MAX_INGEST_RESPONSE_BYTES};
     struct curl_slist *headers = NULL;
     char *accessToken = NULL;
     int n;
@@ -534,13 +561,21 @@ static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrD
                                        &sendLen));
         }
 
-        requestLen = estimateHttpRequestBytesForBody(pData, sendLen);
-        if (requestLen > (size_t)pData->maxBatchBytes) {
-            LogError(0, RS_RET_ERR,
-                     "omazuredce: batch exceeds max request size before send, payload_bytes=%zu "
+        requestLen = estimateHttpRequestBytesForBody(pData, sendLen, tokenLen);
+        if (!allowOverLimit &&
+            omazuredceClassifyRequestSize(requestLen, (size_t)pData->maxBatchBytes) == OMAZUREDCE_REQUEST_RETRY) {
+            LogError(0, RS_RET_SUSPENDED,
+                     "omazuredce: batch exceeds max request size before send, retaining for retry, payload_bytes=%zu "
                      "estimated_request_bytes=%zu max_batch_bytes=%d",
                      sendLen, requestLen, pData->maxBatchBytes);
-            ABORT_FINALIZE(RS_RET_ERR);
+            ABORT_FINALIZE(RS_RET_SUSPENDED);
+        }
+        if (allowOverLimit &&
+            omazuredceClassifyRequestSize(requestLen, (size_t)pData->maxBatchBytes) == OMAZUREDCE_REQUEST_RETRY) {
+            LogMsg(0, RS_RET_OK, LOG_WARNING,
+                   "omazuredce: posting previously accepted single record after request overhead increased, "
+                   "payload_bytes=%zu estimated_request_bytes=%zu max_batch_bytes=%d",
+                   sendLen, requestLen, pData->maxBatchBytes);
         }
 
         if (pWrkrData->curl == NULL) {
@@ -571,15 +606,20 @@ static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrD
                   compressionLevelName(pData->compressionLevel));
         curlRes = curl_easy_perform(pWrkrData->curl);
         if (curlRes != CURLE_OK) {
-            LogError(0, RS_RET_SUSPENDED, "omazuredce: batch post failed: %s", curl_easy_strerror(curlRes));
+            if (curlRes == CURLE_WRITE_ERROR) {
+                LogError(0, RS_RET_SUSPENDED,
+                         "omazuredce: ingest response exceeded %zu bytes or failed while buffering", response.maxLen);
+            } else {
+                LogError(0, RS_RET_SUSPENDED, "omazuredce: batch post failed: %s", curl_easy_strerror(curlRes));
+            }
             ABORT_FINALIZE(RS_RET_SUSPENDED);
         }
         curl_easy_getinfo(pWrkrData->curl, CURLINFO_RESPONSE_CODE, &httpCode);
         if (httpCode >= 200 && httpCode < 300) {
             DBGPRINTF("omazuredce: batch post successful status=%ld response='%s'\n", httpCode,
                       response.data == NULL ? "" : response.data);
-            LogMsg(0, RS_RET_OK, LOG_INFO, "omazuredce: posted batch records=%zu stream=%s compression=%s",
-                   pWrkrData->recordCount, safeStr(pData->tableName),
+            LogMsg(0, RS_RET_OK, LOG_INFO, "omazuredce: posted batch records=%zu stream=%s compression=%s", recordCount,
+                   safeStr(pData->tableName),
                    (pData->compressionLevel == 0) ? "off" : compressionLevelName(pData->compressionLevel));
             FINALIZE;
         }
@@ -693,47 +733,105 @@ static void resetBatch(wrkrInstanceData_t *pWrkrData) {
     DBGPRINTF("omazuredce[%p]: reset batch buffer\n", pWrkrData);
 }
 
+static rsRetVal ensureRecordEndCapacity(wrkrInstanceData_t *pWrkrData) {
+    size_t newCap;
+    size_t *newEnds;
+    DEFiRet;
+
+    if (pWrkrData->recordCount < pWrkrData->recordEndsCap) {
+        FINALIZE;
+    }
+
+    newCap = (pWrkrData->recordEndsCap == 0) ? 16 : pWrkrData->recordEndsCap * 2;
+    if (newCap < pWrkrData->recordEndsCap || newCap > SIZE_MAX / sizeof(*newEnds)) {
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+    CHKmalloc(newEnds = realloc(pWrkrData->recordEnds, newCap * sizeof(*newEnds)));
+    pWrkrData->recordEnds = newEnds;
+    pWrkrData->recordEndsCap = newCap;
+
+finalize_it:
+    RETiRet;
+}
+
+static void removeBatchPrefix(wrkrInstanceData_t *pWrkrData, const size_t prefixCount) {
+    size_t remainingLen;
+    size_t remainingStart;
+    size_t i;
+
+    if (prefixCount >= pWrkrData->recordCount) {
+        resetBatch(pWrkrData);
+        return;
+    }
+
+    /* recordEnds is exclusive, so it identifies the separator after the prefix; skip that comma. */
+    remainingStart = pWrkrData->recordEnds[prefixCount - 1] + 1;
+    remainingLen = pWrkrData->batchLen - remainingStart;
+    memmove(pWrkrData->batchBuf + 1, pWrkrData->batchBuf + remainingStart, remainingLen);
+    pWrkrData->batchLen = 1 + remainingLen;
+    pWrkrData->batchBuf[pWrkrData->batchLen] = '\0';
+
+    for (i = prefixCount; i < pWrkrData->recordCount; ++i) {
+        /* The retained record starts at index 1 in the compacted array, hence the leading-array-byte offset. */
+        pWrkrData->recordEnds[i - prefixCount] = 1 + pWrkrData->recordEnds[i] - remainingStart;
+    }
+    pWrkrData->recordCount -= prefixCount;
+}
+
 static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
     instanceData *const pData = pWrkrData->pData;
-    size_t openBatchLen = 0;
-    size_t payloadLen = 0;
+    size_t prefixCount;
     size_t requestLen;
     DEFiRet;
     DBGPRINTF("omazuredce[%p]: flushBatch enter, records=%zu currentLen=%zu\n", pWrkrData, pWrkrData->recordCount,
               pWrkrData->batchLen);
 
-    if (pWrkrData->recordCount == 0) {
-        FINALIZE;
-    }
+    while (pWrkrData->recordCount > 0) {
+        sbool allowOverLimit = 0;
+        sbool hasRemainingRecords;
+        size_t payloadLen = 0;
+        char savedSeparator = '\0';
 
-    openBatchLen = pWrkrData->batchLen;
-    CHKiRet(appendChar(pWrkrData, ']'));
-    payloadLen = pWrkrData->batchLen;
-    pWrkrData->batchBuf[payloadLen] = '\0';
-    requestLen = estimateHttpRequestBytes(pData, payloadLen);
-    if (requestLen > (size_t)pData->maxBatchBytes) {
-        LogError(0, RS_RET_ERR,
-                 "omazuredce: dropping over-sized batch, payload_bytes=%zu estimated_request_bytes=%zu "
-                 "max_batch_bytes=%d",
-                 payloadLen, requestLen, pData->maxBatchBytes);
-        resetBatch(pWrkrData);
-        FINALIZE;
-    }
-    DBGPRINTF("omazuredce[%p]: flush batch posting records=%zu payloadBytes=%zu payload='%s'\n", pWrkrData,
-              pWrkrData->recordCount, payloadLen, pWrkrData->batchBuf);
-    CHKiRet(postBatchToAzure(pData, pWrkrData, payloadLen));
-    DBGPRINTF("omazuredce[%p]: flushed batch records=%zu payloadBytes=%zu\n", pWrkrData, pWrkrData->recordCount,
-              payloadLen);
+        prefixCount = 0;
+        for (size_t i = 0; i < pWrkrData->recordCount; ++i) {
+            payloadLen = pWrkrData->recordEnds[i] + 1;
+            requestLen = estimateHttpRequestBytes(pData, payloadLen);
+            if (omazuredceClassifyRequestSize(requestLen, (size_t)pData->maxBatchBytes) == OMAZUREDCE_REQUEST_RETRY) {
+                break;
+            }
+            prefixCount = i + 1;
+        }
 
-    resetBatch(pWrkrData);
+        if (prefixCount == 0) {
+            /* This record passed admission before shared request overhead changed. Try it alone so a transient
+             * token-length increase cannot silently discard an already accepted record. */
+            prefixCount = 1;
+            allowOverLimit = 1;
+        }
+
+        payloadLen = pWrkrData->recordEnds[prefixCount - 1] + 1;
+        hasRemainingRecords = prefixCount < pWrkrData->recordCount;
+        if (hasRemainingRecords) {
+            /* A partial prefix replaces its following comma. A full batch instead appends ']' at batchLen,
+             * where no initialized batch byte exists to save. */
+            savedSeparator = pWrkrData->batchBuf[payloadLen - 1];
+        }
+        pWrkrData->batchBuf[payloadLen - 1] = ']';
+        pWrkrData->batchBuf[payloadLen] = '\0';
+        DBGPRINTF("omazuredce[%p]: flush batch posting records=%zu payloadBytes=%zu payload='%s'\n", pWrkrData,
+                  prefixCount, payloadLen, pWrkrData->batchBuf);
+        iRet = postBatchToAzure(pData, pWrkrData, payloadLen, prefixCount, allowOverLimit);
+        if (hasRemainingRecords) {
+            pWrkrData->batchBuf[payloadLen - 1] = savedSeparator;
+        }
+        /* Restore the retained batch after both successful and failed posts. */
+        pWrkrData->batchBuf[pWrkrData->batchLen] = '\0';
+        CHKiRet(iRet);
+        DBGPRINTF("omazuredce[%p]: flushed batch records=%zu payloadBytes=%zu\n", pWrkrData, prefixCount, payloadLen);
+        removeBatchPrefix(pWrkrData, prefixCount);
+    }
 
 finalize_it:
-    if (iRet != RS_RET_OK && pWrkrData->recordCount > 0 && pWrkrData->batchLen == payloadLen &&
-        payloadLen > openBatchLen && pWrkrData->batchBuf[payloadLen - 1] == ']') {
-        /* Restore the open JSON array so a retry keeps appending valid payload. */
-        pWrkrData->batchLen = openBatchLen;
-        pWrkrData->batchBuf[pWrkrData->batchLen] = '\0';
-    }
     RETiRet;
 }
 
@@ -788,8 +886,10 @@ static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const c
         ABORT_FINALIZE(RS_RET_OK);
     }
 
+    CHKiRet(ensureRecordEndCapacity(pWrkrData));
     if (pWrkrData->recordCount > 0) CHKiRet(appendChar(pWrkrData, ','));
     CHKiRet(appendRaw(pWrkrData, recordJson, recordLen));
+    pWrkrData->recordEnds[pWrkrData->recordCount] = pWrkrData->batchLen;
     pWrkrData->recordCount++;
     DBGPRINTF("omazuredce[%p]: message appended, recordCount=%zu batchLen=%zu\n", pWrkrData, pWrkrData->recordCount,
               pWrkrData->batchLen);
@@ -941,6 +1041,8 @@ BEGINcreateWrkrInstance
     pWrkrData->pendingAsyncFlushRet = RS_RET_OK;
     pWrkrData->compressedBuf = NULL;
     pWrkrData->compressedBufCap = 0;
+    pWrkrData->recordEnds = NULL;
+    pWrkrData->recordEndsCap = 0;
     CHKmalloc(pWrkrData->batchBuf = malloc((size_t)pWrkrData->pData->maxBatchBytes + 1));
     pWrkrData->curl = curl_easy_init();
     if (pWrkrData->curl == NULL) {
@@ -968,8 +1070,7 @@ BEGINcreateWrkrInstance
 finalize_it:
     if (iRet != RS_RET_OK) {
         if (pWrkrData->timerThreadRunning) {
-            pWrkrData->stopTimerThread = 1;
-            pthread_cond_signal(&pWrkrData->timerCond);
+            omazuredceRequestTimerStop(&pWrkrData->batchLock, &pWrkrData->timerCond, &pWrkrData->stopTimerThread);
             pthread_join(pWrkrData->timerThread, NULL);
             pWrkrData->timerThreadRunning = 0;
         }
@@ -984,6 +1085,9 @@ finalize_it:
         pWrkrData->compressedBufCap = 0;
         free(pWrkrData->batchBuf);
         pWrkrData->batchBuf = NULL;
+        free(pWrkrData->recordEnds);
+        pWrkrData->recordEnds = NULL;
+        pWrkrData->recordEndsCap = 0;
     }
     DBGPRINTF("omazuredce: createWrkrInstance[%p] ret=%d\n", pWrkrData, iRet);
 ENDcreateWrkrInstance
@@ -1011,8 +1115,7 @@ ENDfreeInstance
 BEGINfreeWrkrInstance
     CODESTARTfreeWrkrInstance;
     DBGPRINTF("omazuredce: freeWrkrInstance[%p]\n", pWrkrData);
-    pWrkrData->stopTimerThread = 1;
-    pthread_cond_signal(&pWrkrData->timerCond);
+    omazuredceRequestTimerStop(&pWrkrData->batchLock, &pWrkrData->timerCond, &pWrkrData->stopTimerThread);
     if (pWrkrData->timerThreadRunning) {
         pthread_join(pWrkrData->timerThread, NULL);
         pWrkrData->timerThreadRunning = 0;
@@ -1024,6 +1127,7 @@ finalize_it:
     if (pWrkrData->curl != NULL) curl_easy_cleanup(pWrkrData->curl);
     free(pWrkrData->compressedBuf);
     free(pWrkrData->batchBuf);
+    free(pWrkrData->recordEnds);
 ENDfreeWrkrInstance
 
 BEGINdbgPrintInstInfo
@@ -1108,7 +1212,12 @@ BEGINendTransaction
     CHKiRet(retryPendingAsyncFlushUnlocked(pWrkrData));
     /* Always flush at transaction end so queue commit never races ahead of HTTP delivery. */
     if (pWrkrData->recordCount > 0) {
-        CHKiRet(flushBatchUnlocked(pWrkrData));
+        iRet = flushBatchUnlocked(pWrkrData);
+        if (iRet != RS_RET_OK) {
+            /* actionCommit() retains and replays the transaction parameters; drop only our private copy. */
+            resetBatch(pWrkrData);
+            FINALIZE;
+        }
     }
     if (pthread_mutex_unlock(&pWrkrData->batchLock) != 0) {
         lockHeld = 0;
@@ -1144,19 +1253,19 @@ BEGINnewActInst
 
         if (!strcmp(actpblk.descr[i].name, "template")) {
             free(pData->templateName);
-            pData->templateName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->templateName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "client_id")) {
-            pData->clientID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->clientID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "client_secret")) {
-            pData->clientSecret = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->clientSecret = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "tenant_id")) {
-            pData->tenantID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tenantID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "dce_url")) {
-            pData->dceURL = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->dceURL = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "dcr_id")) {
-            pData->dcrID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->dcrID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "table_name")) {
-            pData->tableName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tableName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "max_batch_bytes")) {
             pData->maxBatchBytes = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "flush_timeout_ms")) {

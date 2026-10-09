@@ -36,6 +36,7 @@ librsyslog_la_SOURCES = \
 	strgen.c \
 	msg.c \
 	msg.h \
+	msg_replace_helper.h \
 	linkedlist.c \
 	linkedlist.h \
 	objomsr.c \
@@ -58,6 +59,7 @@ librsyslog_la_SOURCES = \
 	modules.h \
 	statsobj.c \
 	statsobj.h \
+	compat_queue.h \
 	dynstats.c \
 	dynstats.h \
 	perctile_ringbuf.c \
@@ -75,6 +77,17 @@ librsyslog_la_SOURCES = \
 	wti.h \
 	queue.c \
 	queue.h \
+	queue_da.c \
+	queue_da.h \
+	segdisk_codec.c \
+	segdisk_codec.h \
+	segdisk_crc.c \
+	segdisk_crc.h \
+	segdisk_format.h \
+	segdisk_state.c \
+	segdisk_state.h \
+	segdisk_store.c \
+	segdisk_store.h \
 	ruleset.c \
 	ruleset.h \
 	rswatch.c \
@@ -92,13 +105,14 @@ librsyslog_la_SOURCES = \
 	cfsysline.c \
 	cfsysline.h \
 	\
-	../action.h \
-	../action.c \
-	../threads.c \
-	../threads.h \
+	action.h \
+	action.c \
+	threads.c \
+	threads.h \
+	dirty.h \
 	\
-	../parse.c \
-	../parse.h \
+	parse.c \
+	parse.h \
 	\
 	hashtable.c \
 	hashtable.h \
@@ -106,15 +120,12 @@ librsyslog_la_SOURCES = \
 	hashtable_itr.h \
 	hashtable_private.h \
 	\
-	../outchannel.c \
-	../outchannel.h \
-	../template.c \
-	../template.h \
+	outchannel.c \
+	outchannel.h \
+	template.c \
+	template.h \
 	timezones.c \
 	timezones.h
-# the files with ../ we need to work on - so that they either become part of the
-# runtime or will no longer be needed. -- rgerhards, 2008-06-13
-#
 #if OS_LINUX
 #librsyslog_la_SOURCES += \
 #endif
@@ -217,15 +228,15 @@ endif # if ENABLE_INET
 if ENABLE_OSSL
 # noinst_LTLIBRARIES += lmnsd_ossl.la
 pkglib_LTLIBRARIES += lmnsd_ossl.la
-lmnsd_ossl_la_SOURCES = net_ossl.c net_ossl.h nsd_ossl.c nsd_ossl.h
+lmnsd_ossl_la_SOURCES = net_ossl.c net_ossl.h net_ossl_store.c net_ossl_store.h nsd_ossl.c nsd_ossl.h
 lmnsd_ossl_la_LDFLAGS = -module -avoid-version
 
 if ENABLE_WOLFSSL
 lmnsd_ossl_la_CPPFLAGS = $(PTHREADS_CFLAGS) $(RSRT_CFLAGS) $(WOLFSSL_CFLAGS)
-lmnsd_ossl_la_LIBADD = $(WOLFSSL_LIBS)
+lmnsd_ossl_la_LIBADD = $(WOLFSSL_LIBS) $(GAI_LIBS)
 else
 lmnsd_ossl_la_CPPFLAGS = $(PTHREADS_CFLAGS) $(RSRT_CFLAGS) $(OPENSSL_CFLAGS)
-lmnsd_ossl_la_LIBADD = $(OPENSSL_LIBS)
+lmnsd_ossl_la_LIBADD = $(OPENSSL_LIBS) $(GAI_LIBS)
 
 endif
 endif
@@ -318,8 +329,13 @@ lmtcpsrv_la_SOURCES = \
 	tcpsrv.c \
 	tcpsrv.h
 lmtcpsrv_la_CPPFLAGS = $(PTHREADS_CFLAGS) $(RSRT_CFLAGS)
-lmtcpsrv_la_LDFLAGS = -module -avoid-version
+lmtcpsrv_la_LDFLAGS = -module -avoid-version $(ZLIB_LIBS)
 lmtcpsrv_la_LIBADD =
+
+if ENABLE_LIBZSTD
+lmtcpsrv_la_CPPFLAGS += $(ZSTD_CFLAGS)
+lmtcpsrv_la_LDFLAGS += $(ZSTD_LIBS)
+endif
 
 if ENABLE_LIBLOGGING_STDLOG
 lmtcpsrv_la_CPPFLAGS += $(LIBLOGGING_STDLOG_CFLAGS)

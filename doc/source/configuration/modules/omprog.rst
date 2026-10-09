@@ -26,13 +26,13 @@ terminate. The message format passed to the program can, as usual, be
 modified by defining rsyslog templates.
 
 Note that in order to execute the given program, rsyslog needs to have
-sufficient permissions on the binary file. This is especially true if
-not running as root. Also, keep in mind that default SELinux policies
-most probably do not permit rsyslogd to execute arbitrary binaries. As
-such, permissions must be appropriately added. Note that SELinux
-restrictions also apply if rsyslogd runs under root. To check if a
-problem is SELinux-related, you can temporarily disable SELinux and
-retry. If it then works, you know for sure you have a SELinux issue.
+sufficient permissions on the binary file and on every resource the
+program uses. This is especially true if rsyslog is not running as root,
+but root is not always unrestricted either. When rsyslog is started as a
+system service, ``omprog`` children inherit the service's execution
+context. The systemd sandbox, Linux capabilities, AppArmor, SELinux, and
+private mount namespaces can restrict the child even when ``rsyslogd``
+runs as root. See :ref:`troubleshooting_service_sandboxing` for troubleshooting steps.
 
 Starting with 8.4.0, rsyslogd emits an error message via the ``syslog()``
 API call when there is a problem executing the binary. This can be
@@ -145,6 +145,21 @@ Action Parameters
         :start-after: .. summary-start
         :end-before: .. summary-end
 
+Transaction Mode Status
+=======================
+
+The :ref:`param-omprog-usetransactions` option is still implemented by the
+existing ``omprog`` module and remains experimental. It uses the legacy output
+transaction callbacks because the setting is action-specific: deployments can
+enable transaction markers for one external program while leaving another
+``omprog`` action in per-message mode.
+
+The newer output transaction interface does not currently model this kind of
+per-action switch. Treating ``useTransactions`` as a simple implementation
+conversion would either change existing behavior or require a broader core or
+module design. New configurations should enable it only when the external
+program explicitly implements the ``omprog`` transaction marker protocol.
+
 Examples
 ========
 
@@ -202,5 +217,3 @@ rsyslog will kill and restart it.
 
 Note that the ``useTransactions`` flag is not used in this example. The
 program stores and confirms each log individually.
-
-

@@ -38,6 +38,10 @@
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <sys/time.h>
+#ifdef __linux__
+    #include <dirent.h>
+    #include <ctype.h>
+#endif
 
 #include "rsyslog.h"
 #include "syslogd-types.h"
@@ -56,6 +60,99 @@
 
 MODULE_TYPE_LIB
 MODULE_TYPE_NOKEEP;
+
+#ifdef __linux__
+/* A bind failure is rare, so consult procfs only on this diagnostic path.
+ * A port can have several listeners on distinct addresses; report one visible
+ * owner as a clue, without claiming that it is necessarily the conflicting one.
+ */
+static unsigned long listenerInodeForPort(const char *path, unsigned port) {
+    FILE *fp = fopen(path, "r");
+    char line[512];
+    unsigned localPort, state;
+    unsigned long inode;
+
+    if (fp == NULL) return 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (sscanf(line, " %*u: %*32[0-9A-Fa-f]:%x %*s %x %*s %*s %*s %*s %*s %lu", &localPort, &state, &inode) == 3 &&
+            localPort == port && state == 0x0a) {
+            fclose(fp);
+            return inode;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int describeListenerOwner(unsigned long inode, char *out, size_t outSize) {
+    DIR *procs = opendir("/proc");
+    struct dirent *proc;
+    if (procs == NULL) return 0;
+    while ((proc = readdir(procs)) != NULL) {
+        char fdDirPath[80], commPath[80], expected[64], linkPath[160], target[80], comm[80];
+        DIR *fds;
+        struct dirent *fd;
+        FILE *fp;
+        ssize_t len;
+        if (!isdigit((unsigned char)proc->d_name[0])) continue;
+        snprintf(fdDirPath, sizeof(fdDirPath), "/proc/%s/fd", proc->d_name);
+        fds = opendir(fdDirPath);
+        if (fds == NULL) continue;
+        snprintf(expected, sizeof(expected), "socket:[%lu]", inode);
+        while ((fd = readdir(fds)) != NULL) {
+            if (!isdigit((unsigned char)fd->d_name[0])) continue;
+            snprintf(linkPath, sizeof(linkPath), "%s/%s", fdDirPath, fd->d_name);
+            len = readlink(linkPath, target, sizeof(target) - 1);
+            if (len < 0) continue;
+            target[len] = '\0';
+            if (strcmp(target, expected) != 0) continue;
+            snprintf(commPath, sizeof(commPath), "/proc/%s/comm", proc->d_name);
+            fp = fopen(commPath, "r");
+            if (fp != NULL && fgets(comm, sizeof(comm), fp) != NULL) {
+                comm[strcspn(comm, "\n")] = '\0';
+                for (size_t i = 0; comm[i] != '\0'; ++i) {
+                    if ((unsigned char)comm[i] < 32 || (unsigned char)comm[i] == 127) comm[i] = '?';
+                }
+                snprintf(out, outSize, "one visible listener is PID %s (%s)", proc->d_name, comm);
+            } else {
+                snprintf(out, outSize, "one visible listener is PID %s", proc->d_name);
+            }
+            if (fp != NULL) fclose(fp);
+            closedir(fds);
+            closedir(procs);
+            return 1;
+        }
+        closedir(fds);
+    }
+    closedir(procs);
+    return 0;
+}
+#endif
+
+static void logBindFailure(const int bindErrno, const unsigned port) {
+#ifdef __linux__
+    unsigned long inode = 0;
+    char owner[160];
+    if (bindErrno == EADDRINUSE) {
+        inode = listenerInodeForPort("/proc/net/tcp", port);
+        if (inode == 0) inode = listenerInodeForPort("/proc/net/tcp6", port);
+    }
+    if (inode != 0 && describeListenerOwner(inode, owner, sizeof(owner))) {
+        LogError(bindErrno, NO_ERRCODE, "Error binding TCP port %u: %s", port, owner);
+        return;
+    }
+#endif
+    if (bindErrno == EADDRINUSE) {
+#ifdef __linux__
+        LogError(bindErrno, NO_ERRCODE,
+                 "Error binding TCP port %u; listener owner unavailable (try ss -ltnp 'sport = :%u')", port, port);
+#else
+        LogError(bindErrno, NO_ERRCODE, "Error binding TCP port %u; listener owner unavailable", port);
+#endif
+    } else {
+        LogError(bindErrno, NO_ERRCODE, "Error binding TCP port %u", port);
+    }
+}
 
 /* static data */
 DEFobjStaticHelpers;
@@ -251,6 +348,18 @@ finalize_it:
     RETiRet;
 }
 
+static rsRetVal SetTlsCAExtraFiles(nsd_t __attribute__((unused)) * pNsd, const uchar *const pszFile) {
+    DEFiRet;
+    if (pszFile != NULL) {
+        LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
+                 "error: extra CA Files setting not supported by "
+                 "ptcp netstream driver");
+        ABORT_FINALIZE(RS_RET_VALUE_NOT_SUPPORTED);
+    }
+finalize_it:
+    RETiRet;
+}
+
 static rsRetVal SetTlsKeyFile(nsd_t __attribute__((unused)) * pNsd, const uchar *const pszFile) {
     DEFiRet;
     if (pszFile != NULL) {
@@ -389,6 +498,19 @@ static rsRetVal SetKeepAliveTime(nsd_t *pNsd, int keepAliveTime) {
     ISOBJ_TYPE_assert((pThis), nsd_ptcp);
 
     pThis->iKeepAliveTime = keepAliveTime;
+
+    RETiRet;
+}
+
+/* TCP user timeout option
+ */
+static rsRetVal SetTcpUserTimeout(nsd_t *pNsd, int tcpUserTimeout) {
+    nsd_ptcp_t *pThis = (nsd_ptcp_t *)pNsd;
+    DEFiRet;
+
+    ISOBJ_TYPE_assert((pThis), nsd_ptcp);
+
+    pThis->tcp_user_timeout_ms = tcpUserTimeout;
 
     RETiRet;
 }
@@ -690,7 +812,11 @@ static rsRetVal ATTR_NONNULL(1, 3, 5) LstnInit(netstrms_t *const pNS,
 #endif
         ) {
             /* TODO: check if *we* bound the socket - else we *have* an error! */
-            LogError(errno, NO_ERRCODE, "Error while binding tcp socket");
+            const int bindErrno = errno;
+            savecast.sa = r->ai_addr;
+            const unsigned port =
+                (r->ai_family == AF_INET6) ? ntohs(savecast.ipv6->sin6_port) : ntohs(savecast.ipv4->sin_port);
+            logBindFailure(bindErrno, port);
             close(sock);
             sock = -1;
             continue;
@@ -761,6 +887,7 @@ static rsRetVal ATTR_NONNULL(1, 3, 5) LstnInit(netstrms_t *const pNS,
         CHKiRet(pNS->Drvr.SetPrioritizeSAN(pNewNsd, netstrms.GetDrvrPrioritizeSAN(pNS)));
         CHKiRet(pNS->Drvr.SetTlsCAFile(pNewNsd, netstrms.GetDrvrTlsCAFile(pNS)));
         CHKiRet(pNS->Drvr.SetTlsCRLFile(pNewNsd, netstrms.GetDrvrTlsCRLFile(pNS)));
+        CHKiRet(pNS->Drvr.SetTlsCAExtraFiles(pNewNsd, NULL));
         CHKiRet(pNS->Drvr.SetTlsKeyFile(pNewNsd, netstrms.GetDrvrTlsKeyFile(pNS)));
         CHKiRet(pNS->Drvr.SetTlsCertFile(pNewNsd, netstrms.GetDrvrTlsCertFile(pNS)));
         CHKiRet(pNS->Drvr.SetTlsVerifyDepth(pNewNsd, netstrms.GetDrvrTlsVerifyDepth(pNS)));
@@ -956,6 +1083,41 @@ finalize_it:
 }
 
 
+/* Set TCP_USER_TIMEOUT on platforms that support it.
+ */
+static rsRetVal ApplyTcpUserTimeout(nsd_ptcp_t *pThis) {
+    static int bWarned = 0;
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, nsd_ptcp);
+
+    if (pThis->tcp_user_timeout_ms <= 0) {
+        FINALIZE;
+    }
+
+#if defined(IPPROTO_TCP) && defined(TCP_USER_TIMEOUT)
+    int ret;
+    int optval;
+    socklen_t optlen;
+
+    optval = pThis->tcp_user_timeout_ms;
+    optlen = sizeof(optval);
+    ret = setsockopt(pThis->sock, IPPROTO_TCP, TCP_USER_TIMEOUT, &optval, optlen);
+    if (ret < 0 && !bWarned) {
+        LogError(errno, NO_ERRCODE, "nsd_ptcp cannot set TCP_USER_TIMEOUT - ignored");
+        bWarned = 1;
+    }
+#else
+    if (!bWarned) {
+        LogError(0, NO_ERRCODE, "nsd_ptcp cannot set TCP_USER_TIMEOUT on this platform - ignored");
+        bWarned = 1;
+    }
+#endif
+
+finalize_it:
+    RETiRet;
+}
+
+
 /* open a connection to a remote host (server).
  * rgerhards, 2008-03-19
  */
@@ -1015,6 +1177,7 @@ static rsRetVal Connect(nsd_t *pNsd, int family, uchar *port, uchar *host, char 
 #endif
         }
 
+        CHKiRet(ApplyTcpUserTimeout(pThis));
         if (connect(pThis->sock, currAddr->ai_addr, currAddr->ai_addrlen) == 0) {
             break;
         }
@@ -1217,11 +1380,13 @@ BEGINobjQueryInterface(nsd_ptcp)
     pIf->SetKeepAliveIntvl = SetKeepAliveIntvl;
     pIf->SetKeepAliveProbes = SetKeepAliveProbes;
     pIf->SetKeepAliveTime = SetKeepAliveTime;
+    pIf->SetTcpUserTimeout = SetTcpUserTimeout;
     pIf->SetCheckExtendedKeyUsage = SetCheckExtendedKeyUsage;
     pIf->SetPrioritizeSAN = SetPrioritizeSAN;
     pIf->SetTlsVerifyDepth = SetTlsVerifyDepth;
     pIf->SetTlsCAFile = SetTlsCAFile;
     pIf->SetTlsCRLFile = SetTlsCRLFile;
+    pIf->SetTlsCAExtraFiles = SetTlsCAExtraFiles;
     pIf->SetTlsKeyFile = SetTlsKeyFile;
     pIf->SetTlsCertFile = SetTlsCertFile;
     pIf->SetRemoteSNI = SetRemoteSNI;

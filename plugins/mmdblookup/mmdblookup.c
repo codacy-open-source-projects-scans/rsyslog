@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include "conf.h"
 #include "syslogd-types.h"
@@ -69,6 +70,7 @@ typedef struct wrkrInstanceData {
     instanceData *pData;
     MMDB_s mmdb;
     pthread_mutex_t mmdbMutex;
+    sbool mmdb_mutex_initialized;
     sbool mmdb_is_open;
 } wrkrInstanceData_t;
 
@@ -168,10 +170,19 @@ ENDcreateInstance
 
 BEGINcreateWrkrInstance
     CODESTARTcreateWrkrInstance;
+    pWrkrData->mmdb_mutex_initialized = 0;
+    pWrkrData->mmdb_is_open = 0;
+    CHKiConcCtrl(pthread_mutex_init(&pWrkrData->mmdbMutex, NULL));
+    pWrkrData->mmdb_mutex_initialized = 1;
     CHKiRet(open_mmdb(pData->pszMmdbFile, &pWrkrData->mmdb));
     pWrkrData->mmdb_is_open = 1;
-    CHKiConcCtrl(pthread_mutex_init(&pWrkrData->mmdbMutex, NULL));
 finalize_it:
+    if (iRet != RS_RET_OK) {
+        if (pWrkrData->mmdb_is_open) close_mmdb(&pWrkrData->mmdb);
+        if (pWrkrData->mmdb_mutex_initialized) pthread_mutex_destroy(&pWrkrData->mmdbMutex);
+        free(pWrkrData);
+        pWrkrData = NULL;
+    }
 ENDcreateWrkrInstance
 
 
@@ -199,7 +210,10 @@ BEGINfreeWrkrInstance
     CODESTARTfreeWrkrInstance;
     if (pWrkrData->mmdb_is_open) close_mmdb(&pWrkrData->mmdb);
     pWrkrData->mmdb_is_open = 0;
-    pthread_mutex_destroy(&pWrkrData->mmdbMutex);
+    if (pWrkrData->mmdb_mutex_initialized) {
+        pthread_mutex_destroy(&pWrkrData->mmdbMutex);
+        pWrkrData->mmdb_mutex_initialized = 0;
+    }
 ENDfreeWrkrInstance
 
 
@@ -224,7 +238,7 @@ BEGINsetModCnf
     for (i = 0; i < modpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(modpblk.descr[i].name, "container")) {
-            loadModConf->container = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->container = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             dbgprintf(
                 "mmdblookup: program error, non-handled "
@@ -265,15 +279,16 @@ BEGINnewActInst
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "key")) {
-            pData->pszKey = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszKey = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "mmdbfile")) {
-            pData->pszMmdbFile = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszMmdbFile = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "fields")) {
             pData->fieldList.nmemb = pvals[i].val.d.ar->nmemb;
             CHKmalloc(pData->fieldList.name = calloc(pData->fieldList.nmemb, sizeof(char *)));
             CHKmalloc(pData->fieldList.varname = calloc(pData->fieldList.nmemb, sizeof(char *)));
             for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
-                char *const param = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+                char *param;
+                CHKmalloc(param = es_str2cstr(pvals[i].val.d.ar->arr[j], NULL));
                 char *varname = NULL;
                 char *name;
                 if (*param == ':') {
@@ -338,7 +353,20 @@ static json_object *entry_data_to_json(const MMDB_entry_data_s *data) {
         case MMDB_DATA_TYPE_INT32:
             return json_object_new_int(data->int32);
         case MMDB_DATA_TYPE_UINT64:
-            return json_object_new_int64((int64_t)data->uint64);
+#ifdef json_type_uint64
+            return json_object_new_uint64(data->uint64);
+#else
+            if (data->uint64 <= (uint64_t)INT64_MAX) {
+                return json_object_new_int64((int64_t)data->uint64);
+            }
+
+            char uint64Buf[sizeof("18446744073709551615")];
+            if (snprintf(uint64Buf, sizeof(uint64Buf), "%" PRIu64, data->uint64) < 0) {
+                return NULL;
+            }
+            uint64Buf[sizeof(uint64Buf) - 1] = '\0';
+            return json_object_new_string(uint64Buf);
+#endif
         case MMDB_DATA_TYPE_BOOLEAN:
             return json_object_new_boolean(data->boolean);
         default:

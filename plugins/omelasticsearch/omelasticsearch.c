@@ -82,8 +82,38 @@ STATSCOUNTER_DEF(indexBadArgument, mutIndexBadArgument)
 STATSCOUNTER_DEF(indexBulkRejection, mutIndexBulkRejection)
 STATSCOUNTER_DEF(indexOtherResponse, mutIndexOtherResponse)
 STATSCOUNTER_DEF(rebinds, mutRebinds)
+STATSCOUNTER_DEF(indexRequestCount, mutIndexRequestCount)
+STATSCOUNTER_DEF(indexRequestTimeMs, mutIndexRequestTimeMs)
+STATSCOUNTER_DEF(indexRequestTimeMsMin, mutIndexRequestTimeMsMin)
+STATSCOUNTER_DEF(indexRequestTimeMsMax, mutIndexRequestTimeMsMax)
 
 static prop_t *pInputName = NULL;
+
+/*
+ * Keep the request-duration summary lock-free. The statistics subsystem
+ * deliberately permits a scrape/reset race, and these compare-and-swap loops
+ * preserve that best-effort behavior without serializing output workers.
+ * A value of zero marks an empty reporting interval, so callers clamp an
+ * observed duration to at least one millisecond before calling this helper.
+ */
+static inline void updateRequestDurationStats(const uint64_t duration_ms) {
+    uint64_t old_value;
+
+    STATSCOUNTER_INC(indexRequestCount, mutIndexRequestCount);
+    STATSCOUNTER_ADD(indexRequestTimeMs, mutIndexRequestTimeMs, duration_ms);
+
+    old_value = ATOMIC_LOAD_uint64(&indexRequestTimeMsMin, &mutIndexRequestTimeMsMin);
+    while ((old_value == 0 || duration_ms < old_value) &&
+           !ATOMIC_CAS_uint64(&indexRequestTimeMsMin, old_value, duration_ms, &mutIndexRequestTimeMsMin)) {
+        old_value = ATOMIC_LOAD_uint64(&indexRequestTimeMsMin, &mutIndexRequestTimeMsMin);
+    }
+
+    old_value = ATOMIC_LOAD_uint64(&indexRequestTimeMsMax, &mutIndexRequestTimeMsMax);
+    while (duration_ms > old_value &&
+           !ATOMIC_CAS_uint64(&indexRequestTimeMsMax, old_value, duration_ms, &mutIndexRequestTimeMsMax)) {
+        old_value = ATOMIC_LOAD_uint64(&indexRequestTimeMsMax, &mutIndexRequestTimeMsMax);
+    }
+}
 
 #define META_STRT "{\"index\":{\"_index\": \""
 #define META_STRT_CREATE "{\"create\":{" /* \"_index\": \" */
@@ -156,6 +186,7 @@ typedef struct instanceConf_s {
     sbool dynBulkId;
     sbool dynPipelineName;
     sbool bulkmode;
+    int iNumTpls;
     size_t maxbytes;
     sbool useHttps;
     sbool allowUnsignedCerts;
@@ -163,6 +194,9 @@ typedef struct instanceConf_s {
     uchar *caCertFile;
     uchar *myCertFile;
     uchar *myPrivKeyFile;
+    uchar *tlsVersion; /* tls.tlsversion       → CURLOPT_SSLVERSION    */
+    uchar *tlsCipherSuites; /* tls.ciphersuites      → CURLOPT_TLS13_CIPHERS */
+    uchar *tlsKeyExchangeGroups; /* tls.keyexchangegroups → CURLOPT_SSL_EC_CURVES */
     es_write_ops_t writeOperation;
     sbool retryFailures;
     int ratelimitInterval;
@@ -237,6 +271,9 @@ static struct cnfparamdescr actpdescr[] = {{"server", eCmdHdlrArray, 0},
                                            {"tls.cacert", eCmdHdlrString, 0},
                                            {"tls.mycert", eCmdHdlrString, 0},
                                            {"tls.myprivkey", eCmdHdlrString, 0},
+                                           {"tls.tlsversion", eCmdHdlrString, 0},
+                                           {"tls.ciphersuites", eCmdHdlrString, 0},
+                                           {"tls.keyexchangegroups", eCmdHdlrString, 0},
                                            {"writeoperation", eCmdHdlrGetWord, 0},
                                            {"retryfailures", eCmdHdlrBinary, 0},
                                            {"ratelimit.interval", eCmdHdlrInt, 0},
@@ -248,6 +285,7 @@ static struct cnfparamdescr actpdescr[] = {{"server", eCmdHdlrArray, 0},
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
 static rsRetVal ATTR_NONNULL() curlSetup(wrkrInstanceData_t *pWrkrData);
+static void ATTR_NONNULL() curlSetupTlsOptions(instanceData *const pData, CURL *const handle);
 static rsRetVal ATTR_NONNULL() detectTargetPlatformAndVersion(instanceData *const pData);
 static rsRetVal ATTR_NONNULL() applyVersionRequirements(instanceData *const pData);
 
@@ -350,6 +388,9 @@ BEGINfreeInstance
     free(pData->caCertFile);
     free(pData->myCertFile);
     free(pData->myPrivKeyFile);
+    free(pData->tlsVersion);
+    free(pData->tlsCipherSuites);
+    free(pData->tlsKeyExchangeGroups);
     free(pData->retryRulesetName);
     free(pData->detectedVersionString);
     if (pData->ratelimiter != NULL) ratelimitDestruct(pData->ratelimiter);
@@ -526,6 +567,9 @@ struct versionDetectBuffer {
     size_t len;
 };
 
+/* Keep startup platform probes bounded: root endpoint metadata is tiny JSON. */
+#define ES_VERSION_DETECT_MAX_RESPONSE (1024U * 1024U)
+
 /**
  * @brief cURL write callback used during platform/version detection.
  *
@@ -540,12 +584,28 @@ struct versionDetectBuffer {
 static size_t ATTR_NONNULL(1, 4)
     curlVersionResult(void *const ptr, const size_t size, const size_t nmemb, void *const userdata) {
     struct versionDetectBuffer *const buffer = (struct versionDetectBuffer *)userdata;
-    const size_t size_add = size * nmemb;
+    size_t size_add;
+    size_t newlen;
     char *tmp;
 
-    if (size_add == 0) return 0;
+    if (size == 0 || nmemb == 0) return 0;
+    if (nmemb > SIZE_MAX / size) {
+        LogError(0, RS_RET_ERR, "omelasticsearch: platform detection response size overflow");
+        return 0;
+    }
+    size_add = size * nmemb;
+    if (buffer->len > SIZE_MAX - size_add) {
+        LogError(0, RS_RET_ERR, "omelasticsearch: platform detection response size overflow");
+        return 0;
+    }
+    newlen = buffer->len + size_add;
+    if (newlen > ES_VERSION_DETECT_MAX_RESPONSE) {
+        LogError(0, RS_RET_ERR, "omelasticsearch: platform detection response exceeded %u-byte limit",
+                 (unsigned)ES_VERSION_DETECT_MAX_RESPONSE);
+        return 0;
+    }
 
-    tmp = realloc(buffer->data, buffer->len + size_add + 1);
+    tmp = realloc(buffer->data, newlen + 1);
     if (tmp == NULL) {
         LogError(errno, RS_RET_OUT_OF_MEMORY, "omelasticsearch: realloc failed in curlVersionResult");
         return 0;
@@ -553,7 +613,7 @@ static size_t ATTR_NONNULL(1, 4)
 
     memcpy(tmp + buffer->len, ptr, size_add);
     buffer->data = tmp;
-    buffer->len += size_add;
+    buffer->len = newlen;
     buffer->data[buffer->len] = '\0';
 
     return size_add;
@@ -792,8 +852,7 @@ static rsRetVal ATTR_NONNULL() detectTargetPlatformAndVersion(instanceData *cons
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlVersionResult);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-        if (pData->allowUnsignedCerts) curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        if (pData->skipVerifyHost) curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        curlSetupTlsOptions(pData, curl);
         if (pData->authBuf != NULL) {
             curl_easy_setopt(curl, CURLOPT_USERPWD, pData->authBuf);
             curl_easy_setopt(curl, CURLOPT_PROXYAUTH, CURLAUTH_ANY);
@@ -806,10 +865,6 @@ static rsRetVal ATTR_NONNULL() detectTargetPlatformAndVersion(instanceData *cons
             }
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         }
-        if (pData->caCertFile) curl_easy_setopt(curl, CURLOPT_CAINFO, pData->caCertFile);
-        if (pData->myCertFile) curl_easy_setopt(curl, CURLOPT_SSLCERT, pData->myCertFile);
-        if (pData->myPrivKeyFile) curl_easy_setopt(curl, CURLOPT_SSLKEY, pData->myPrivKeyFile);
-
         CURLcode code = curl_easy_perform(curl);
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -975,6 +1030,104 @@ done:
 }
 
 
+static int ATTR_NONNULL(1) getTemplateCount(const instanceData *const pData) {
+    int iNumTpls = 1;
+    if (pData->dynSrchIdx) ++iNumTpls;
+    if (pData->dynSrchType) ++iNumTpls;
+    if (pData->dynParent) ++iNumTpls;
+    if (pData->dynBulkId) ++iNumTpls;
+    if (pData->dynPipelineName) ++iNumTpls;
+
+    return iNumTpls;
+}
+
+
+/* Bulk metadata values are JSON strings. Dynamic templates may include
+ * untrusted message content, so quote, backslash, and control bytes before
+ * inserting values into the bulk control line.
+ */
+static size_t jsonEscapedLen(const uchar *const str) {
+    size_t len = 0;
+
+    if (str == NULL) return 0;
+
+    for (const uchar *p = str; *p != '\0'; ++p) {
+        if (*p == '"' || *p == '\\') {
+            len += 2;
+        } else if (*p < 0x20) {
+            len += sizeof("\\u00ff") - 1;
+        } else {
+            ++len;
+        }
+    }
+    return len;
+}
+
+
+static int addJsonEscapedBuf(es_str_t **const buf, const uchar *const str) {
+    static const char hex[] = "0123456789abcdef";
+    const uchar *chunk = str;
+    int r = 0;
+
+    if (str == NULL) return 0;
+
+    const uchar *p;
+    for (p = str; *p != '\0'; ++p) {
+        char esc[sizeof("\\u00ff") - 1];
+        size_t escLen;
+
+        if (*p == '"' || *p == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)*p;
+            escLen = 2;
+        } else if (*p < 0x20) {
+            esc[0] = '\\';
+            esc[1] = 'u';
+            esc[2] = '0';
+            esc[3] = '0';
+            esc[4] = hex[*p >> 4];
+            esc[5] = hex[*p & 0x0f];
+            escLen = sizeof("\\u00ff") - 1;
+        } else {
+            continue;
+        }
+
+        if (p > chunk) r = es_addBuf(buf, (const char *)chunk, (size_t)(p - chunk));
+        if (r == 0) r = es_addBuf(buf, esc, escLen);
+        if (r != 0) return r;
+        chunk = p + 1;
+    }
+
+    if (p > chunk) r = es_addBuf(buf, (const char *)chunk, (size_t)(p - chunk));
+    return r;
+}
+
+
+static rsRetVal ATTR_NONNULL(1) validateActionStrings(const instanceData *const pData, uchar **const tpls) {
+    DEFiRet;
+
+    if (tpls == NULL) {
+        LogError(0, RS_RET_INVALID_PARAMS,
+                 "omelasticsearch: action template strings are missing - "
+                 "cannot submit message");
+        ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
+    }
+
+    for (int i = 0; i < pData->iNumTpls; ++i) {
+        if (tpls[i] == NULL) {
+            LogError(0, RS_RET_INVALID_PARAMS,
+                     "omelasticsearch: rendered action template string %d is "
+                     "NULL - cannot submit message",
+                     i);
+            ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
+        }
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+
 static rsRetVal ATTR_NONNULL(1) setPostURL(wrkrInstanceData_t *const pWrkrData, uchar **const tpls) {
     uchar *searchIndex = NULL;
     uchar *searchType = NULL;
@@ -1066,23 +1219,20 @@ static size_t computeMessageSize(const wrkrInstanceData_t *const pWrkrData,
     getIndexTypeAndParent(pWrkrData->pData, tpls, &searchIndex, &searchType, &parent, &bulkId, &pipelineName);
     r += ustrlen((char *)message);
     if (searchIndex != NULL) {
-        r += ustrlen(searchIndex);
-    }
-    if (searchType != NULL) {
-        if (searchType[0] == '\0') {
-            r += 4;  // "_doc"
-        } else {
-            r += ustrlen(searchType);
+        if (pWrkrData->pData->writeOperation == ES_WRITE_CREATE) r += sizeof(META_IX) - 1;
+        r += jsonEscapedLen(searchIndex);
+        if (searchType != NULL && searchType[0] != '\0') {
+            r += sizeof(META_TYPE) - 1 + jsonEscapedLen(searchType);
         }
     }
     if (parent != NULL) {
-        r += sizeof(META_PARENT) - 1 + ustrlen(parent);
+        r += sizeof(META_PARENT) - 1 + jsonEscapedLen(parent);
     }
     if (bulkId != NULL) {
-        r += sizeof(META_ID) - 1 + ustrlen(bulkId);
+        r += sizeof(META_ID) - 1 + jsonEscapedLen(bulkId);
     }
     if (pipelineName != NULL && (!pWrkrData->pData->skipPipelineIfEmpty || pipelineName[0] != '\0')) {
-        r += sizeof(META_PIPELINE) - 1 + ustrlen(pipelineName);
+        r += sizeof(META_PIPELINE) - 1 + jsonEscapedLen(pipelineName);
     }
 
     return r;
@@ -1114,26 +1264,26 @@ static rsRetVal buildBatch(wrkrInstanceData_t *pWrkrData, uchar *message, uchar 
         endQuote = 1;
         if (pWrkrData->pData->writeOperation == ES_WRITE_CREATE)
             if (r == 0) r = es_addBuf(&pWrkrData->batch.data, META_IX, sizeof(META_IX) - 1);
-        if (r == 0) r = es_addBuf(&pWrkrData->batch.data, (char *)searchIndex, ustrlen(searchIndex));
+        if (r == 0) r = addJsonEscapedBuf(&pWrkrData->batch.data, searchIndex);
         if (searchType != NULL && searchType[0] != '\0') {
             if (r == 0) r = es_addBuf(&pWrkrData->batch.data, META_TYPE, sizeof(META_TYPE) - 1);
-            if (r == 0) r = es_addBuf(&pWrkrData->batch.data, (char *)searchType, ustrlen(searchType));
+            if (r == 0) r = addJsonEscapedBuf(&pWrkrData->batch.data, searchType);
         }
     }
     if (parent != NULL) {
         endQuote = 1;
         if (r == 0) r = es_addBuf(&pWrkrData->batch.data, META_PARENT, sizeof(META_PARENT) - 1);
-        if (r == 0) r = es_addBuf(&pWrkrData->batch.data, (char *)parent, ustrlen(parent));
+        if (r == 0) r = addJsonEscapedBuf(&pWrkrData->batch.data, parent);
     }
     if (pipelineName != NULL && (!pWrkrData->pData->skipPipelineIfEmpty || pipelineName[0] != '\0')) {
         endQuote = 1;
         if (r == 0) r = es_addBuf(&pWrkrData->batch.data, META_PIPELINE, sizeof(META_PIPELINE) - 1);
-        if (r == 0) r = es_addBuf(&pWrkrData->batch.data, (char *)pipelineName, ustrlen(pipelineName));
+        if (r == 0) r = addJsonEscapedBuf(&pWrkrData->batch.data, pipelineName);
     }
     if (bulkId != NULL) {
         endQuote = 1;
         if (r == 0) r = es_addBuf(&pWrkrData->batch.data, META_ID, sizeof(META_ID) - 1);
-        if (r == 0) r = es_addBuf(&pWrkrData->batch.data, (char *)bulkId, ustrlen(bulkId));
+        if (r == 0) r = addJsonEscapedBuf(&pWrkrData->batch.data, bulkId);
     }
     if (endQuote == 0) {
         if (r == 0) r = es_addBuf(&pWrkrData->batch.data, META_END_NOQUOTE, sizeof(META_END_NOQUOTE) - 1);
@@ -1190,7 +1340,7 @@ finalize_it:
  */
 static rsRetVal getSection(const char *bulkRequest, const char **bulkRequestNextSectionStart) {
     DEFiRet;
-    char *idx = 0;
+    const char *idx = 0;
     if ((idx = strchr(bulkRequest, '\n')) != 0) /*intermediate section*/
     {
         *bulkRequestNextSectionStart = ++idx;
@@ -1233,6 +1383,23 @@ static int checkReplyStatus(fjson_object *ok) {
             fjson_object_get_int(ok) > 299);
 }
 
+static int ATTR_NONNULL(1) isRetryableBulkStatus(fjson_object *response_body, const int status) {
+    fjson_object *error = NULL;
+    fjson_object *errtype = NULL;
+    const char *type = NULL;
+
+    if (status == 429 || status >= 500) return 1;
+
+    if (status != 403) return 0;
+
+    if (fjson_object_object_get_ex(response_body, "error", &error) &&
+        fjson_object_object_get_ex(error, "type", &errtype)) {
+        type = fjson_object_get_string(errtype);
+    }
+
+    return type != NULL && strcmp(type, "cluster_block_exception") == 0;
+}
+
 /*
  * Context object for error file content creation or status check
  * response_item - the full {"create":{"_index":"idxname",.....}}
@@ -1268,6 +1435,9 @@ static rsRetVal parseRequestAndResponseForContext(wrkrInstanceData_t *pWrkrData,
     int i;
     int numitems;
     fjson_object *items = NULL, *jo_errors = NULL;
+    int sawRetriableError = 0;
+    int sawPermanentError = 0;
+    int sawSuccess = 0;
 
     /*iterate over items*/
     if (!fjson_object_object_get_ex(replyRoot, "items", &items)) {
@@ -1281,12 +1451,23 @@ static rsRetVal parseRequestAndResponseForContext(wrkrInstanceData_t *pWrkrData,
     numitems = fjson_object_array_length(items);
 
     int errors = 0;
-    if (fjson_object_object_get_ex(replyRoot, "errors", &jo_errors)) {
+    const int has_errors = fjson_object_object_get_ex(replyRoot, "errors", &jo_errors);
+    const int errors_is_boolean = has_errors && fjson_object_is_type(jo_errors, fjson_type_boolean);
+    if (errors_is_boolean) {
         errors = fjson_object_get_boolean(jo_errors);
         if (!errors && pWrkrData->pData->retryFailures) {
             STATSCOUNTER_ADD(indexSuccess, mutIndexSuccess, numitems);
             return RS_RET_OK;
         }
+    }
+
+    /* Both Elasticsearch and OpenSearch set errors to false only when every
+     * item in a bulk response succeeded. Without retry or error-file handling,
+     * there is no per-item work left to do. Keep the full parsing path for
+     * absent or failing errors fields so malformed responses stay conservative.
+     */
+    if (errors_is_boolean && !errors && !pWrkrData->pData->retryFailures && pWrkrData->pData->errorFile == NULL) {
+        return RS_RET_OK;
     }
 
     if (reqmsg) {
@@ -1324,6 +1505,18 @@ static rsRetVal parseRequestAndResponseForContext(wrkrInstanceData_t *pWrkrData,
 
         fjson_object_object_get_ex(result, "status", &ok);
         itemStatus = checkReplyStatus(ok);
+        const int status = (ok != NULL && fjson_object_is_type(ok, fjson_type_int)) ? fjson_object_get_int(ok) : 0;
+        if (ctx->statusCheckOnly) {
+            if (itemStatus) {
+                if (isRetryableBulkStatus(result, status)) {
+                    sawRetriableError = 1;
+                } else {
+                    sawPermanentError = 1;
+                }
+            } else {
+                sawSuccess = 1;
+            }
+        }
 
         char *request = 0;
         char *response = 0;
@@ -1332,9 +1525,11 @@ static rsRetVal parseRequestAndResponseForContext(wrkrInstanceData_t *pWrkrData,
                 DBGPRINTF(
                     "omelasticsearch: error in elasticsearch reply: item %d, "
                     "status is %d\n",
-                    i, fjson_object_get_int(ok));
-                DBGPRINTF("omelasticsearch: status check found error.\n");
-                ABORT_FINALIZE(RS_RET_DATAFAIL);
+                    i, status);
+                if (!ctx->statusCheckOnly) {
+                    DBGPRINTF("omelasticsearch: status check found error.\n");
+                    ABORT_FINALIZE(RS_RET_DATAFAIL);
+                }
             }
 
         } else {
@@ -1364,6 +1559,18 @@ static rsRetVal parseRequestAndResponseForContext(wrkrInstanceData_t *pWrkrData,
             }
         }
     }
+    if (ctx->statusCheckOnly && sawRetriableError) {
+        if (!sawPermanentError && !sawSuccess) {
+            LogError(0, RS_RET_SUSPENDED,
+                     "omelasticsearch: suspending action because bulk response contains only retryable item errors");
+            ABORT_FINALIZE(RS_RET_SUSPENDED);
+        }
+        DBGPRINTF(
+            "omelasticsearch: retryable bulk item errors are mixed with "
+            "successful or permanent responses; preserving per-item data-failure handling\n");
+        ABORT_FINALIZE(RS_RET_DATAFAIL);
+    }
+    if (ctx->statusCheckOnly && sawPermanentError) ABORT_FINALIZE(RS_RET_DATAFAIL);
 
 finalize_it:
     RETiRet;
@@ -1809,11 +2016,6 @@ static rsRetVal ATTR_NONNULL() writeDataError(wrkrInstanceData_t *const pWrkrDat
                 DBGPRINTF("omelasticsearch: error initializing error interleaved context.\n");
                 ABORT_FINALIZE(RS_RET_ERR);
             }
-        } else if (pData->retryFailures) {
-            if (initializeRetryFailuresContext(pWrkrData, &ctx) != RS_RET_OK) {
-                DBGPRINTF("omelasticsearch: error initializing retry failures context.\n");
-                ABORT_FINALIZE(RS_RET_ERR);
-            }
         } else {
             DBGPRINTF("omelasticsearch: None of the modes match file write. No data to write.\n");
             ABORT_FINALIZE(RS_RET_ERR);
@@ -1871,12 +2073,14 @@ static rsRetVal checkResultBulkmode(wrkrInstanceData_t *pWrkrData, fjson_object 
     ctx.statusCheckOnly = 1;
     ctx.jTokener = NULL;
     if (pWrkrData->pData->retryFailures) {
+        /* retryFailures owns per-item retry routing via retryRuleset. */
         ctx.statusCheckOnly = 0;
         CHKiRet(initializeRetryFailuresContext(pWrkrData, &ctx));
     }
-    if (parseRequestAndResponseForContext(pWrkrData, &root, reqmsg, &ctx) != RS_RET_OK) {
+    iRet = parseRequestAndResponseForContext(pWrkrData, &root, reqmsg, &ctx);
+    if (iRet != RS_RET_OK) {
         DBGPRINTF("omelasticsearch: error found in elasticsearch reply\n");
-        ABORT_FINALIZE(RS_RET_DATAFAIL);
+        if (iRet != RS_RET_SUSPENDED) ABORT_FINALIZE(RS_RET_DATAFAIL);
     }
 
 finalize_it:
@@ -1937,17 +2141,17 @@ static rsRetVal ATTR_NONNULL(1, 2)
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
 
     if ((pWrkrData->pData->rebindInterval > -1) && (pWrkrData->nOperations > pWrkrData->pData->rebindInterval)) {
-        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
         pWrkrData->nOperations = 0;
         STATSCOUNTER_INC(rebinds, mutRebinds);
     } else {
         /* by default, reuse existing connections */
-        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0);
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
     }
     if ((pWrkrData->pData->rebindInterval > -1) && (pWrkrData->nOperations == pWrkrData->pData->rebindInterval)) {
-        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
     } else {
-        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
     }
 
     if (pWrkrData->pData->numServers > 1) {
@@ -1958,10 +2162,20 @@ static rsRetVal ATTR_NONNULL(1, 2)
     CHKiRet(setPostURL(pWrkrData, tpls));
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (char *)message);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, msglen);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)msglen);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
     code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &pWrkrData->httpStatusCode);
+    if (STATSCOUNTER_ENABLED()) {
+        double total_time = 0;
+        uint64_t total_time_ms;
+
+        /* libcurl exposes total transfer time after every completed attempt. */
+        (void)curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_time);
+        total_time_ms = (uint64_t)(total_time * 1000);
+        if (total_time_ms == 0) total_time_ms = 1;
+        updateRequestDurationStats(total_time_ms);
+    }
     DBGPRINTF("curl returned %lld\n", (long long)code);
     if (code != CURLE_OK && code != CURLE_HTTP_RETURNED_ERROR) {
         STATSCOUNTER_INC(indexHTTPReqFail, mutIndexHTTPReqFail);
@@ -2036,12 +2250,15 @@ BEGINdoAction
     CODESTARTdoAction;
     STATSCOUNTER_INC(indexSubmit, mutIndexSubmit);
 
+    CHKiRet(validateActionStrings(pWrkrData->pData, ppString));
+
     if (pWrkrData->pData->bulkmode) {
         const size_t nBytes = computeMessageSize(pWrkrData, ppString[0], ppString);
 
         /* If max bytes is set and this next message will put us over the limit,
          * submit the current buffer and reset */
-        if (pWrkrData->pData->maxbytes > 0 && es_strlen(pWrkrData->batch.data) + nBytes > pWrkrData->pData->maxbytes) {
+        if (pWrkrData->batch.nmemb > 0 && pWrkrData->pData->maxbytes > 0 &&
+            es_strlen(pWrkrData->batch.data) + nBytes > pWrkrData->pData->maxbytes) {
             dbgprintf(
                 "omelasticsearch: maxbytes limit reached, submitting partial "
                 "batch of %d elements.\n",
@@ -2102,21 +2319,54 @@ finalize_it:
     RETiRet;
 }
 
+static const struct {
+    const char *name;
+    long curlver;
+} tlsVersionMap[] = {
+#if LIBCURL_VERSION_NUM >= 0x072200
+    {"TLSv1.2", CURL_SSLVERSION_TLSv1_2},
+#endif
+#if LIBCURL_VERSION_NUM >= 0x073400
+    {"TLSv1.3", CURL_SSLVERSION_TLSv1_3},
+#endif
+    {NULL, 0}};
+
+static void ATTR_NONNULL() curlSetupTlsOptions(instanceData *const pData, CURL *const handle) {
+    if (pData->allowUnsignedCerts) curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0L);
+    if (pData->skipVerifyHost) curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 0L);
+    if (pData->caCertFile) curl_easy_setopt(handle, CURLOPT_CAINFO, pData->caCertFile);
+    if (pData->myCertFile) curl_easy_setopt(handle, CURLOPT_SSLCERT, pData->myCertFile);
+    if (pData->myPrivKeyFile) curl_easy_setopt(handle, CURLOPT_SSLKEY, pData->myPrivKeyFile);
+    if (pData->tlsVersion) {
+        long ver = CURL_SSLVERSION_DEFAULT;
+        for (size_t i = 0; tlsVersionMap[i].name != NULL; i++) {
+            if (!strcmp((char *)pData->tlsVersion, tlsVersionMap[i].name)) {
+                ver = tlsVersionMap[i].curlver;
+                break;
+            }
+        }
+        curl_easy_setopt(handle, CURLOPT_SSLVERSION, ver);
+    }
+#if LIBCURL_VERSION_NUM >= 0x073D00
+    if (pData->tlsCipherSuites) curl_easy_setopt(handle, CURLOPT_TLS13_CIPHERS, (char *)pData->tlsCipherSuites);
+#endif
+#if LIBCURL_VERSION_NUM >= 0x074900
+    if (pData->tlsKeyExchangeGroups)
+        curl_easy_setopt(handle, CURLOPT_SSL_EC_CURVES, (char *)pData->tlsKeyExchangeGroups);
+#endif
+}
+
 static void ATTR_NONNULL() curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle) {
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
-    curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
+    curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
     curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
-    if (pWrkrData->pData->allowUnsignedCerts) curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
-    if (pWrkrData->pData->skipVerifyHost) curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, FALSE);
+    curlSetupTlsOptions(pWrkrData->pData, handle);
     if (pWrkrData->pData->authBuf != NULL) {
         curl_easy_setopt(handle, CURLOPT_USERPWD, pWrkrData->pData->authBuf);
         curl_easy_setopt(handle, CURLOPT_PROXYAUTH, CURLAUTH_ANY);
     }
-    if (pWrkrData->pData->caCertFile) curl_easy_setopt(handle, CURLOPT_CAINFO, pWrkrData->pData->caCertFile);
-    if (pWrkrData->pData->myCertFile) curl_easy_setopt(handle, CURLOPT_SSLCERT, pWrkrData->pData->myCertFile);
-    if (pWrkrData->pData->myPrivKeyFile) curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData->pData->myPrivKeyFile);
     /* uncomment for in-dept debuggung:
     curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
 }
@@ -2132,6 +2382,15 @@ static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData) {
     curlSetupCommon(pWrkrData, pWrkrData->curlPostHandle);
     curl_easy_setopt(pWrkrData->curlPostHandle, CURLOPT_POST, 1L);
     curl_easy_setopt(pWrkrData->curlPostHandle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->indexTimeout);
+
+    CURLcode cRet;
+    /* Enable TCP keep-alive for idle reusable bulk POST connections. */
+    cRet = curl_easy_setopt(pWrkrData->curlPostHandle, CURLOPT_TCP_KEEPALIVE, 1L);
+    if (cRet != CURLE_OK) DBGPRINTF("omelasticsearch: curlPostSetup unknown option CURLOPT_TCP_KEEPALIVE\n");
+    cRet = curl_easy_setopt(pWrkrData->curlPostHandle, CURLOPT_TCP_KEEPIDLE, 120L);
+    if (cRet != CURLE_OK) DBGPRINTF("omelasticsearch: curlPostSetup unknown option CURLOPT_TCP_KEEPIDLE\n");
+    cRet = curl_easy_setopt(pWrkrData->curlPostHandle, CURLOPT_TCP_KEEPINTVL, 60L);
+    if (cRet != CURLE_OK) DBGPRINTF("omelasticsearch: curlPostSetup unknown option CURLOPT_TCP_KEEPINTVL\n");
 }
 
 #define CONTENT_JSON "Content-Type: application/json; charset=utf-8"
@@ -2186,6 +2445,7 @@ static void ATTR_NONNULL() setInstParamDefaults(instanceData *const pData) {
     pData->dynSrchIdx = 0;
     pData->dynSrchType = 0;
     pData->dynParent = 0;
+    pData->iNumTpls = 1;
     pData->useHttps = 0;
     pData->bulkmode = 0;
     pData->maxbytes = 104857600;  // 100 MB Is the default max message size that ships with ElasticSearch
@@ -2200,6 +2460,9 @@ static void ATTR_NONNULL() setInstParamDefaults(instanceData *const pData) {
     pData->caCertFile = NULL;
     pData->myCertFile = NULL;
     pData->myPrivKeyFile = NULL;
+    pData->tlsVersion = NULL;
+    pData->tlsCipherSuites = NULL;
+    pData->tlsKeyExchangeGroups = NULL;
     pData->writeOperation = ES_WRITE_INDEX;
     pData->retryFailures = 0;
     pData->ratelimitBurst = -1;
@@ -2237,7 +2500,7 @@ BEGINnewActInst
         if (!strcmp(actpblk.descr[i].name, "server")) {
             servers = pvals[i].val.d.ar;
         } else if (!strcmp(actpblk.descr[i].name, "errorfile")) {
-            pData->errorFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->errorFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "erroronly")) {
             pData->errorOnly = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "interleaved")) {
@@ -2249,23 +2512,27 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "indextimeout")) {
             pData->indexTimeout = (long)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "uid")) {
-            pData->uid = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->uid = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "pwd")) {
-            pData->pwd = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pwd = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "apikey")) {
-            pData->apiKey = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->apiKey = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "searchindex")) {
-            pData->searchIndex = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->searchIndex = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "searchtype")) {
-            pData->searchType = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            LogMsg(0, RS_RET_DEPRECATED, LOG_WARNING,
+                   "omelasticsearch: parameter 'searchType' is deprecated because "
+                   "Elasticsearch mapping types are obsolete; remove this parameter "
+                   "for Elasticsearch 8 and later");
+            CHKmalloc(pData->searchType = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "pipelinename")) {
-            pData->pipelineName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pipelineName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "dynpipelinename")) {
             pData->dynPipelineName = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "skippipelineifempty")) {
             pData->skipPipelineIfEmpty = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "parent")) {
-            pData->parent = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->parent = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "dynsearchindex")) {
             pData->dynSrchIdx = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "dynsearchtype")) {
@@ -2281,17 +2548,17 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "skipverifyhost")) {
             pData->skipVerifyHost = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "timeout")) {
-            pData->timeout = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->timeout = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "usehttps")) {
             pData->useHttps = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "dynbulkid")) {
             pData->dynBulkId = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "bulkid")) {
-            pData->bulkId = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->bulkId = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "tls.cacert")) {
-            pData->caCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->caCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             fp = fopen((const char *)pData->caCertFile, "r");
             if (fp == NULL) {
                 LogError(errno, RS_RET_NO_FILE_ACCESS, "error: 'tls.cacert' file %s couldn't be accessed",
@@ -2300,7 +2567,7 @@ BEGINnewActInst
                 fclose(fp);
             }
         } else if (!strcmp(actpblk.descr[i].name, "tls.mycert")) {
-            pData->myCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->myCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             fp = fopen((const char *)pData->myCertFile, "r");
             if (fp == NULL) {
                 LogError(errno, RS_RET_NO_FILE_ACCESS, "error: 'tls.mycert' file %s couldn't be accessed",
@@ -2309,7 +2576,7 @@ BEGINnewActInst
                 fclose(fp);
             }
         } else if (!strcmp(actpblk.descr[i].name, "tls.myprivkey")) {
-            pData->myPrivKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->myPrivKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             fp = fopen((const char *)pData->myPrivKeyFile, "r");
             if (fp == NULL) {
                 LogError(errno, RS_RET_NO_FILE_ACCESS, "error: 'tls.myprivkey' file %s couldn't be accessed",
@@ -2317,8 +2584,41 @@ BEGINnewActInst
             } else {
                 fclose(fp);
             }
+        } else if (!strcmp(actpblk.descr[i].name, "tls.tlsversion")) {
+            char *ver;
+            int known;
+            CHKmalloc(ver = es_str2cstr(pvals[i].val.d.estr, NULL));
+            known = 0;
+            for (size_t j = 0; tlsVersionMap[j].name != NULL; j++) {
+                if (!strcmp(ver, tlsVersionMap[j].name)) {
+                    known = 1;
+                    break;
+                }
+            }
+            if (!known) {
+                LogError(0, RS_RET_PARAM_ERROR,
+                         "omelasticsearch: unknown tls.tlsversion '%s'; accepted: TLSv1.2, TLSv1.3", ver);
+                free(ver);
+                ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+            }
+            pData->tlsVersion = (uchar *)ver;
+        } else if (!strcmp(actpblk.descr[i].name, "tls.ciphersuites")) {
+            CHKmalloc(pData->tlsCipherSuites = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+#if LIBCURL_VERSION_NUM < 0x073D00
+            LogMsg(0, RS_RET_OK, LOG_WARNING,
+                   "omelasticsearch: tls.ciphersuites set but libcurl < 7.61 was used at build time; "
+                   "option will be ignored");
+#endif
+        } else if (!strcmp(actpblk.descr[i].name, "tls.keyexchangegroups")) {
+            CHKmalloc(pData->tlsKeyExchangeGroups = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+#if LIBCURL_VERSION_NUM < 0x074900
+            LogMsg(0, RS_RET_OK, LOG_WARNING,
+                   "omelasticsearch: tls.keyexchangegroups set but libcurl < 7.73 was used at build time; "
+                   "option will be ignored");
+#endif
         } else if (!strcmp(actpblk.descr[i].name, "writeoperation")) {
-            char *writeop = es_str2cstr(pvals[i].val.d.estr, NULL);
+            char *writeop;
+            CHKmalloc(writeop = es_str2cstr(pvals[i].val.d.estr, NULL));
             if (writeop && !strcmp(writeop, "create")) {
                 pData->writeOperation = ES_WRITE_CREATE;
             } else if (writeop && !strcmp(writeop, "index")) {
@@ -2338,9 +2638,9 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
             pData->ratelimitInterval = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "ratelimit.name")) {
-            pData->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "retryruleset")) {
-            pData->retryRulesetName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->retryRulesetName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "rebindinterval")) {
             pData->rebindInterval = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "esversion.major")) {
@@ -2433,14 +2733,9 @@ BEGINnewActInst
     if (pData->uid != NULL && pData->apiKey == NULL)
         CHKiRet(computeAuthHeader((char *)pData->uid, (char *)pData->pwd, &pData->authBuf));
 
-    iNumTpls = 1;
-    if (pData->dynSrchIdx) ++iNumTpls;
-    if (pData->dynSrchType) ++iNumTpls;
-    if (pData->dynParent) ++iNumTpls;
-    if (pData->dynBulkId) ++iNumTpls;
-    if (pData->dynPipelineName) ++iNumTpls;
-    DBGPRINTF("omelasticsearch: requesting %d templates\n", iNumTpls);
-    CODE_STD_STRING_REQUESTnewActInst(iNumTpls);
+    pData->iNumTpls = getTemplateCount(pData);
+    DBGPRINTF("omelasticsearch: requesting %d templates\n", pData->iNumTpls);
+    CODE_STD_STRING_REQUESTnewActInst(pData->iNumTpls);
 
     CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar *)strdup((pData->tplName == NULL) ? " StdJSONFmt" : (char *)pData->tplName),
                          OMSR_NO_RQD_TPL_OPTS));
@@ -2684,6 +2979,18 @@ BEGINmodInit()
                                 &indexOtherResponse));
     STATSCOUNTER_INIT(rebinds, mutRebinds);
     CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"rebinds", ctrType_IntCtr, CTR_FLAG_RESETTABLE, &rebinds));
+    STATSCOUNTER_INIT(indexRequestCount, mutIndexRequestCount);
+    CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"requests.count", ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &indexRequestCount));
+    STATSCOUNTER_INIT(indexRequestTimeMs, mutIndexRequestTimeMs);
+    CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"requests.time_ms", ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &indexRequestTimeMs));
+    STATSCOUNTER_INIT(indexRequestTimeMsMin, mutIndexRequestTimeMsMin);
+    CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"requests.time_ms.min", ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &indexRequestTimeMsMin));
+    STATSCOUNTER_INIT(indexRequestTimeMsMax, mutIndexRequestTimeMsMax);
+    CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"requests.time_ms.max", ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &indexRequestTimeMsMax));
     CHKiRet(statsobj.ConstructFinalize(indexStats));
     CHKiRet(prop.Construct(&pInputName));
     CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("omelasticsearch"), sizeof("omelasticsearch") - 1));

@@ -38,6 +38,9 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <zlib.h>
+#ifdef ENABLE_LIBZSTD
+    #include <zstd.h>
+#endif
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
@@ -61,6 +64,7 @@
 #include "cfsysline.h"
 #include "module-template.h"
 #include "glbl.h"
+#include "rsconf.h"
 #include "errmsg.h"
 #include "unicode-helper.h"
 #include "parserif.h"
@@ -100,11 +104,13 @@ typedef struct _instanceData {
     uchar *pszStrmDrvrRemoteSNI; /* Optional TLS SNI to use for the remote server (instead of its hostname) */
     permittedPeers_t *pPermPeers;
     int iStrmDrvrMode;
+    sbool bStrmDrvrModeSet;
     int iStrmDrvrExtendedCertCheck; /* verify also purpose OID in certificate extended field */
     int iStrmDrvrSANPreference; /* ignore CN when any SAN set */
     int iStrmTlsVerifyDepth; /**< Verify Depth for certificate chains */
     const uchar *pszStrmDrvrCAFile;
     const uchar *pszStrmDrvrCRLFile;
+    const uchar *pszStrmDrvrCAExtraFiles;
     const uchar *pszStrmDrvrKeyFile;
     const uchar *pszStrmDrvrCertFile;
     int nTargets;
@@ -117,6 +123,9 @@ typedef struct _instanceData {
     char *address;
     char *device;
     int compressionLevel; /* 0 - no compression, else level for zlib */
+#define COMPRESS_DRIVER_ZLIB 0
+#define COMPRESS_DRIVER_ZSTD 1
+    uint8_t compressionDriver;
     int protocol;
     char *networkNamespace;
     int originalNamespace;
@@ -125,6 +134,7 @@ typedef struct _instanceData {
     int iKeepAliveIntvl;
     int iKeepAliveProbes;
     int iKeepAliveTime;
+    int tcp_user_timeout_ms;
     int iConErrSkip; /* skipping excessive connection errors */
     uchar *gnutlsPriorityString;
     int ipfreebind;
@@ -169,6 +179,9 @@ typedef struct targetData {
     sbool bInDestruct; /* guard against recursive teardown on send failure */
     sbool bzInitDone; /* did we do an init of zstrm already? */
     z_stream zstrm; /* zip stream to use for tcp compression */
+#ifdef ENABLE_LIBZSTD
+    ZSTD_CCtx *zstdCctx;
+#endif
     /* we know int is sufficient, as we have the fixed buffer size above! so no need for size_t */
     int maxLenSndBuf; /* max usable length of sendbuf - primarily for testing */
     int offsSndBuf; /* next free spot in send buffer */
@@ -193,6 +206,7 @@ typedef struct configSettings_s {
     uchar *pszTplName; /* name of the default template to use */
     uchar *pszStrmDrvr; /* name of the stream driver to use */
     int iStrmDrvrMode; /* mode for stream driver, driver-dependent (0 mostly means plain tcp) */
+    sbool bStrmDrvrModeSet; /* stream driver mode was explicitly configured */
     int bResendLastOnRecon; /* should the last message be re-sent on a successful reconnect? */
     uchar *pszStrmDrvrAuthMode; /* authentication mode to use */
     uchar *pszStrmDrvrPermitExpiredCerts; /* control how to handly expired certificates */
@@ -211,8 +225,11 @@ static configSettings_t cs;
 
 /* tables for interfacing with the v6 config system */
 /* module-global parameters */
-static struct cnfparamdescr modpdescr[] = {{"iobuffer.maxsize", eCmdHdlrNonNegInt, 0},
-                                           {"template", eCmdHdlrGetWord, 0}};
+static struct cnfparamdescr modpdescr[] = {
+    {"iobuffer.maxsize", eCmdHdlrNonNegInt, 0},       {"template", eCmdHdlrGetWord, 0},
+    {"streamdriver.cafile", eCmdHdlrString, 0},       {"streamdriver.crlfile", eCmdHdlrString, 0},
+    {"streamdriver.caextrafiles", eCmdHdlrString, 0}, {"streamdriver.keyfile", eCmdHdlrString, 0},
+    {"streamdriver.certfile", eCmdHdlrString, 0}};
 static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / sizeof(struct cnfparamdescr), modpdescr};
 
 /* action (instance) parameters */
@@ -228,6 +245,7 @@ static struct cnfparamdescr actpdescr[] = {
     {"tcp_framedelimiter", eCmdHdlrInt, 0},
     {"ziplevel", eCmdHdlrInt, 0},
     {"compression.mode", eCmdHdlrGetWord, 0},
+    {"compression.driver", eCmdHdlrGetWord, 0},
     {"compression.stream.flushontxend", eCmdHdlrBinary, 0},
     {"ipfreebind", eCmdHdlrInt, 0},
     {"maxerrormessages", eCmdHdlrInt, CNFPARAM_DEPRECATED},
@@ -236,6 +254,7 @@ static struct cnfparamdescr actpdescr[] = {
     {"keepalive.probes", eCmdHdlrNonNegInt, 0},
     {"keepalive.time", eCmdHdlrNonNegInt, 0},
     {"keepalive.interval", eCmdHdlrNonNegInt, 0},
+    {"tcp_user_timeout", eCmdHdlrNonNegInt, 0},
     {"conerrskip", eCmdHdlrNonNegInt, 0},
     {"gnutlsprioritystring", eCmdHdlrString, 0},
     {"streamdriver", eCmdHdlrGetWord, 0},
@@ -253,6 +272,7 @@ static struct cnfparamdescr actpdescr[] = {
     {"streamdriver.TlsVerifyDepth", eCmdHdlrPositiveInt, 0},
     {"streamdriver.cafile", eCmdHdlrString, 0},
     {"streamdriver.crlfile", eCmdHdlrString, 0},
+    {"streamdriver.caextrafiles", eCmdHdlrString, 0},
     {"streamdriver.keyfile", eCmdHdlrString, 0},
     {"streamdriver.certfile", eCmdHdlrString, 0},
     {"resendlastmsgonreconnect", eCmdHdlrBinary, 0},
@@ -270,6 +290,11 @@ static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / si
 struct modConfData_s {
     rsconf_t *pConf; /* our overall config object */
     uchar *tplName; /* default template */
+    uchar *pszStrmDrvrCAFile; /* module default CA file or URI */
+    uchar *pszStrmDrvrCRLFile; /* module default CRL file or URI */
+    uchar *pszStrmDrvrCAExtraFiles; /* module default extra CA files or URIs */
+    uchar *pszStrmDrvrKeyFile; /* module default private key file or URI */
+    uchar *pszStrmDrvrCertFile; /* module default certificate file or URI */
     int maxLenSndBuf; /* default max usable length of sendbuf - primarily for testing */
 };
 
@@ -285,6 +310,7 @@ BEGINinitConfVars /* (re)set config variables to default values */
     cs.pszTplName = NULL; /* name of the default template to use */
     cs.pszStrmDrvr = NULL; /* name of the stream driver to use */
     cs.iStrmDrvrMode = 0; /* mode for stream driver, driver-dependent (0 mostly means plain tcp) */
+    cs.bStrmDrvrModeSet = 0;
     cs.bResendLastOnRecon = 0; /* should the last message be re-sent on a successful reconnect? */
     cs.pszStrmDrvrAuthMode = NULL; /* authentication mode to use */
     cs.pszStrmDrvrRemoteSNI = NULL; /* Remote TLS SNI to use instead of hostname */
@@ -295,7 +321,7 @@ ENDinitConfVars
 
 
 static rsRetVal doTryResume(targetData_t *);
-static rsRetVal doZipFinish(targetData_t *);
+static rsRetVal doCompressionFinish(targetData_t *);
 static rsRetVal TCPSendBuf(targetData_t *, uchar *, unsigned, sbool);
 
 /* this function gets the default template. It coordinates action between
@@ -308,6 +334,91 @@ static uchar *getDfltTpl(void) {
         return (uchar *)"RSYSLOG_TraditionalForwardFormat";
     else
         return cs.pszTplName;
+}
+
+/**
+ * @brief Check whether the effective netstream driver selects the OpenSSL
+ * driver.
+ * @param drvr Effective netstream driver name, or NULL.
+ * @return Non-zero when the effective driver is ``ossl``.
+ */
+static int isOsslNetstrmDrvr(const uchar *const drvr) {
+    return drvr != NULL && !strcasecmp((const char *)drvr, "ossl");
+}
+
+/**
+ * @brief Check whether a TLS object reference uses a strict PKCS#11 URI.
+ * @param ref TLS object reference string, or NULL.
+ * @return Non-zero when the reference begins with ``pkcs11:``.
+ */
+static int isPkcs11UriRef(const uchar *const ref) {
+    return ref != NULL && !strncasecmp((const char *)ref, "pkcs11:", sizeof("pkcs11:") - 1);
+}
+
+/**
+ * @brief Copy a module-scope TLS object default into an action instance.
+ *
+ * The destination is updated only when the action instance did not already set
+ * the corresponding parameter. This preserves the precedence order of action
+ * setting over module default over global netstream default.
+ */
+static rsRetVal ATTR_NONNULL(1) copyModuleTlsDefaultIfUnset(uchar **const ppDst, const uchar *const pSrc) {
+    DEFiRet;
+
+    if (*ppDst == NULL && pSrc != NULL) {
+        CHKmalloc(*ppDst = ustrdup(pSrc));
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+/**
+ * @brief Apply builtin:omfwd module TLS defaults to an action instance.
+ *
+ * This fills in any unset CA, CRL, key, and certificate references from the
+ * current omfwd module configuration, leaving explicitly configured action
+ * values untouched. Global netstream defaults remain the final fallback in the
+ * driver when both action and module settings are absent.
+ *
+ * Module defaults are applied only when the effective stream driver supports
+ * the corresponding setting. Ordinary filesystem-backed TLS defaults remain
+ * available to every TLS-capable driver, but strict ``pkcs11:`` URI defaults
+ * are inherited only by ``ossl`` actions. This preserves mixed deployments
+ * where ``builtin:omfwd`` provides shared TLS defaults for encrypted
+ * forwarding actions, while other omfwd actions in the same configuration
+ * still use plain TCP or another TLS driver that cannot resolve PKCS#11
+ * objects. Explicit action parameters remain untouched so unsupported
+ * action-level settings still fail in the selected driver instead of being
+ * silently ignored.
+ */
+static rsRetVal ATTR_NONNULL() applyModuleTlsDefaults(instanceData *const pData, const modConfData_t *const pModConf) {
+    DEFiRet;
+    const uchar *const effectiveDrvr = glblGetEffectiveNetstrmDrvr(pModConf->pConf, pData->pszStrmDrvr);
+    const int tlsCapable = glblIsTlsCapableNetstrmDrvr(effectiveDrvr);
+    const int osslDriver = isOsslNetstrmDrvr(effectiveDrvr);
+
+    if (tlsCapable) {
+        if (!isPkcs11UriRef(pModConf->pszStrmDrvrCAFile) || osslDriver) {
+            CHKiRet(copyModuleTlsDefaultIfUnset((uchar **)&pData->pszStrmDrvrCAFile, pModConf->pszStrmDrvrCAFile));
+        }
+        if (!isPkcs11UriRef(pModConf->pszStrmDrvrCRLFile)) {
+            CHKiRet(copyModuleTlsDefaultIfUnset((uchar **)&pData->pszStrmDrvrCRLFile, pModConf->pszStrmDrvrCRLFile));
+        }
+        if (!isPkcs11UriRef(pModConf->pszStrmDrvrKeyFile) || osslDriver) {
+            CHKiRet(copyModuleTlsDefaultIfUnset((uchar **)&pData->pszStrmDrvrKeyFile, pModConf->pszStrmDrvrKeyFile));
+        }
+        if (!isPkcs11UriRef(pModConf->pszStrmDrvrCertFile) || osslDriver) {
+            CHKiRet(copyModuleTlsDefaultIfUnset((uchar **)&pData->pszStrmDrvrCertFile, pModConf->pszStrmDrvrCertFile));
+        }
+    }
+    if (osslDriver) {
+        CHKiRet(
+            copyModuleTlsDefaultIfUnset((uchar **)&pData->pszStrmDrvrCAExtraFiles, pModConf->pszStrmDrvrCAExtraFiles));
+    }
+
+finalize_it:
+    RETiRet;
 }
 
 
@@ -351,6 +462,7 @@ static void freeConfiguredPorts(instanceData *const pData) {
     pData->nPorts = 0;
 }
 
+#ifdef HAVE_RESOLV_NS_INITPARSE
 static int compareSrvPriority(const void *lhs, const void *rhs) {
     const srvRecord_t *const left = (const srvRecord_t *)lhs;
     const srvRecord_t *const right = (const srvRecord_t *)rhs;
@@ -421,10 +533,10 @@ static const char *resolverErrorString(const int err) {
             return "unrecoverable resolver failure";
         case NO_DATA:
             return "no data";
-#if defined(NO_ADDRESS) && (!defined(NO_DATA) || (NO_ADDRESS != NO_DATA))
+    #if defined(NO_ADDRESS) && (!defined(NO_DATA) || (NO_ADDRESS != NO_DATA))
         case NO_ADDRESS:
             return "no address";
-#endif
+    #endif
         default:
             return "unknown resolver error";
     }
@@ -433,19 +545,19 @@ static const char *resolverErrorString(const int err) {
 static rsRetVal initResolverState(res_state *const pres) {
     DEFiRet;
 
-#ifdef HAVE_RESOLV_RES_N_API
+    #ifdef HAVE_RESOLV_RES_N_API
     CHKmalloc(*pres = (res_state)calloc(1, sizeof(struct __res_state)));
     if (res_ninit(*pres) != 0) {
         LogError(0, RS_RET_INTERNAL_ERROR, "omfwd: failed to init resolver state: %s", strerror(errno));
         ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
     }
-#else
+    #else
     if (res_init() != 0) {
         LogError(0, RS_RET_INTERNAL_ERROR, "omfwd: failed to init resolver state: %s", strerror(errno));
         ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
     }
     *pres = &_res;
-#endif
+    #endif
 
 finalize_it:
     RETiRet;
@@ -455,25 +567,25 @@ static int queryResolverState(res_state const res,
                               const char *const srvName,
                               unsigned char *const answer,
                               const size_t answerSize) {
-#ifdef HAVE_RESOLV_RES_N_API
+    #ifdef HAVE_RESOLV_RES_N_API
     return res_nquery(res, srvName, ns_c_in, ns_t_srv, answer, answerSize);
-#else
+    #else
     (void)res;
     return res_query(srvName, ns_c_in, ns_t_srv, answer, answerSize);
-#endif
+    #endif
 }
 
 static void closeResolverState(res_state const res) {
     if (res == NULL) {
         return;
     }
-#ifdef HAVE_RESOLV_RES_N_API
+    #ifdef HAVE_RESOLV_RES_N_API
     res_nclose(res);
     free(res);
-#else
+    #else
     /* Old resolver APIs use global state; musl's implementation is stateless. */
     (void)res;
-#endif
+    #endif
 }
 
 static rsRetVal applyResolverOverrides(res_state res) {
@@ -534,6 +646,7 @@ static rsRetVal applyResolverOverrides(res_state res) {
 finalize_it:
     RETiRet;
 }
+#endif
 
 static rsRetVal resolveSrvTargets(instanceData *const pData) {
 #ifndef HAVE_RESOLV_NS_INITPARSE
@@ -706,7 +819,7 @@ static void DestructTargetData(targetData_t *const pTarget, const sbool bIsRebin
         }
     }
 
-    doZipFinish(pTarget);
+    doCompressionFinish(pTarget);
 
     if (pTarget->pNetstrm != NULL) {
         netstrm.Destruct(&pTarget->pNetstrm);
@@ -759,6 +872,11 @@ BEGINbeginCnfLoad
     loadModConf = pModConf;
     pModConf->pConf = pConf;
     pModConf->tplName = NULL;
+    pModConf->pszStrmDrvrCAFile = NULL;
+    pModConf->pszStrmDrvrCRLFile = NULL;
+    pModConf->pszStrmDrvrCAExtraFiles = NULL;
+    pModConf->pszStrmDrvrKeyFile = NULL;
+    pModConf->pszStrmDrvrCertFile = NULL;
     pModConf->maxLenSndBuf = -1;
 ENDbeginCnfLoad
 
@@ -778,7 +896,7 @@ BEGINsetModCnf
     for (i = 0; i < modpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(modpblk.descr[i].name, "template")) {
-            loadModConf->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             if (cs.pszTplName != NULL) {
                 LogError(0, RS_RET_DUP_PARAM,
                          "omfwd: warning: default template "
@@ -797,6 +915,21 @@ BEGINsetModCnf
                     loadModConf->maxLenSndBuf = newLen;
                 }
             }
+        } else if (!strcmp(modpblk.descr[i].name, "streamdriver.cafile")) {
+            free(loadModConf->pszStrmDrvrCAFile);
+            CHKmalloc(loadModConf->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "streamdriver.crlfile")) {
+            free(loadModConf->pszStrmDrvrCRLFile);
+            CHKmalloc(loadModConf->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "streamdriver.caextrafiles")) {
+            free(loadModConf->pszStrmDrvrCAExtraFiles);
+            CHKmalloc(loadModConf->pszStrmDrvrCAExtraFiles = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "streamdriver.keyfile")) {
+            free(loadModConf->pszStrmDrvrKeyFile);
+            CHKmalloc(loadModConf->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "streamdriver.certfile")) {
+            free(loadModConf->pszStrmDrvrCertFile);
+            CHKmalloc(loadModConf->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             LogMsg(0, RS_RET_INTERNAL_ERROR, LOG_ERR, "omfwd: internal error, non-handled param '%s' in beginCnfLoad",
                    modpblk.descr[i].name);
@@ -826,6 +959,11 @@ ENDactivateCnf
 BEGINfreeCnf
     CODESTARTfreeCnf;
     free(pModConf->tplName);
+    free(pModConf->pszStrmDrvrCAFile);
+    free(pModConf->pszStrmDrvrCRLFile);
+    free(pModConf->pszStrmDrvrCAExtraFiles);
+    free(pModConf->pszStrmDrvrKeyFile);
+    free(pModConf->pszStrmDrvrCertFile);
 ENDfreeCnf
 
 BEGINcreateInstance
@@ -833,10 +971,11 @@ BEGINcreateInstance
     /* We always have at least one target and port */
     pData->nTargets = 1;
     pData->nActiveTargets = 0;
-    INIT_ATOMIC_HELPER_MUT64(pData->mut_nActiveTargets);
+    INIT_ATOMIC_HELPER_MUT(pData->mut_nActiveTargets);
     pData->nPorts = 1;
     pData->target_name = NULL;
     if (cs.pszStrmDrvr != NULL) CHKmalloc(pData->pszStrmDrvr = (uchar *)strdup((char *)cs.pszStrmDrvr));
+    pData->bStrmDrvrModeSet = cs.bStrmDrvrModeSet;
     if (cs.pszStrmDrvrAuthMode != NULL)
         CHKmalloc(pData->pszStrmDrvrAuthMode = (uchar *)strdup((char *)cs.pszStrmDrvrAuthMode));
     if (cs.pszStrmDrvrRemoteSNI != NULL)
@@ -890,9 +1029,16 @@ BEGINsetActionInfo
     pData->pAction = pAction;
 ENDsetActionInfo
 
-
+/**
+ * @brief Release all action-instance resources owned by an omfwd action.
+ *
+ * This includes transport-related configuration strings, dynamically
+ * allocated target metadata, TLS object paths or URIs, and the optional
+ * action-level template name used when building the output message stream.
+ */
 BEGINfreeInstance
     CODESTARTfreeInstance;
+    free(pData->tplName);
     free(pData->pszStrmDrvr);
     free(pData->pszStrmDrvrAuthMode);
     free(pData->pszStrmDrvrPermitExpiredCerts);
@@ -918,6 +1064,7 @@ BEGINfreeInstance
     free(pData->device);
     free((void *)pData->pszStrmDrvrCAFile);
     free((void *)pData->pszStrmDrvrCRLFile);
+    free((void *)pData->pszStrmDrvrCAExtraFiles);
     free((void *)pData->pszStrmDrvrKeyFile);
     free((void *)pData->pszStrmDrvrCertFile);
     free(pData->pszRatelimitName);
@@ -1007,13 +1154,15 @@ static rsRetVal UDPSend(wrkrInstanceData_t *__restrict__ const pWrkrData, uchar 
             int try_send = 1;
             size_t lenThisTry = len;
             while (try_send) {
+                int sendErrno;
                 lsent = sendto(pTarget->pSockArray[i + 1], msg, lenThisTry, 0, r->ai_addr, r->ai_addrlen);
+                sendErrno = errno;
                 if (lsent == (ssize_t)lenThisTry) {
                     bSendSuccess = RSTRUE;
                     ATOMIC_ADD_uint64(&pTargetStats->sentBytes, &pTargetStats->mut_sentBytes, lenThisTry);
                     try_send = 0;
                     runSockArrayLoop = 0;
-                } else if (errno == EMSGSIZE) {
+                } else if (sendErrno == EMSGSIZE) {
                     const size_t newlen = (lenThisTry > 1024) ? lenThisTry - 1024 : 512;
                     LogError(0, RS_RET_UDP_MSGSIZE_TOO_LARGE,
                              "omfwd/udp: send failed due to message being too "
@@ -1023,7 +1172,7 @@ static rsRetVal UDPSend(wrkrInstanceData_t *__restrict__ const pWrkrData, uchar 
                     lenThisTry = newlen;
                 } else {
                     reInit = RSTRUE;
-                    lasterrno = errno;
+                    lasterrno = sendErrno;
                     lasterr_sock = pTarget->pSockArray[i + 1];
                     LogError(lasterrno, RS_RET_ERR_UDPSEND, "omfwd/udp: socket %d: sendto() error", lasterr_sock);
                     try_send = 0;
@@ -1145,7 +1294,9 @@ static rsRetVal TCPSendBufUncompressed(targetData_t *const pTarget, uchar *const
 
     while (alreadySent != len) {
         lenSend = len - alreadySent;
-        CHKiRet(netstrm.Send(pTarget->pNetstrm, buf + alreadySent, &lenSend));
+        iRet = netstrm.Send(pTarget->pNetstrm, buf + alreadySent, &lenSend);
+        if (iRet == RS_RET_RETRY) ABORT_FINALIZE(iRet);
+        CHKiRet(iRet);
         DBGPRINTF("omfwd: TCP sent %zd bytes, requested %u\n", lenSend, len - alreadySent);
         alreadySent += lenSend;
     }
@@ -1154,16 +1305,20 @@ static rsRetVal TCPSendBufUncompressed(targetData_t *const pTarget, uchar *const
 
 finalize_it:
     if (iRet != RS_RET_OK) {
-        emitConnectionErrorMsg(pTarget, iRet);
-        if (!pTarget->bInDestruct) {
-            DestructTargetData(pTarget, 0);
+        if (iRet == RS_RET_RETRY) {
+            DBGPRINTF("omfwd: TCP send deferred for retry\n");
+        } else {
+            emitConnectionErrorMsg(pTarget, iRet);
+            if (!pTarget->bInDestruct) {
+                DestructTargetData(pTarget, 0);
+            }
+            iRet = RS_RET_SUSPENDED;
         }
-        iRet = RS_RET_SUSPENDED;
     }
     RETiRet;
 }
 
-static rsRetVal TCPSendBufCompressed(targetData_t *pTarget, uchar *const buf, unsigned len, sbool bIsFlush) {
+static rsRetVal TCPSendBufCompressedZlib(targetData_t *pTarget, uchar *const buf, unsigned len, sbool bIsFlush) {
     wrkrInstanceData_t *const pWrkrData = (wrkrInstanceData_t *)pTarget->pWrkrData;
     int zRet; /* zlib return state */
     unsigned outavail;
@@ -1210,6 +1365,67 @@ finalize_it:
     RETiRet;
 }
 
+static rsRetVal TCPSendBufCompressedZstd(targetData_t *pTarget, uchar *const buf, unsigned len, sbool bIsFlush) {
+#ifdef ENABLE_LIBZSTD
+    wrkrInstanceData_t *const pWrkrData = (wrkrInstanceData_t *)pTarget->pWrkrData;
+    uchar zipBuf[32 * 1024];
+    DEFiRet;
+
+    if (!pTarget->bzInitDone) {
+        pTarget->zstdCctx = ZSTD_createCCtx();
+        if (pTarget->zstdCctx == NULL) {
+            LogError(0, RS_RET_ZLIB_ERR, "omfwd: error creating zstd compression context");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        size_t zRet =
+            ZSTD_CCtx_setParameter(pTarget->zstdCctx, ZSTD_c_compressionLevel, pWrkrData->pData->compressionLevel);
+        if (ZSTD_isError(zRet)) {
+            LogError(0, RS_RET_ZLIB_ERR, "omfwd: error setting zstd compression level: %s", ZSTD_getErrorName(zRet));
+            ZSTD_freeCCtx(pTarget->zstdCctx);
+            pTarget->zstdCctx = NULL;
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        pTarget->bzInitDone = RSTRUE;
+    }
+
+    ZSTD_inBuffer input = {buf, len, 0};
+    const ZSTD_EndDirective op = (pWrkrData->pData->strmCompFlushOnTxEnd && bIsFlush) ? ZSTD_e_flush : ZSTD_e_continue;
+
+    size_t remaining;
+    do {
+        ZSTD_outBuffer output = {zipBuf, sizeof(zipBuf), 0};
+        remaining = ZSTD_compressStream2(pTarget->zstdCctx, &output, &input, op);
+        if (ZSTD_isError(remaining)) {
+            LogError(0, RS_RET_ZLIB_ERR, "omfwd: error returned from ZSTD_compressStream2(): %s",
+                     ZSTD_getErrorName(remaining));
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        if (output.pos != 0) {
+            CHKiRet(TCPSendBufUncompressed(pTarget, zipBuf, output.pos));
+        }
+    } while (input.pos != input.size || (op == ZSTD_e_flush && remaining != 0));
+
+finalize_it:
+    RETiRet;
+#else
+    (void)pTarget;
+    (void)buf;
+    (void)len;
+    (void)bIsFlush;
+    LogError(0, RS_RET_PARAM_ERROR, "omfwd: zstd stream compression requested but rsyslog was built without libzstd");
+    return RS_RET_PARAM_ERROR;
+#endif
+}
+
+static rsRetVal TCPSendBufCompressed(targetData_t *pTarget, uchar *const buf, unsigned len, sbool bIsFlush) {
+    wrkrInstanceData_t *const pWrkrData = (wrkrInstanceData_t *)pTarget->pWrkrData;
+
+    if (pWrkrData->pData->compressionDriver == COMPRESS_DRIVER_ZSTD)
+        return TCPSendBufCompressedZstd(pTarget, buf, len, bIsFlush);
+    else
+        return TCPSendBufCompressedZlib(pTarget, buf, len, bIsFlush);
+}
+
 static rsRetVal TCPSendBuf(targetData_t *pTarget, uchar *buf, unsigned len, sbool bIsFlush) {
     wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *)pTarget->pWrkrData;
     DEFiRet;
@@ -1220,10 +1436,8 @@ static rsRetVal TCPSendBuf(targetData_t *pTarget, uchar *buf, unsigned len, sboo
     RETiRet;
 }
 
-/* finish zlib buffer, to be called before closing the ZIP file (if
- * running in stream mode).
- */
-static rsRetVal doZipFinish(targetData_t *pTarget) {
+/* finish zlib buffer, to be called before closing the ZIP file (if running in stream mode). */
+static rsRetVal doZlibFinish(targetData_t *pTarget) {
     int zRet; /* zlib return state */
     DEFiRet;
     unsigned outavail;
@@ -1255,6 +1469,51 @@ finalize_it:
     pTarget->bzInitDone = 0;
 done:
     RETiRet;
+}
+
+static rsRetVal doZstdFinish(targetData_t *pTarget) {
+#ifdef ENABLE_LIBZSTD
+    DEFiRet;
+    uchar zipBuf[32 * 1024];
+
+    if (!pTarget->bzInitDone) goto done;
+
+    ZSTD_inBuffer input = {zipBuf, 0, 0};
+    size_t remaining;
+    do {
+        ZSTD_outBuffer output = {zipBuf, sizeof(zipBuf), 0};
+        remaining = ZSTD_compressStream2(pTarget->zstdCctx, &output, &input, ZSTD_e_end);
+        if (ZSTD_isError(remaining)) {
+            LogError(0, RS_RET_ZLIB_ERR, "omfwd: error finishing zstd stream: %s", ZSTD_getErrorName(remaining));
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        if (output.pos != 0) {
+            CHKiRet(TCPSendBufUncompressed(pTarget, zipBuf, output.pos));
+        }
+    } while (remaining != 0);
+
+finalize_it:
+    if (pTarget->zstdCctx != NULL) {
+        const size_t zRet = ZSTD_freeCCtx(pTarget->zstdCctx);
+        if (ZSTD_isError(zRet)) {
+            LogError(0, RS_RET_ZLIB_ERR, "omfwd: error from ZSTD_freeCCtx(): %s", ZSTD_getErrorName(zRet));
+        }
+        pTarget->zstdCctx = NULL;
+    }
+    pTarget->bzInitDone = 0;
+done:
+    RETiRet;
+#else
+    (void)pTarget;
+    return RS_RET_OK;
+#endif
+}
+
+static rsRetVal doCompressionFinish(targetData_t *pTarget) {
+    if (pTarget->pData->compressionDriver == COMPRESS_DRIVER_ZSTD)
+        return doZstdFinish(pTarget);
+    else
+        return doZlibFinish(pTarget);
 }
 
 
@@ -1329,6 +1588,7 @@ static rsRetVal TCPSendInitTarget(targetData_t *const pTarget) {
         CHKiRet(netstrm.SetDrvrPermitExpiredCerts(pTarget->pNetstrm, pData->pszStrmDrvrPermitExpiredCerts));
         CHKiRet(netstrm.SetDrvrTlsCAFile(pTarget->pNetstrm, pData->pszStrmDrvrCAFile));
         CHKiRet(netstrm.SetDrvrTlsCRLFile(pTarget->pNetstrm, pData->pszStrmDrvrCRLFile));
+        CHKiRet(netstrm.SetDrvrTlsCAExtraFiles(pTarget->pNetstrm, pData->pszStrmDrvrCAExtraFiles));
         CHKiRet(netstrm.SetDrvrTlsKeyFile(pTarget->pNetstrm, pData->pszStrmDrvrKeyFile));
         CHKiRet(netstrm.SetDrvrTlsCertFile(pTarget->pNetstrm, pData->pszStrmDrvrCertFile));
 
@@ -1343,6 +1603,7 @@ static rsRetVal TCPSendInitTarget(targetData_t *const pTarget) {
         if (pData->gnutlsPriorityString != NULL) {
             CHKiRet(netstrm.SetGnutlsPriorityString(pTarget->pNetstrm, pData->gnutlsPriorityString));
         }
+        CHKiRet(netstrm.SetTcpUserTimeout(pTarget->pNetstrm, pData->tcp_user_timeout_ms));
         CHKiRet(netstrm.Connect(pTarget->pNetstrm, glbl.GetDefPFFamily(runModConf->pConf), (uchar *)pTarget->port,
                                 (uchar *)pTarget->target_name, pData->device));
 
@@ -1437,10 +1698,10 @@ static void countActiveTargets(const wrkrInstanceData_t *const pWrkrData) {
         }
     }
 
-    /* Use atomic CAS to update the value safely */
+    /* nActiveTargets is a scheduling snapshot; ordering comes from the CAS update, not from readers. */
     int oldVal, newVal;
     do {
-        oldVal = ATOMIC_FETCH_32BIT(&pWrkrData->pData->nActiveTargets, &pWrkrData->pData->mut_nActiveTargets);
+        oldVal = ATOMIC_LOAD_32BIT_RELAXED(&pWrkrData->pData->nActiveTargets, &pWrkrData->pData->mut_nActiveTargets);
         if (oldVal == activeTargets) {
             break; /* no change, so no log message either */
         }
@@ -1498,7 +1759,8 @@ static rsRetVal doTryResume(targetData_t *pTarget) {
     const char *address;
     DEFiRet;
 
-    const int nActiveTargets = ATOMIC_FETCH_32BIT(&pTarget->pData->nActiveTargets, &pTarget->pData->mut_nActiveTargets);
+    const int nActiveTargets =
+        ATOMIC_LOAD_32BIT_RELAXED(&pTarget->pData->nActiveTargets, &pTarget->pData->mut_nActiveTargets);
 
     DBGPRINTF("doTryResume: isConnected: %d, ttResume %lld, LastActiveTargets: %d\n", pTarget->bIsConnected,
               (long long)pTarget->ttResume, nActiveTargets);
@@ -1593,7 +1855,7 @@ BEGINtryResume
     iRet = poolTryResume(pWrkrData);
     countActiveTargets(pWrkrData);
     const int nActiveTargets =
-        ATOMIC_FETCH_32BIT(&pWrkrData->pData->nActiveTargets, &pWrkrData->pData->mut_nActiveTargets);
+        ATOMIC_LOAD_32BIT_RELAXED(&pWrkrData->pData->nActiveTargets, &pWrkrData->pData->mut_nActiveTargets);
 
     LogMsg(0, RS_RET_DEBUG, LOG_DEBUG,
            "omfwd: [wrkr %u/%" PRIuPTR
@@ -1678,7 +1940,9 @@ static rsRetVal processMsg(targetData_t *__restrict__ const pTarget, actWrkrIPar
     } else {
         /* forward via TCP */
         iRet = tcpclt.Send(pTarget->pTCPClt, pTarget, (char *)psz, l);
-        if (iRet != RS_RET_OK && iRet != RS_RET_DEFER_COMMIT && iRet != RS_RET_PREVIOUS_COMMITTED) {
+        if (iRet == RS_RET_RETRY) {
+            DBGPRINTF("omfwd: TCP send deferred for retry to %s:%s\n", pTarget->target_name, pTarget->port);
+        } else if (iRet != RS_RET_OK && iRet != RS_RET_DEFER_COMMIT && iRet != RS_RET_PREVIOUS_COMMITTED) {
             /* error! */
             LogError(0, iRet, "omfwd: error forwarding via tcp to %s:%s, suspending target", pTarget->target_name,
                      pTarget->port);
@@ -1699,17 +1963,19 @@ finalize_it:
 BEGINcommitTransaction
     unsigned i;
     char namebuf[264]; /* 256 for FQDN, 5 for port and 3 for transport => 264 */
+    sbool bFlushRetry = 0;
     CODESTARTcommitTransaction;
     /* if needed, rebind first. This ensure we can deliver to the rebound addresses.
-     * Note that rebind requires reconnect (TCP) or socket recreation (UDP) to the
-     * new targets. This is done by the poolTryResume(), which needs to be made in any case.
+     * Note that rebind requires reconnect (TCP) or socket recreation (UDP) to
+     * the new targets. DestructInstanceData() drops the transport state and
+     * poolTryResume() creates the next connection. The per-worker tcpclt
+     * objects stay valid across rebinds and must not be reallocated here.
      */
     if (pWrkrData->pData->iRebindInterval && (pWrkrData->nXmit++ >= pWrkrData->pData->iRebindInterval)) {
         dbgprintf("REBIND (sent %d, interval %d) - omfwd dropping target connection (as configured)\n",
                   pWrkrData->nXmit, pWrkrData->pData->iRebindInterval);
         pWrkrData->nXmit = 0; /* else we have an addtl wrap at 2^31-1 */
         DestructInstanceData(pWrkrData, 1);
-        initTCP(pWrkrData);
         LogMsg(0, RS_RET_PARAM_ERROR, LOG_WARNING, "omfwd: dropped connections due to configured rebind interval");
     }
 
@@ -1779,6 +2045,11 @@ BEGINcommitTransaction
                               IS_FLUSH);
             if (iRet == RS_RET_OK || iRet == RS_RET_DEFER_COMMIT || iRet == RS_RET_PREVIOUS_COMMITTED) {
                 pWrkrData->target[j].offsSndBuf = 0;
+            } else if (iRet == RS_RET_RETRY) {
+                DBGPRINTF("omfwd: TCP buffer flush deferred for retry to %s:%s\n", pWrkrData->target[j].target_name,
+                          pWrkrData->target[j].port);
+                bFlushRetry = 1;
+                iRet = RS_RET_OK;
             } else {
                 LogMsg(0, RS_RET_SUSPENDED, LOG_WARNING,
                        "omfwd: [wrkr %u] target %s:%s became unavailable during buffer flush. "
@@ -1803,23 +2074,27 @@ finalize_it:
      *   We determine this by calling countActiveTargets() and inspecting
      *   the atomic nActiveTargets value. When it is zero, the whole pool
      *   is unavailable and the action engine must enter retry logic.
-     * - If at least one target remains active, we keep returning OK here
-     *   so that the action is not suspended at pool level. Any buffered
-     *   frames for failed targets remain in that target's send buffer and
-     *   will be flushed once doTryResume() re-establishes the connection
-     *   on a subsequent transaction.
+     * - Also return RS_RET_SUSPENDED when a connected target reports
+     *   RS_RET_RETRY while flushing its pending TCP buffer. The target remains
+     *   connected, but the action engine still needs to schedule another commit
+     *   attempt for the retained buffered data.
+     * - If at least one target remains active and no flush retry is pending,
+     *   we keep returning OK here so that the action is not suspended at pool
+     *   level. Any buffered frames for failed targets remain in that target's
+     *   send buffer and will be flushed once doTryResume() re-establishes the
+     *   connection on a subsequent transaction.
      */
     /* do pool stats */
 
     countActiveTargets(pWrkrData);
     const int nActiveTargets =
-        ATOMIC_FETCH_32BIT(&pWrkrData->pData->nActiveTargets, &pWrkrData->pData->mut_nActiveTargets);
+        ATOMIC_LOAD_32BIT_RELAXED(&pWrkrData->pData->nActiveTargets, &pWrkrData->pData->mut_nActiveTargets);
 
-    if (nActiveTargets == 0) {
+    if (bFlushRetry || nActiveTargets == 0) {
         /*
-         * All pool members are currently unavailable. Only in this case we
-         * return RS_RET_SUSPENDED from commitTransaction, as required by the
-         * omfwd pool contract.
+         * All pool members are currently unavailable, or a connected target
+         * needs a retry to finish flushing retained TCP data. Return
+         * RS_RET_SUSPENDED so the action engine schedules retry handling.
          */
         iRet = RS_RET_SUSPENDED;
     }
@@ -1887,11 +2162,13 @@ static void setInstParamDefaults(instanceData *pData) {
     pData->pszStrmDrvrPermitExpiredCerts = NULL;
     pData->pszStrmDrvrRemoteSNI = NULL;
     pData->iStrmDrvrMode = 0;
+    pData->bStrmDrvrModeSet = 0;
     pData->iStrmDrvrExtendedCertCheck = 0;
     pData->iStrmDrvrSANPreference = 0;
     pData->iStrmTlsVerifyDepth = 0;
     pData->pszStrmDrvrCAFile = NULL;
     pData->pszStrmDrvrCRLFile = NULL;
+    pData->pszStrmDrvrCAExtraFiles = NULL;
     pData->pszStrmDrvrKeyFile = NULL;
     pData->pszStrmDrvrCertFile = NULL;
     pData->iRebindInterval = 0;
@@ -1899,6 +2176,7 @@ static void setInstParamDefaults(instanceData *pData) {
     pData->iKeepAliveProbes = 0;
     pData->iKeepAliveIntvl = 0;
     pData->iKeepAliveTime = 0;
+    pData->tcp_user_timeout_ms = 0;
     pData->iConErrSkip = 0;
     pData->gnutlsPriorityString = NULL;
     pData->bResendLastOnRecon = 0;
@@ -1908,6 +2186,7 @@ static void setInstParamDefaults(instanceData *pData) {
     pData->UDPSendBuf = 0;
     pData->pPermPeers = NULL;
     pData->compressionLevel = 9;
+    pData->compressionDriver = COMPRESS_DRIVER_ZLIB;
     pData->strmCompFlushOnTxEnd = 1;
     pData->compressionMode = COMPRESS_NEVER;
     pData->ipfreebind = IPFREEBIND_ENABLED_WITH_LOG;
@@ -1971,6 +2250,89 @@ finalize_it:
     RETiRet;
 }
 
+/** Warn in secure warn mode when omfwd is configured without TLS transport protection. */
+static void warnIfNonTlsForwardingConfigured(const instanceData *const pData) {
+    if (pData->protocol == FORW_UDP) {
+        glblWarnIfInsecureDefault(loadModConf->pConf,
+                                  "omfwd action uses protocol=\"udp\" (without TLS); "
+                                  "see https://docs.rsyslog.com/doc/faq/tls_mode0_disables_tls.html");
+    } else if (pData->protocol == FORW_TCP && pData->iStrmDrvrMode == 0) {
+        const uchar *const effectiveDrvr = glblGetEffectiveNetstrmDrvr(loadModConf->pConf, pData->pszStrmDrvr);
+        const int tlsHintsConfigured =
+            (pData->pszStrmDrvrAuthMode != NULL) || glblIsTlsCapableNetstrmDrvr(effectiveDrvr);
+        if (tlsHintsConfigured) {
+            glblWarnIfInsecureDefault(loadModConf->pConf,
+                                      "omfwd has TLS-related settings but streamdriver.mode=\"0\"; mode 0 uses plain "
+                                      "TCP so TLS is not active "
+                                      "(see https://docs.rsyslog.com/doc/faq/tls_mode0_disables_tls.html)");
+        } else {
+            glblWarnIfInsecureDefault(
+                loadModConf->pConf,
+                "omfwd action uses protocol=\"tcp\" with streamdriver.mode=\"0\" "
+                "(plain TCP without TLS); see https://docs.rsyslog.com/doc/faq/tls_mode0_disables_tls.html");
+        }
+    }
+
+    if (pData->protocol == FORW_TCP && pData->iStrmDrvrMode != 0 && pData->pszStrmDrvrAuthMode != NULL &&
+        strcasecmp((const char *)pData->pszStrmDrvrAuthMode, "anon") == 0) {
+        glblWarnIfInsecureDefault(
+            loadModConf->pConf,
+            "omfwd uses streamdriver.authmode=\"anon\"; server identity is not authenticated, so MITM is possible "
+            "(see https://docs.rsyslog.com/doc/faq/tls_anon_auth_mitm.html)");
+    }
+}
+
+static rsRetVal applySecureDefaultsToForwarding(instanceData *const pData) {
+    DEFiRet;
+
+    if (pData->protocol == FORW_TCP) {
+        const uchar *const effectiveDrvr = glblGetEffectiveNetstrmDrvr(loadModConf->pConf, pData->pszStrmDrvr);
+        if (glblIsTlsCapableNetstrmDrvr(effectiveDrvr) && pData->iStrmDrvrMode == 0 &&
+            loadModConf->pConf->globals.compatDefaultsSecure == COMPAT_DEFAULTS_SECURE_STRICT) {
+            if (pData->bStrmDrvrModeSet) {
+                LogError(0, RS_RET_PARAM_ERROR,
+                         "omfwd: compatibility.defaults.secure=\"strict\" rejects explicit "
+                         "streamdriver.mode=\"0\" with TLS-capable stream driver \"%s\"; use "
+                         "streamdriver.mode=\"1\" to enable TLS or select ptcp/plain TCP intentionally",
+                         (const char *)effectiveDrvr);
+                ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+            }
+            pData->iStrmDrvrMode = 1;
+        }
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal setLegacyStrmDrvrMode(void __attribute__((unused)) * pVal, int mode) {
+    cs.iStrmDrvrMode = mode;
+    cs.bStrmDrvrModeSet = 1;
+    return RS_RET_OK;
+}
+
+static rsRetVal validateTargetSrvTlsAuth(const instanceData *const pData) {
+    DEFiRet;
+
+    if (pData->targetSrv == NULL || pData->protocol != FORW_TCP || pData->iStrmDrvrMode == 0) {
+        FINALIZE;
+    }
+
+    if (pData->pPermPeers != NULL) {
+        FINALIZE;
+    }
+
+    if (pData->pszStrmDrvrAuthMode == NULL || !strcasecmp((const char *)pData->pszStrmDrvrAuthMode, "x509/name")) {
+        LogError(0, RS_RET_PARAM_ERROR,
+                 "omfwd: targetSrv with TLS requires streamdriverpermittedpeers when using streamdriverauthmode "
+                 "\"x509/name\" or the default auth mode (explicitly set permitted peers or use static target)");
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+
+finalize_it:
+    RETiRet;
+}
+
 
 BEGINnewActInst
     struct cnfparamvals *pvals;
@@ -2004,19 +2366,19 @@ BEGINnewActInst
             pData->nTargets = nTargets;
             CHKmalloc(pData->target_name = (char **)calloc(pData->nTargets, sizeof(char *)));
             for (int j = 0; j < nTargets; ++j) {
-                pData->target_name[j] = (char *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+                CHKmalloc(pData->target_name[j] = (char *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL));
             }
         } else if (!strcmp(actpblk.descr[i].name, "targetsrv")) {
-            pData->targetSrv = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->targetSrv = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "address")) {
-            pData->address = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->address = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "device")) {
-            pData->device = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->device = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "port")) {
             pData->nPorts = pvals[i].val.d.ar->nmemb;
             CHKmalloc(pData->ports = (char **)calloc(pData->nPorts, sizeof(char *)));
             for (int j = 0; j < pData->nPorts; ++j) {
-                pData->ports[j] = (char *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+                CHKmalloc(pData->ports[j] = (char *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL));
             }
         } else if (!strcmp(actpblk.descr[i].name, "protocol")) {
             if (!es_strcasebufcmp(pvals[i].val.d.estr, (uchar *)"udp", 3)) {
@@ -2033,13 +2395,13 @@ BEGINnewActInst
                 pData->protocol = FORW_TCP;
             } else {
                 uchar *str;
-                str = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+                CHKmalloc(str = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
                 LogError(0, RS_RET_INVLD_PROTOCOL, "omfwd: invalid protocol \"%s\"", str);
                 free(str);
                 ABORT_FINALIZE(RS_RET_INVLD_PROTOCOL);
             }
         } else if (!strcmp(actpblk.descr[i].name, "networknamespace")) {
-            pData->networkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->networkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "tcp_framing")) {
             if (!es_strcasebufcmp(pvals[i].val.d.estr, (uchar *)"traditional", 11)) {
                 pData->tcp_framing = TCP_FRAMING_OCTET_STUFFING;
@@ -2047,7 +2409,7 @@ BEGINnewActInst
                 pData->tcp_framing = TCP_FRAMING_OCTET_COUNTING;
             } else {
                 uchar *str;
-                str = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+                CHKmalloc(str = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
                 LogError(0, RS_RET_CNF_INVLD_FRAMING, "omfwd: invalid framing \"%s\"", str);
                 free(str);
                 ABORT_FINALIZE(RS_RET_CNF_INVLD_FRAMING);
@@ -2062,16 +2424,19 @@ BEGINnewActInst
             pData->iKeepAliveIntvl = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "keepalive.time")) {
             pData->iKeepAliveTime = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "tcp_user_timeout")) {
+            pData->tcp_user_timeout_ms = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "conerrskip")) {
             pData->iConErrSkip = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "gnutlsprioritystring")) {
-            pData->gnutlsPriorityString = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->gnutlsPriorityString = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver") ||
                    !strcmp(actpblk.descr[i].name, "streamdriver.name")) {
-            pData->pszStrmDrvr = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszStrmDrvr = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdrivermode") ||
-                   !strcmp(actpblk.descr[i].name, "streamdrivermode")) {
+                   !strcmp(actpblk.descr[i].name, "streamdriver.mode")) {
             pData->iStrmDrvrMode = pvals[i].val.d.n;
+            pData->bStrmDrvrModeSet = 1;
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.CheckExtendedKeyPurpose")) {
             pData->iStrmDrvrExtendedCertCheck = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.PrioritizeSAN")) {
@@ -2083,10 +2448,11 @@ BEGINnewActInst
                 parser_errmsg("streamdriver.TlsVerifyDepth must be 2 or higher but is %d", (int)pvals[i].val.d.n);
             }
         } else if (!strcmp(actpblk.descr[i].name, "streamdriverauthmode") ||
-                   !strcmp(actpblk.descr[i].name, "streamdriverauthmode")) {
-            pData->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+                   !strcmp(actpblk.descr[i].name, "streamdriver.authmode")) {
+            CHKmalloc(pData->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.permitexpiredcerts")) {
-            uchar *val = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            uchar *val;
+            CHKmalloc(val = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             if (es_strcasebufcmp(pvals[i].val.d.estr, (uchar *)"off", 3) &&
                 es_strcasebufcmp(pvals[i].val.d.estr, (uchar *)"on", 2) &&
                 es_strcasebufcmp(pvals[i].val.d.estr, (uchar *)"warn", 4)) {
@@ -2100,20 +2466,22 @@ BEGINnewActInst
             }
         } else if (!strcmp(actpblk.descr[i].name, "streamdriverremotesni") ||
                    !strcmp(actpblk.descr[i].name, "streamdriver.remotesni")) {
-            pData->pszStrmDrvrRemoteSNI = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszStrmDrvrRemoteSNI = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.cafile")) {
-            pData->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.crlfile")) {
-            pData->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(actpblk.descr[i].name, "streamdriver.caextrafiles")) {
+            CHKmalloc(pData->pszStrmDrvrCAExtraFiles = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.keyfile")) {
-            pData->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriver.certfile")) {
-            pData->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "streamdriverpermittedpeers")) {
             uchar *start, *str;
             uchar *p;
             int lenStr;
-            str = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(str = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             start = str;
             lenStr = ustrlen(start); /* we need length after '\0' has been dropped... */
             while (lenStr > 0) {
@@ -2160,11 +2528,33 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "udp.sendbuf")) {
             pData->UDPSendBuf = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "compression.stream.flushontxend")) {
             pData->strmCompFlushOnTxEnd = (sbool)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "compression.driver")) {
+            CHKmalloc(cstr = es_str2cstr(pvals[i].val.d.estr, NULL));
+            if (!strcasecmp(cstr, "zlib")) {
+                pData->compressionDriver = COMPRESS_DRIVER_ZLIB;
+            } else if (!strcasecmp(cstr, "zstd")) {
+#ifdef ENABLE_LIBZSTD
+                pData->compressionDriver = COMPRESS_DRIVER_ZSTD;
+#else
+                LogError(0, RS_RET_PARAM_ERROR,
+                         "omfwd: compression.driver=\"zstd\" requires rsyslog to be built with libzstd support");
+                free(cstr);
+                ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+#endif
+            } else {
+                LogError(0, RS_RET_PARAM_ERROR,
+                         "omfwd: invalid value for 'compression.driver' "
+                         "parameter (given is '%s')",
+                         cstr);
+                free(cstr);
+                ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+            }
+            free(cstr);
         } else if (!strcmp(actpblk.descr[i].name, "compression.mode")) {
-            cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(cstr = es_str2cstr(pvals[i].val.d.estr, NULL));
             if (!strcasecmp(cstr, "stream:always")) {
                 pData->compressionMode = COMPRESS_STREAM_ALWAYS;
             } else if (!strcasecmp(cstr, "none")) {
@@ -2189,7 +2579,7 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
             pData->ratelimitInterval = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "ratelimit.name")) {
-            pData->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             LogError(0, RS_RET_INTERNAL_ERROR, "omfwd: program error, non-handled parameter '%s'",
                      actpblk.descr[i].name);
@@ -2219,11 +2609,15 @@ BEGINnewActInst
         ABORT_FINALIZE(RS_RET_PARAM_ERROR);
     }
 
+    CHKiRet(applyModuleTlsDefaults(pData, loadModConf));
+    CHKiRet(applySecureDefaultsToForwarding(pData));
+
     if (pData->targetSrv != NULL) {
         if (pData->ports != NULL) {
             parser_warnmsg("omfwd: targetSrv was set, ignoring explicit port list");
             freeConfiguredPorts(pData);
         }
+        CHKiRet(validateTargetSrvTlsAuth(pData));
         CHKiRet(resolveSrvTargets(pData));
     }
 
@@ -2265,6 +2659,21 @@ BEGINnewActInst
         }
     }
 
+    if (pData->compressionDriver == COMPRESS_DRIVER_ZSTD && pData->compressionMode != COMPRESS_STREAM_ALWAYS) {
+        LogError(0, RS_RET_PARAM_ERROR,
+                 "omfwd: compression.driver=\"zstd\" is supported only with "
+                 "compression.mode=\"stream:always\"");
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+
+    if (pData->compressionDriver == COMPRESS_DRIVER_ZSTD && pData->compressionMode == COMPRESS_STREAM_ALWAYS &&
+        pData->compressionLevel == 0) {
+        LogError(0, RS_RET_PARAM_ERROR,
+                 "omfwd: compression.driver=\"zstd\" with compression.mode=\"stream:always\" requires non-zero "
+                 "zipLevel because libzstd treats level 0 as its default compression level");
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+
     CODE_STD_STRING_REQUESTnewActInst(1);
 
     tplToUse = ustrdup((pData->tplName == NULL) ? getDfltTpl() : pData->tplName);
@@ -2283,6 +2692,8 @@ BEGINnewActInst
     if (pData->address && (pData->protocol == FORW_TCP)) {
         LogError(0, RS_RET_PARAM_ERROR, "omfwd: parameter \"address\" not supported for tcp -- ignored");
     }
+
+    warnIfNonTlsForwardingConfigured(pData);
 
     if (pData->pszRatelimitName != NULL) {
         CHKiRet(ratelimitNewFromConfig(&pData->ratelimiter, loadModConf->pConf, (char *)pData->pszRatelimitName,
@@ -2464,6 +2875,7 @@ BEGINparseSelectorAct
     if (pData->protocol == FORW_TCP) {
         pData->bResendLastOnRecon = cs.bResendLastOnRecon;
         pData->iStrmDrvrMode = cs.iStrmDrvrMode;
+        pData->bStrmDrvrModeSet = cs.bStrmDrvrModeSet;
         if (cs.pszStrmDrvrRemoteSNI != NULL) {
             CHKmalloc(pData->pszStrmDrvrRemoteSNI = (uchar *)strdup((char *)cs.pszStrmDrvrRemoteSNI));
         }
@@ -2472,6 +2884,9 @@ BEGINparseSelectorAct
             cs.pPermPeers = NULL;
         }
     }
+    CHKiRet(applyModuleTlsDefaults(pData, loadModConf));
+    CHKiRet(applySecureDefaultsToForwarding(pData));
+    warnIfNonTlsForwardingConfigured(pData);
     CODE_STD_FINALIZERparseSelectorAct if (iRet == RS_RET_OK) {
         setupInstStatsCtrs(pData);
     }
@@ -2525,6 +2940,7 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
 
     /* we now must reset all non-string values */
     cs.iStrmDrvrMode = 0;
+    cs.bStrmDrvrModeSet = 0;
     cs.bResendLastOnRecon = 0;
     cs.iUDPRebindInterval = 0;
     cs.iTCPRebindInterval = 0;
@@ -2559,7 +2975,7 @@ BEGINmodInitNoPredecl(Fwd)
     CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_intvl", 0, eCmdHdlrInt, NULL, &cs.iKeepAliveIntvl, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_time", 0, eCmdHdlrInt, NULL, &cs.iKeepAliveTime, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriver", 0, eCmdHdlrGetWord, NULL, &cs.pszStrmDrvr, NULL));
-    CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdrivermode", 0, eCmdHdlrInt, NULL, &cs.iStrmDrvrMode, NULL));
+    CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdrivermode", 0, eCmdHdlrInt, setLegacyStrmDrvrMode, NULL, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriverauthmode", 0, eCmdHdlrGetWord, NULL,
                              &cs.pszStrmDrvrAuthMode, NULL));
     CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriverremotesni", 0, eCmdHdlrGetWord, NULL,

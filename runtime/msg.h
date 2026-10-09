@@ -89,7 +89,7 @@ struct msg {
         char *pszTIMESTAMP_MySQL; /* TIMESTAMP as MySQL formatted string (always 14 characters) */
         char *pszTIMESTAMP_PgSQL; /* TIMESTAMP as PgSQL formatted string (always 21 characters) */
         uchar *pszStrucData; /* STRUCTURED-DATA */
-        uint16_t lenStrucData; /* (cached) length of STRUCTURED-DATA */
+        rs_size_t lenStrucData; /* (cached) length of STRUCTURED-DATA */
         cstr_t *pCSAPPNAME; /* APP-NAME */
         cstr_t *pCSPROCID; /* PROCID */
         cstr_t *pCSMSGID; /* MSGID */
@@ -113,6 +113,21 @@ struct msg {
         struct syslogTime tTIMESTAMP; /* (parsed) value of the timestamp */
         struct json_object *json;
         struct json_object *localvars;
+    #ifdef HAVE_LOGNORM_TURBO
+        /* Opaque turbo result slot — set by mmnormalize turbo path.
+         * Enables zero-JSON data flow: template resolution reads fields
+         * directly from the snapshot without building a json-c tree.
+         * No liblognorm dependency: uses void* + function pointer callbacks. */
+        void *turbo_result;
+        void (*turbo_result_free)(void *);
+        void (*turbo_result_to_json)(void *, struct json_object **);
+        int (*turbo_result_get_str)(void *, const uchar *, int, const uchar **, rs_size_t *);
+        /* Shared-ownership refcount for turbo_result across MsgDup() copies.
+         * NULL while a single message owns the snapshot (the common case:
+         * no allocation, no atomics); lazily allocated on the first dup.
+         * The last owner (counter reaches 0) frees the snapshot. */
+        unsigned *turbo_result_refs;
+    #endif
         /* some fixed-size buffers to save malloc()/free() for frequently used fields (from the default templates) */
         uchar szRawMsg[CONF_RAWMSG_BUFSIZE];
         /* most messages are small, and these are stored here (without malloc/free!) */
@@ -160,6 +175,8 @@ struct msg {
     /* rawmsg does not include a PRI (Solaris!), but PRI is already set correctly in the msg object */
     #define PRESERVE_CASE 0x200
     /* preserve case in fromhost */
+    #define NO_LEGACY_Z_DECOMPRESS 0x400
+    /* skip built-in legacy 'z' transport-frame decompression */
 
     /* (syslog) protocol types */
     #define MSG_LEGACY_PROTOCOL 0
@@ -176,9 +193,32 @@ rsRetVal msgConstructForDeserializer(smsg_t **ppThis);
 rsRetVal msgConstructFinalizer(smsg_t *pThis);
 rsRetVal msgDestruct(smsg_t **ppM);
 smsg_t *MsgDup(smsg_t *pOld);
+    #ifdef HAVE_LOGNORM_TURBO
+/**
+ * @brief Release a message's reference to its turbo parse snapshot.
+ *
+ * The snapshot can be shared across MsgDup() copies. This function decrements
+ * the shared ownership count, frees the snapshot for the last owner, and
+ * clears the message's snapshot pointer and all associated callbacks. Callers
+ * must hold @p pMsg's mutex or otherwise have exclusive access to the message.
+ * Never invoke turbo_result_free directly.
+ *
+ * @param pMsg Message whose turbo snapshot reference is released.
+ */
+void MsgReleaseTurboResult(smsg_t *pMsg);
+    #endif
 smsg_t *MsgAddRef(smsg_t *pM);
 void setProtocolVersion(smsg_t *pM, int iNewVersion);
-void MsgSetInputName(smsg_t *pMsg, prop_t *);
+/** Set a message's input-name property.
+ * @param pMsg message to update
+ * @param inputName property retained by the message; the caller remains
+ * responsible for releasing its own reference
+ */
+void MsgSetInputName(smsg_t *pMsg, prop_t *inputName);
+rsRetVal MsgSetInputNameStr(smsg_t *pMsg, const uchar *text, int len);
+rsRetVal MsgSetRcvFromText(smsg_t *pMsg, const uchar *text, int len);
+rsRetVal MsgSetRcvFromIPText(smsg_t *pMsg, const uchar *text, int len);
+rsRetVal MsgSetRcvFromPortText(smsg_t *pMsg, const uchar *text, int len);
 void MsgSetDfltTZ(smsg_t *pThis, char *tz);
 rsRetVal MsgSetAPPNAME(smsg_t *pMsg, const char *pszAPPNAME);
 rsRetVal MsgSetPROCID(smsg_t *pMsg, const char *pszPROCID);
@@ -186,12 +226,19 @@ rsRetVal MsgSetMSGID(smsg_t *pMsg, const char *pszMSGID);
 void MsgSetParseSuccess(smsg_t *pMsg, int bSuccess);
 void MsgSetTAG(smsg_t *pMsg, const uchar *pszBuf, const size_t lenBuf);
 void MsgSetRuleset(smsg_t *pMsg, ruleset_t *);
+rsRetVal MsgSetRulesetByName(smsg_t *pMsg, cstr_t *rulesetName);
 rsRetVal MsgSetFlowControlType(smsg_t *pMsg, flowControl_t eFlowCtl);
 rsRetVal MsgSetStructuredData(smsg_t *const pMsg, const char *pszStrucData);
 rsRetVal MsgAddToStructuredData(smsg_t *pMsg, uchar *toadd, rs_size_t len);
 void MsgGetStructuredData(smsg_t *pM, uchar **pBuf, rs_size_t *len);
 rsRetVal msgSetFromSockinfo(smsg_t *pThis, struct sockaddr_storage *sa);
-void MsgSetRcvFrom(smsg_t *pMsg, prop_t *);
+rsRetVal msgSetFromSockinfoLen(smsg_t *pThis, const struct sockaddr_storage *sa, size_t salen);
+/** Set a message's received-from property.
+ * @param pMsg message to update
+ * @param rcvFrom property retained by the message; the caller remains
+ * responsible for releasing its own reference
+ */
+void MsgSetRcvFrom(smsg_t *pMsg, prop_t *rcvFrom);
 void MsgSetRcvFromStr(smsg_t *const pMsg, const uchar *pszRcvFrom, const int, prop_t **);
 rsRetVal MsgSetRcvFromIP(smsg_t *pMsg, prop_t *);
 rsRetVal MsgSetRcvFromIPStr(smsg_t *const pThis, const uchar *psz, const int len, prop_t **ppProp);
@@ -250,6 +297,9 @@ void getInputName(const smsg_t *const pM, uchar **ppsz, int *const plen);
 int getHOSTNAMELen(smsg_t *pM);
 uchar *getProgramName(smsg_t *pM, sbool bLockMutex);
 uchar *getRcvFrom(smsg_t *pM);
+uchar *getRcvFromIP(smsg_t *pM);
+uchar *getRcvFromPort(smsg_t *pM);
+void MsgGetRcvFromProp(smsg_t *pM, propid_t propid, uchar **ppsz, int *plen);
 rsRetVal propNameToID(const uchar *pName, propid_t *pPropID);
 uchar *propIDToName(propid_t propID);
 rsRetVal ATTR_NONNULL() msgCheckVarExists(smsg_t *const pMsg, msgPropDescr_t *pProp);
@@ -258,6 +308,7 @@ rsRetVal msgGetJSONPropJSONorString(smsg_t *const pMsg,
                                     msgPropDescr_t *pProp,
                                     struct json_object **pjson,
                                     uchar **pcstr);
+rsRetVal msgGetJSONPropSVar(smsg_t *const pMsg, msgPropDescr_t *pProp, struct svar *out);
 rsRetVal getJSONPropVal(
     smsg_t *pMsg, msgPropDescr_t *pProp, uchar **pRes, rs_size_t *buflen, unsigned short *pbMustBeFreed);
 rsRetVal msgSetJSONFromVar(smsg_t *pMsg, uchar *varname, struct svar *var, int force_reset);

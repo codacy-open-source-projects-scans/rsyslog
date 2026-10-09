@@ -33,7 +33,7 @@
 #include "datetime.h"
 #include "unicode-helper.h"
 #include "hashtable_itr.h"
-#include <sys/queue.h>
+#include "compat_queue.h"
 
 /* definitions for objects we access */
 DEFobjStaticHelpers;
@@ -100,6 +100,17 @@ static void dynstats_destroyCtr(dynstats_ctr_t *ctr) {
     free(ctr);
 }
 
+static void dynstats_destroyStatsCounter(statsobj_t *stats, ctr_t **ref) {
+    if (*ref != NULL) {
+        if (stats != NULL) {
+            statsobj.DestructCounter(stats, *ref);
+        } else {
+            statsobj.DestructUnlinkedCounter(*ref);
+        }
+        *ref = NULL;
+    }
+}
+
 static void /* assumes exclusive access to bucket */
 dynstats_destroyCountersIn(dynstats_bucket_t *b, htable *table, dynstats_ctr_t *ctrs) {
     dynstats_ctr_t *ctr;
@@ -113,12 +124,6 @@ dynstats_destroyCountersIn(dynstats_bucket_t *b, htable *table, dynstats_ctr_t *
     }
     STATSCOUNTER_ADD(b->ctrMetricsPurged, b->mutCtrMetricsPurged, ctrs_purged);
     ATOMIC_SUB_unsigned(&b->metricCount, ctrs_purged, &b->mutMetricCount);
-}
-
-static void /* assumes exclusive access to bucket */
-dynstats_destroyCounters(dynstats_bucket_t *b) {
-    statsobj.UnlinkAllCounters(b->stats);
-    dynstats_destroyCountersIn(b, b->table, b->ctrs);
 }
 
 static void dynstats_destroyBucket(dynstats_bucket_t *b) {
@@ -137,8 +142,8 @@ static void dynstats_destroyBucket(dynstats_bucket_t *b) {
     }
 
     pthread_rwlock_rdlock(&b->lock);
-    need_persist =
-        (b->persist_state_write_count_interval || b->persist_state_interval_secs || b->persist_expiration_time);
+    need_persist = (b->persist_state_write_count_interval || b->persist_state_interval_secs ||
+                    ATOMIC_LOAD_time_t_RELAXED(&b->persist_expiration_time, &b->mutPersistExpirationTime));
     pthread_rwlock_unlock(&b->lock);
 
     /* Persist state BEFORE taking lock for destruction to avoid holding lock during I/O.
@@ -151,24 +156,32 @@ static void dynstats_destroyBucket(dynstats_bucket_t *b) {
         pthread_rwlock_unlock(&b->lock);
     }
 
+    /* Drop stats registry visibility before taking the bucket lock for
+     * teardown. Stats scrapes hold mutStats while read notifiers take bucket
+     * locks, so statsobj destruction must not run under bucket locks. */
+    if (b->stats != NULL) {
+        statsobj.UnlinkAllCounters(b->stats);
+        statsobj.Destruct(&b->stats);
+    }
+
     pthread_rwlock_wrlock(&b->lock);
-    dynstats_destroyCounters(b);
+    dynstats_destroyCountersIn(b, b->table, b->ctrs);
     dynstats_destroyCountersIn(b, b->survivor_table, b->survivor_ctrs);
-    statsobj.DestructCounter(b->stats, b->pCtrFlushedBytes);
-    statsobj.DestructCounter(b->stats, b->pCtrFlushed);
-    statsobj.DestructCounter(b->stats, b->pCtrFlushedErrors);
-    statsobj.Destruct(&b->stats);
+    dynstats_destroyStatsCounter(NULL, &b->pCtrFlushedBytes);
+    dynstats_destroyStatsCounter(NULL, &b->pCtrFlushed);
+    dynstats_destroyStatsCounter(NULL, &b->pCtrFlushedErrors);
     free(b->name);
     free(b->state_file_directory);
     pthread_rwlock_unlock(&b->lock);
     pthread_rwlock_destroy(&b->lock);
     pthread_mutex_destroy(&b->mutMetricCount);
-    statsobj.DestructCounter(bkts->global_stats, b->pOpsOverflowCtr);
-    statsobj.DestructCounter(bkts->global_stats, b->pNewMetricAddCtr);
-    statsobj.DestructCounter(bkts->global_stats, b->pNoMetricCtr);
-    statsobj.DestructCounter(bkts->global_stats, b->pMetricsPurgedCtr);
-    statsobj.DestructCounter(bkts->global_stats, b->pOpsIgnoredCtr);
-    statsobj.DestructCounter(bkts->global_stats, b->pPurgeTriggeredCtr);
+    DESTROY_ATOMIC_HELPER_MUT64(b->mutPersistExpirationTime);
+    dynstats_destroyStatsCounter(bkts->global_stats, &b->pOpsOverflowCtr);
+    dynstats_destroyStatsCounter(bkts->global_stats, &b->pNewMetricAddCtr);
+    dynstats_destroyStatsCounter(bkts->global_stats, &b->pNoMetricCtr);
+    dynstats_destroyStatsCounter(bkts->global_stats, &b->pMetricsPurgedCtr);
+    dynstats_destroyStatsCounter(bkts->global_stats, &b->pOpsIgnoredCtr);
+    dynstats_destroyStatsCounter(bkts->global_stats, &b->pPurgeTriggeredCtr);
     free(b);
 }
 
@@ -268,24 +281,12 @@ static rsRetVal dynstats_addBucketMetrics(dynstats_buckets_t *bkts, dynstats_buc
 finalize_it:
     free(metric_name_buff);
     if (iRet != RS_RET_OK) {
-        if (b->pOpsOverflowCtr != NULL) {
-            statsobj.DestructCounter(bkts->global_stats, b->pOpsOverflowCtr);
-        }
-        if (b->pNewMetricAddCtr != NULL) {
-            statsobj.DestructCounter(bkts->global_stats, b->pNewMetricAddCtr);
-        }
-        if (b->pNoMetricCtr != NULL) {
-            statsobj.DestructCounter(bkts->global_stats, b->pNoMetricCtr);
-        }
-        if (b->pMetricsPurgedCtr != NULL) {
-            statsobj.DestructCounter(bkts->global_stats, b->pMetricsPurgedCtr);
-        }
-        if (b->pOpsIgnoredCtr != NULL) {
-            statsobj.DestructCounter(bkts->global_stats, b->pOpsIgnoredCtr);
-        }
-        if (b->pPurgeTriggeredCtr != NULL) {
-            statsobj.DestructCounter(bkts->global_stats, b->pPurgeTriggeredCtr);
-        }
+        dynstats_destroyStatsCounter(bkts->global_stats, &b->pOpsOverflowCtr);
+        dynstats_destroyStatsCounter(bkts->global_stats, &b->pNewMetricAddCtr);
+        dynstats_destroyStatsCounter(bkts->global_stats, &b->pNoMetricCtr);
+        dynstats_destroyStatsCounter(bkts->global_stats, &b->pMetricsPurgedCtr);
+        dynstats_destroyStatsCounter(bkts->global_stats, &b->pOpsIgnoredCtr);
+        dynstats_destroyStatsCounter(bkts->global_stats, &b->pPurgeTriggeredCtr);
     }
     RETiRet;
 }
@@ -529,16 +530,21 @@ static rsRetVal dynstats_newBucket(const uchar *name,
                                    const uchar *stateFileDirectory) {
     dynstats_bucket_t *b;
     dynstats_buckets_t *bkts;
-    uint8_t lock_initialized, metric_count_mutex_initialized;
+    uint8_t lock_initialized, metric_count_mutex_initialized, persist_expiration_mutex_initialized;
     pthread_rwlockattr_t bucket_lock_attr;
     DEFiRet;
 
-    lock_initialized = metric_count_mutex_initialized = 0;
+    lock_initialized = metric_count_mutex_initialized = persist_expiration_mutex_initialized = 0;
     b = NULL;
 
     bkts = &loadConf->dynstats_buckets;
 
     if (bkts->initialized) {
+        if (dynstats_findBucket(name) != NULL) {
+            LogMsg(0, RS_RET_OK, LOG_WARNING,
+                   "dynstats: duplicate bucket name '%s' in current config set; impstats output may be ambiguous",
+                   name);
+        }
         CHKmalloc(b = calloc(1, sizeof(dynstats_bucket_t)));
         b->bkts = bkts;
         b->resettable = resettable;
@@ -561,6 +567,8 @@ static rsRetVal dynstats_newBucket(const uchar *name,
         lock_initialized = 1;
         pthread_mutex_init(&b->mutMetricCount, NULL);
         metric_count_mutex_initialized = 1;
+        INIT_ATOMIC_HELPER_MUT64(b->mutPersistExpirationTime);
+        persist_expiration_mutex_initialized = 1;
 
         CHKiRet(dynstats_initNewBucketStats(b));
 
@@ -581,7 +589,8 @@ static rsRetVal dynstats_newBucket(const uchar *name,
             }
             pthread_rwlock_wrlock(&b->lock);
             if (persistStateTimeInterval > 0) {
-                b->persist_expiration_time = now + persistStateTimeInterval;
+                ATOMIC_STORE_time_t_RELAXED(&b->persist_expiration_time, &b->mutPersistExpirationTime,
+                                            now + persistStateTimeInterval);
             }
             pthread_rwlock_unlock(&b->lock);
 
@@ -609,6 +618,9 @@ finalize_it:
             if (lock_initialized) {
                 if (!metric_count_mutex_initialized) {
                     pthread_mutex_init(&b->mutMetricCount, NULL);
+                }
+                if (!persist_expiration_mutex_initialized) {
+                    INIT_ATOMIC_HELPER_MUT64(b->mutPersistExpirationTime);
                 }
                 dynstats_destroyBucket(b);
             } else {
@@ -720,18 +732,22 @@ void dynstats_destroyAllBuckets(rsconf_t *cnf) {
         } else {
             pthread_mutex_unlock(&bkts->work_q.mut);
         }
-        pthread_rwlock_wrlock(&bkts->lock);
         while (1) {
+            pthread_rwlock_wrlock(&bkts->lock);
             b = bkts->list;
             if (b == NULL) {
+                pthread_rwlock_unlock(&bkts->lock);
                 break;
-            } else {
-                bkts->list = b->next;
-                dynstats_destroyBucket(b);
             }
+            bkts->list = b->next;
+            b->next = NULL;
+            pthread_rwlock_unlock(&bkts->lock);
+            dynstats_destroyBucket(b);
         }
-        statsobj.Destruct(&bkts->global_stats);
-        pthread_rwlock_unlock(&bkts->lock);
+        if (bkts->global_stats != NULL) {
+            statsobj.UnlinkAllCounters(bkts->global_stats);
+            statsobj.Destruct(&bkts->global_stats);
+        }
         pthread_rwlock_destroy(&bkts->lock);
         destroyFileWriteWorker(bkts);
     }
@@ -1015,22 +1031,28 @@ static rsRetVal dynstats_addNewCtr(dynstats_bucket_t *b,
                                    const uchar *metric,
                                    uint8_t doInitialIncrement,
                                    uint64_t doInitialOffset) {
-    dynstats_ctr_t *ctr;
+    dynstats_ctr_t *ctr = NULL;
     dynstats_ctr_t *found_ctr, *survivor_ctr, *effective_ctr = NULL;
-    int created;
+    int created = 0;
+    int bucketLockHeld = 0;
+    int bucketMutationCommitted = 0;
+    int destroyCreatedCtrOnFailure = 0;
+    int survivorUnlinked = 0;
+    int tableInserted = 0;
     uchar *copy_of_key = NULL;
     DEFiRet;
 
     created = 0;
     ctr = NULL;
 
-    if ((unsigned)ATOMIC_FETCH_32BIT_unsigned(&b->metricCount, &b->mutMetricCount) >= b->maxCardinality) {
+    if ((unsigned)ATOMIC_LOAD_32BIT_unsigned(&b->metricCount, &b->mutMetricCount) >= b->maxCardinality) {
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     }
 
     CHKiRet(dynstats_createCtr(b, metric, &ctr));
 
-    pthread_rwlock_wrlock(&b->lock);
+    CHKiConcCtrl(pthread_rwlock_wrlock(&b->lock));
+    bucketLockHeld = 1;
     found_ctr = (dynstats_ctr_t *)hashtable_search(b->table, ctr->metric);
     if (found_ctr != NULL) {
         if (doInitialIncrement) {
@@ -1053,9 +1075,11 @@ static rsRetVal dynstats_addNewCtr(dynstats_bucket_t *b,
                 if (survivor_ctr == b->survivor_ctrs) {
                     b->survivor_ctrs = survivor_ctr->next;
                 }
+                survivorUnlinked = 1;
             }
             if ((created = hashtable_insert(b->table, copy_of_key, effective_ctr))) {
-                statsobj.AddPreCreatedCtr(b->stats, effective_ctr->pCtr);
+                tableInserted = 1;
+                CHKiRet(statsobj.AddPreCreatedCtr(b->stats, effective_ctr->pCtr));
             }
         }
         if (created) {
@@ -1074,7 +1098,13 @@ static rsRetVal dynstats_addNewCtr(dynstats_bucket_t *b,
             }
         }
     }
-    pthread_rwlock_unlock(&b->lock);
+    bucketMutationCommitted = 1;
+    const int ret = pthread_rwlock_unlock(&b->lock);
+    if (ret != 0) {
+        LogError(ret, RS_RET_CONC_CTRL_ERR, "dynstats: error unlocking bucket mutex");
+        abort();
+    }
+    bucketLockHeld = 0;
 
     if (found_ctr != NULL) {
         // ignore
@@ -1089,7 +1119,33 @@ static rsRetVal dynstats_addNewCtr(dynstats_bucket_t *b,
     }
 
 finalize_it:
-    if (((!created) || (effective_ctr != ctr)) && (ctr != NULL)) {
+    if (bucketLockHeld) {
+        if (iRet != RS_RET_OK && !bucketMutationCommitted && tableInserted) {
+            if (effective_ctr == ctr) {
+                destroyCreatedCtrOnFailure = 1;
+            }
+            hashtable_remove(b->table, copy_of_key);
+            copy_of_key = NULL;
+            created = 0;
+        }
+        if (iRet != RS_RET_OK && !bucketMutationCommitted && survivorUnlinked) {
+            if (effective_ctr->prev != NULL) {
+                effective_ctr->prev->next = effective_ctr;
+            }
+            if (effective_ctr->next != NULL) {
+                effective_ctr->next->prev = effective_ctr;
+            }
+            if (b->survivor_ctrs == effective_ctr->next) {
+                b->survivor_ctrs = effective_ctr;
+            }
+        }
+        const int cleanupRet = pthread_rwlock_unlock(&b->lock);
+        if (cleanupRet != 0) {
+            LogError(cleanupRet, RS_RET_CONC_CTRL_ERR, "dynstats: error unlocking bucket mutex during error cleanup");
+            abort();
+        }
+    }
+    if ((destroyCreatedCtrOnFailure || (!created) || (effective_ctr != ctr)) && (ctr != NULL)) {
         dynstats_destroyCtr(ctr);
     }
     RETiRet;
@@ -1107,13 +1163,7 @@ static sbool dynstats_shouldPersist(dynstats_bucket_t *b, time_t now) {
         }
     }
 
-#ifdef HAVE_ATOMIC_BUILTINS64
-    expire = (time_t)__sync_fetch_and_add((uint64_t *)&b->persist_expiration_time, 0);
-#else
-    pthread_rwlock_rdlock(&b->lock);
-    expire = b->persist_expiration_time;
-    pthread_rwlock_unlock(&b->lock);
-#endif
+    expire = ATOMIC_LOAD_time_t_ACQUIRE(&b->persist_expiration_time, &b->mutPersistExpirationTime);
 
     if (!shouldPersist && expire && now >= expire) {
         shouldPersist = TRUE;
@@ -1122,12 +1172,13 @@ static sbool dynstats_shouldPersist(dynstats_bucket_t *b, time_t now) {
 }
 
 static sbool dynstats_shouldPersistLocked(dynstats_bucket_t *b, time_t now) {
+    const time_t expire = ATOMIC_LOAD_time_t_RELAXED(&b->persist_expiration_time, &b->mutPersistExpirationTime);
     if (b->persist_state_write_count_interval > 0 &&
-        (uint32_t)ATOMIC_FETCH_32BIT_unsigned(&b->n_updates, &b->mutMetricCount) >=
+        (uint32_t)ATOMIC_LOAD_32BIT_unsigned(&b->n_updates, &b->mutMetricCount) >=
             b->persist_state_write_count_interval) {
         return TRUE;
     }
-    if (b->persist_expiration_time && now >= b->persist_expiration_time) {
+    if (expire && now >= expire) {
         return TRUE;
     }
     return FALSE;
@@ -1175,7 +1226,8 @@ rsRetVal dynstats_inc(dynstats_bucket_t *b, uchar *metric) {
                         ATOMIC_SUB_unsigned(&b->n_updates, b->persist_state_write_count_interval, &b->mutMetricCount);
                     }
                     if (b->persist_state_interval_secs) {
-                        b->persist_expiration_time = now + b->persist_state_interval_secs;
+                        ATOMIC_STORE_time_t_RELAXED(&b->persist_expiration_time, &b->mutPersistExpirationTime,
+                                                    now + b->persist_state_interval_secs);
                     }
                 }
             }
@@ -1309,6 +1361,7 @@ static void ATTR_NONNULL(1) destroyFileWriteWorker(dynstats_buckets_t *bkts) {
 
 static rsRetVal ATTR_NONNULL(1) enqueueFileWriteTask(dynstats_bucket_t *b, const char *file_name, const char *content) {
     file_write_entry_t *task;
+    file_write_entry_t *queued_task;
     dynstats_buckets_t *bkts;
     DEFiRet;
 
@@ -1318,7 +1371,27 @@ static rsRetVal ATTR_NONNULL(1) enqueueFileWriteTask(dynstats_bucket_t *b, const
         FINALIZE;
     }
 
-    CHKmalloc(task = malloc(sizeof(file_write_entry_t)));
+    task = NULL;
+    pthread_mutex_lock(&bkts->work_q.mut);
+    STAILQ_FOREACH(queued_task, &bkts->work_q.q, link) {
+        if (queued_task->bucket == b) {
+            char *new_content = strdup(content);
+            if (new_content == NULL) {
+                pthread_mutex_unlock(&bkts->work_q.mut);
+                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+            }
+            free((void *)queued_task->content);
+            queued_task->content = new_content;
+            pthread_mutex_unlock(&bkts->work_q.mut);
+            FINALIZE;
+        }
+    }
+
+    task = malloc(sizeof(file_write_entry_t));
+    if (task == NULL) {
+        pthread_mutex_unlock(&bkts->work_q.mut);
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
     task->bucket = b;
     task->name = strdup(file_name);
     task->content = strdup(content);
@@ -1329,10 +1402,10 @@ static rsRetVal ATTR_NONNULL(1) enqueueFileWriteTask(dynstats_bucket_t *b, const
         free(task);
         task =
             NULL; /* Prevent double-free in error handler if it existed, though here finalize handles NULL task check */
+        pthread_mutex_unlock(&bkts->work_q.mut);
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     }
 
-    pthread_mutex_lock(&bkts->work_q.mut);
     STAILQ_INSERT_TAIL(&bkts->work_q.q, task, link);
     bkts->work_q.size++;
     STATSCOUNTER_INC(bkts->work_q.ctrEnq, bkts->work_q.mutCtrEnq);

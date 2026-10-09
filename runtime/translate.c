@@ -48,7 +48,8 @@ struct rsconfTranslateWarning_s {
     struct rsconfTranslateWarning_s *next;
 };
 
-static void addWarning(struct rsconfTranslateWarning_s **head, const char *fmt, ...);
+static void addWarning(struct rsconfTranslateWarning_s **head, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 
 struct rsconfTranslateYamlAction_s {
     struct nvlst *nvlst;
@@ -192,7 +193,8 @@ int rsconfTranslateHasFatal(void) {
 }
 
 PRAGMA_DIAGNOSTIC_PUSH
-PRAGMA_IGNORE_Wformat_nonliteral static char *translateVasprintf(const char *fmt, va_list ap) {
+PRAGMA_IGNORE_Wformat_nonliteral static char *__attribute__((format(printf, 1, 0))) translateVasprintf(const char *fmt,
+                                                                                                       va_list ap) {
     va_list ap_copy;
     char *buf;
     int len;
@@ -213,7 +215,8 @@ PRAGMA_IGNORE_Wformat_nonliteral static char *translateVasprintf(const char *fmt
     return buf;
 }
 
-PRAGMA_IGNORE_Wformat_nonliteral static void addWarning(struct rsconfTranslateWarning_s **head, const char *fmt, ...) {
+PRAGMA_IGNORE_Wformat_nonliteral static void __attribute__((format(printf, 2, 3))) addWarning(
+    struct rsconfTranslateWarning_s **head, const char *fmt, ...) {
     va_list ap;
     char *buf;
     struct rsconfTranslateWarning_s *w;
@@ -671,6 +674,7 @@ static void yamlStatementsAppend(struct rsconfTranslateYamlStatement_s **dst,
 
 static int promoteSimpleYamlToStatements(struct rsconfTranslateItem_s *it, int *oom) {
     char *if_expr;
+    struct rsconfTranslateYamlAction_s *actions;
     struct rsconfTranslateYamlStatement_s *stmt;
 
     if (it->yaml_ruleset_kind == RS_TRANSLATE_YAML_RULESET_STATEMENTS) return 1;
@@ -683,10 +687,11 @@ static int promoteSimpleYamlToStatements(struct rsconfTranslateItem_s *it, int *
         *oom = 1;
         return 0;
     }
-    stmt = newYamlStatement(if_expr, it->yaml_actions, oom);
+    actions = it->yaml_actions;
+    it->yaml_actions = NULL;
+    stmt = newYamlStatement(if_expr, actions, oom);
     if (stmt == NULL) return 0;
 
-    it->yaml_actions = NULL;
     free(it->yaml_filter);
     it->yaml_filter = NULL;
     it->yaml_statements = stmt;
@@ -842,6 +847,12 @@ static int estrAppendChar(es_str_t **s, char c) {
     return es_addChar(s, (unsigned char)c);
 }
 
+static int estrAppendVarName(es_str_t **s, const char *name) {
+    if (name == NULL || name[0] == '\0') return -1;
+    if (name[0] != '$' && estrAppendChar(s, '$') != 0) return -1;
+    return estrAppendCstr(s, name);
+}
+
 static int estrAppendQuoted(es_str_t **s, const char *buf) {
     size_t i;
     if (estrAppendChar(s, '"') != 0) return -1;
@@ -949,7 +960,7 @@ static int exprToString(es_str_t **out, const struct cnfexpr *expr, struct rscon
             free(cstr);
             return i;
         case 'V':
-            return estrAppendCstr(out, ((const struct cnfvar *)expr)->name);
+            return estrAppendVarName(out, ((const struct cnfvar *)expr)->name);
         case 'A':
             ar = (const struct cnfarray *)expr;
             if (estrAppendChar(out, '[') != 0) return -1;
@@ -981,7 +992,7 @@ static int exprToString(es_str_t **out, const struct cnfexpr *expr, struct rscon
             return 0;
         case S_FUNC_EXISTS:
             if (estrAppendCstr(out, "exists(") != 0) return -1;
-            if (estrAppendCstr(out, ((const struct cnffuncexists *)expr)->varname) != 0) return -1;
+            if (estrAppendVarName(out, ((const struct cnffuncexists *)expr)->varname) != 0) return -1;
             return estrAppendChar(out, ')');
         case '&':
         case '+':
@@ -1146,33 +1157,45 @@ static int stmtListToString(es_str_t **out,
             case S_SET:
                 if (appendIndent(out, indent) != 0) return -1;
                 if (estrAppendCstr(out, stmt->d.s_set.force_reset ? "reset " : "set ") != 0 ||
-                    estrAppendCstr(out, (char *)stmt->d.s_set.varname) != 0 || estrAppendCstr(out, " = ") != 0 ||
+                    estrAppendVarName(out, (char *)stmt->d.s_set.varname) != 0 || estrAppendCstr(out, " = ") != 0 ||
                     exprToString(out, stmt->d.s_set.expr, warnings) != 0 || estrAppendCstr(out, ";\n") != 0)
                     return -1;
                 break;
             case S_UNSET:
                 if (appendIndent(out, indent) != 0 || estrAppendCstr(out, "unset ") != 0 ||
-                    estrAppendCstr(out, (char *)stmt->d.s_unset.varname) != 0 || estrAppendCstr(out, ";\n") != 0)
+                    estrAppendVarName(out, (char *)stmt->d.s_unset.varname) != 0 || estrAppendCstr(out, ";\n") != 0)
                     return -1;
                 break;
-            case S_IF:
-                if (appendIndent(out, indent) != 0 || estrAppendCstr(out, "if ") != 0 ||
-                    exprToString(out, stmt->d.s_if.expr, warnings) != 0 || estrAppendCstr(out, " then {\n") != 0 ||
-                    stmtListToString(out, stmt->d.s_if.t_then, indent + 1, warnings) != 0)
-                    return -1;
-                if (appendIndent(out, indent) != 0) return -1;
-                if (stmt->d.s_if.t_else != NULL) {
-                    if (estrAppendCstr(out, "} else {\n") != 0 ||
-                        stmtListToString(out, stmt->d.s_if.t_else, indent + 1, warnings) != 0 ||
-                        appendIndent(out, indent) != 0 || estrAppendCstr(out, "}\n") != 0)
+            case S_IF: {
+                const struct cnfstmt *if_stmt = stmt;
+
+                for (;;) {
+                    if (appendIndent(out, indent) != 0 ||
+                        estrAppendCstr(out, if_stmt == stmt ? "if " : "} else if ") != 0 ||
+                        exprToString(out, if_stmt->d.s_if.expr, warnings) != 0 ||
+                        estrAppendCstr(out, " then {\n") != 0 ||
+                        stmtListToString(out, if_stmt->d.s_if.t_then, indent + 1, warnings) != 0)
                         return -1;
-                } else if (estrAppendCstr(out, "}\n") != 0) {
-                    return -1;
+                    if (if_stmt->d.s_if.t_else != NULL && if_stmt->d.s_if.t_else->nodetype == S_IF &&
+                        if_stmt->d.s_if.t_else->next == NULL && if_stmt->d.s_if.t_else->d.s_if.is_else_if) {
+                        if_stmt = if_stmt->d.s_if.t_else;
+                        continue;
+                    }
+                    if (appendIndent(out, indent) != 0) return -1;
+                    if (if_stmt->d.s_if.t_else != NULL) {
+                        if (estrAppendCstr(out, "} else {\n") != 0 ||
+                            stmtListToString(out, if_stmt->d.s_if.t_else, indent + 1, warnings) != 0 ||
+                            appendIndent(out, indent) != 0 || estrAppendCstr(out, "}\n") != 0)
+                            return -1;
+                    } else if (estrAppendCstr(out, "}\n") != 0) {
+                        return -1;
+                    }
+                    break;
                 }
-                break;
+            } break;
             case S_FOREACH:
                 if (appendIndent(out, indent) != 0 || estrAppendCstr(out, "foreach (") != 0 ||
-                    estrAppendCstr(out, stmt->d.s_foreach.iter->var) != 0 || estrAppendCstr(out, " in ") != 0 ||
+                    estrAppendVarName(out, stmt->d.s_foreach.iter->var) != 0 || estrAppendCstr(out, " in ") != 0 ||
                     exprToString(out, stmt->d.s_foreach.iter->collection, warnings) != 0 ||
                     estrAppendCstr(out, ") do {\n") != 0 ||
                     stmtListToString(out, stmt->d.s_foreach.body, indent + 1, warnings) != 0 ||

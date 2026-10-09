@@ -480,19 +480,11 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "resetcounters")) {
             loadModConf->bResetCtrs = (sbool)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "log.file")) {
-            loadModConf->logfile = es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (loadModConf->logfile == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert log.file parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(loadModConf->logfile = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "log.file.overwrite")) {
             loadModConf->bLogOverwrite = (sbool)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "format")) {
-            mode = es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (mode == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert format parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(mode = es_str2cstr(pvals[i].val.d.estr, NULL));
             if (!strcasecmp(mode, "json")) {
                 loadModConf->statsFmt = statsFmt_JSON;
             } else if (!strcasecmp(mode, "json-elasticsearch")) {
@@ -510,18 +502,10 @@ BEGINsetModCnf
             }
             free(mode);
         } else if (!strcmp(modpblk.descr[i].name, "ruleset")) {
-            loadModConf->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (loadModConf->pszBindRuleset == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert ruleset parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(loadModConf->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
 #ifdef ENABLE_IMPSTATS_PUSH
         } else if (!strcmp(modpblk.descr[i].name, "push.url")) {
-            loadModConf->pushConfig.url = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (loadModConf->pushConfig.url == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert push.url parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(loadModConf->pushConfig.url = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             loadModConf->bPushEnabled = 1;
         } else if (!strcmp(modpblk.descr[i].name, "push.labels")) {
             /* Array of label strings */
@@ -534,18 +518,7 @@ BEGINsetModCnf
                 CHKmalloc(loadModConf->pushConfig.labels = (uchar **)calloc(arr->nmemb, sizeof(uchar *)));
                 int j;
                 for (j = 0; j < arr->nmemb; j++) {
-                    loadModConf->pushConfig.labels[j] = (uchar *)es_str2cstr(arr->arr[j], NULL);
-                    if (loadModConf->pushConfig.labels[j] == NULL) {
-                        LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert push label");
-                        /* Free previously allocated labels */
-                        for (int k = 0; k < j; k++) {
-                            free(loadModConf->pushConfig.labels[k]);
-                        }
-                        free(loadModConf->pushConfig.labels);
-                        loadModConf->pushConfig.labels = NULL;
-                        loadModConf->pushConfig.nLabels = 0;
-                        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-                    }
+                    CHKmalloc(loadModConf->pushConfig.labels[j] = (uchar *)es_str2cstr(arr->arr[j], NULL));
                 }
             }
         } else if (!strcmp(modpblk.descr[i].name, "push.timeout.ms")) {
@@ -557,31 +530,16 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "push.label.name")) {
             loadModConf->pushConfig.labelName = (sbool)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "push.label.job")) {
-            uchar *job = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (job == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert push.label.job parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            uchar *job;
+            CHKmalloc(job = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             free(loadModConf->pushConfig.labelJob);
             loadModConf->pushConfig.labelJob = job;
         } else if (!strcmp(modpblk.descr[i].name, "push.tls.cafile")) {
-            loadModConf->pushConfig.tlsCaFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (loadModConf->pushConfig.tlsCaFile == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert push.tls.cafile parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(loadModConf->pushConfig.tlsCaFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "push.tls.certfile")) {
-            loadModConf->pushConfig.tlsCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (loadModConf->pushConfig.tlsCertFile == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert push.tls.certfile parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(loadModConf->pushConfig.tlsCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "push.tls.keyfile")) {
-            loadModConf->pushConfig.tlsKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
-            if (loadModConf->pushConfig.tlsKeyFile == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "impstats: failed to convert push.tls.keyfile parameter");
-                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-            }
+            CHKmalloc(loadModConf->pushConfig.tlsKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "push.tls.insecureSkipVerify")) {
             loadModConf->pushConfig.tlsInsecureSkipVerify = (sbool)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "push.batch.maxBytes")) {
@@ -814,17 +772,26 @@ BEGINrunInput
 
         char *tmp_logfile = NULL;
         if (runModConf->bLogOverwrite && runModConf->logfile != NULL) {
-            const size_t len_tmp_logfile = strlen(runModConf->logfile) + 5;
+            const size_t len_tmp_logfile = strlen(runModConf->logfile) + sizeof(".tmp.XXXXXX");
             if ((tmp_logfile = malloc(len_tmp_logfile)) == NULL) {
                 LogError(errno, RS_RET_OUT_OF_MEMORY, "impstats: could not allocate memory for temp log file name");
             } else {
-                snprintf(tmp_logfile, len_tmp_logfile, "%s.tmp", runModConf->logfile);
+                snprintf(tmp_logfile, len_tmp_logfile, "%s.tmp.XXXXXX", runModConf->logfile);
                 pthread_mutex_lock(&hup_mutex);
-                runModConf->logfd = open(tmp_logfile, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+                runModConf->logfd = mkstemp(tmp_logfile);
                 if (runModConf->logfd == -1) {
-                    LogError(errno, RS_RET_ERR, "impstats: error opening temp stats file %s", tmp_logfile);
+                    LogError(errno, RS_RET_ERR, "impstats: error creating temp stats file %s", tmp_logfile);
                     free(tmp_logfile);
                     tmp_logfile = NULL;
+                } else {
+                    if (fcntl(runModConf->logfd, F_SETFD, FD_CLOEXEC) != 0) {
+                        LogError(errno, RS_RET_ERR, "impstats: failed to set close-on-exec on temp stats file %s",
+                                 tmp_logfile);
+                    }
+                    if (fchmod(runModConf->logfd, S_IRUSR | S_IWUSR) != 0) {
+                        LogError(errno, RS_RET_ERR, "impstats: failed to set permissions on temp stats file %s",
+                                 tmp_logfile);
+                    }
                 }
                 pthread_mutex_unlock(&hup_mutex);
             }

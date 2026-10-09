@@ -34,6 +34,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <ctype.h>
+#ifdef ENABLE_LIBZSTD
+    #define ZSTD_STATIC_LINKING_ONLY
+    #include <zstd.h>
+#endif
 
 #include "rsyslog.h"
 #include "dirty.h"
@@ -45,34 +49,12 @@
 #include "obj.h"
 #include "errmsg.h"
 #include "netstrm.h"
-#include "template.h"
-#include "wti.h"
 #include "msg.h"
 #include "datetime.h"
 #include "prop.h"
-#include "parser.h"
 #include "ratelimit.h"
 #include "debug.h"
 #include "rsconf.h"
-
-static rsRetVal ensurePerSourceKeyBuf(actWrkrIParams_t *param, size_t need) {
-    uchar *pNewBuf;
-    size_t iNewSize;
-    DEFiRet;
-
-    if (param->lenBuf >= need + 1) {
-        RETiRet;
-    }
-
-    iNewSize = ((need + 1) / 128 + 1) * 128;
-    CHKmalloc(pNewBuf = (uchar *)realloc(param->param, iNewSize));
-    param->param = pNewBuf;
-    param->lenBuf = iNewSize;
-
-finalize_it:
-    RETiRet;
-}
-
 
 /* static data */
 DEFobjStaticHelpers;
@@ -81,11 +63,11 @@ DEFobjCurrIf(netstrm);
 DEFobjCurrIf(prop);
 DEFobjCurrIf(datetime);
 DEFobjCurrIf(regexp);
-DEFobjCurrIf(parser)
 
 
-    /* forward definitions */
-    static rsRetVal Close(tcps_sess_t *pThis);
+/* forward definitions */
+static rsRetVal Close(tcps_sess_t *pThis);
+static rsRetVal finishCompressedStream(tcps_sess_t *pThis);
 
 
 /* Standard-Constructor */
@@ -105,8 +87,20 @@ BEGINobjConstruct(tcps_sess) /* be sure to specify the object type also in END m
     pThis->tlsProbeBytes = 0;
     pThis->tlsProbeDone = 0;
     pThis->tlsMismatchWarned = 0;
+    pThis->compressionMode = TCPSRV_COMPRESS_NEVER;
+    pThis->compressionDriver = TCPSRV_COMPRESS_DRIVER_ZLIB;
+    pThis->compressionMaxTotalZstdWindowBytes = TCPSRV_COMPRESS_MAX_TOTAL_ZSTD_WINDOW_BYTES_DEFAULT;
+    pThis->compressionTotalBytesIn = 0;
+    pThis->compressionTotalBytesOut = 0;
+    pThis->zipInitDone = 0;
+    pThis->compressedStreamEnded = 0;
+    pThis->streamDecompressed = 0;
+    pThis->zstdDctx = NULL;
+    pThis->zstd_frame_header_len = 0;
+    pThis->zstd_frame_header_processed = 0;
+    pThis->zstd_window_reservation = 0;
+    memset(&pThis->zstrm, 0, sizeof(pThis->zstrm));
     memset(pThis->tlsProbeBuf, 0, sizeof(pThis->tlsProbeBuf));
-    wtiInitIParam(&pThis->perSourceKeyParam);
     /* now allocate the message reception buffer */
     bufSize = (size_t)pThis->iMaxLine + 1;
     CHKmalloc(pThis->pMsg = (uchar *)malloc(bufSize));
@@ -122,6 +116,7 @@ static rsRetVal tcps_sessConstructFinalize(tcps_sess_t *pThis) {
 #ifdef FEATURE_REGEXP
     if (pThis->pLstnInfo->bHasStartRegex) {
         size_t regexBufSize;
+        uchar *pMsgTmp;
 
         if (pThis->iMaxLine > (INT_MAX - 1) / 2) {
             LogError(0, RS_RET_ERR,
@@ -131,7 +126,8 @@ static rsRetVal tcps_sessConstructFinalize(tcps_sess_t *pThis) {
         }
         regexBufSize = ((size_t)pThis->iMaxLine * 2) + 1;
         /* in this case, we need a second buffer and a larger primary one */
-        CHKmalloc(pThis->pMsg = (uchar *)realloc(pThis->pMsg, regexBufSize));
+        CHKmalloc(pMsgTmp = (uchar *)realloc(pThis->pMsg, regexBufSize));
+        pThis->pMsg = pMsgTmp;
         CHKmalloc(pThis->pMsg_save = (uchar *)malloc(regexBufSize));
     }
 #endif
@@ -144,9 +140,59 @@ finalize_it:
 }
 
 
+#ifdef ENABLE_LIBZSTD
+static sbool reserve_zstd_window(tcps_sess_t *const pThis, const uint64 window_size) {
+    tcpLstnPortList_t *const listener = pThis->pLstnInfo;
+    const uint64 limit = pThis->compressionMaxTotalZstdWindowBytes;
+    uint64 in_use;
+
+    assert(listener != NULL);
+    assert(pThis->zstd_window_reservation == 0);
+    if (window_size > limit) return RSFALSE;
+
+    in_use = ATOMIC_LOAD_uint64(&listener->compressionZstdWindowBytesInUse, &listener->mutCompressionZstdWindow);
+    for (;;) {
+        if (in_use > limit - window_size) return RSFALSE;
+        if (ATOMIC_CAS_uint64(&listener->compressionZstdWindowBytesInUse, in_use, in_use + window_size,
+                              &listener->mutCompressionZstdWindow)) {
+            pThis->zstd_window_reservation = window_size;
+            return RSTRUE;
+        }
+        in_use = ATOMIC_LOAD_uint64(&listener->compressionZstdWindowBytesInUse, &listener->mutCompressionZstdWindow);
+    }
+}
+
+static void release_zstd_window_reservation(tcps_sess_t *const pThis) {
+    if (pThis->zstd_window_reservation == 0 || pThis->pLstnInfo == NULL) return;
+
+    assert(ATOMIC_LOAD_uint64(&pThis->pLstnInfo->compressionZstdWindowBytesInUse,
+                              &pThis->pLstnInfo->mutCompressionZstdWindow) >= pThis->zstd_window_reservation);
+    ATOMIC_SUB_uint64(&pThis->pLstnInfo->compressionZstdWindowBytesInUse, &pThis->pLstnInfo->mutCompressionZstdWindow,
+                      pThis->zstd_window_reservation);
+    pThis->zstd_window_reservation = 0;
+}
+#endif
+
+static void release_zlib_decoder(tcps_sess_t *const pThis) {
+    if (!pThis->zipInitDone) return;
+
+    inflateEnd(&pThis->zstrm);
+    memset(&pThis->zstrm, 0, sizeof(pThis->zstrm));
+    pThis->zipInitDone = 0;
+}
+
+
 /* destructor for the tcps_sess object */
 BEGINobjDestruct(tcps_sess) /* be sure to specify the object type also in END and CODESTART macros! */
     CODESTARTobjDestruct(tcps_sess);
+    release_zlib_decoder(pThis);
+#ifdef ENABLE_LIBZSTD
+    if (pThis->zstdDctx != NULL) {
+        ZSTD_freeDCtx((ZSTD_DCtx *)pThis->zstdDctx);
+        pThis->zstdDctx = NULL;
+    }
+    release_zstd_window_reservation(pThis);
+#endif
     if (pThis->pStrm != NULL) netstrm.Destruct(&pThis->pStrm);
 
     if (pThis->pSrv->pOnSessDestruct != NULL) {
@@ -157,7 +203,6 @@ BEGINobjDestruct(tcps_sess) /* be sure to specify the object type also in END an
     if (pThis->fromHost != NULL) CHKiRet(prop.Destruct(&pThis->fromHost));
     if (pThis->fromHostIP != NULL) CHKiRet(prop.Destruct(&pThis->fromHostIP));
     if (pThis->fromHostPort != NULL) CHKiRet(prop.Destruct(&pThis->fromHostPort));
-    free(pThis->perSourceKeyParam.param);
     free(pThis->pMsg);
     free(pThis->pMsg_save);
 ENDobjDestruct(tcps_sess)
@@ -297,6 +342,11 @@ static rsRetVal SetLstnInfo(tcps_sess_t *pThis, tcpLstnPortList_t *pLstnInfo) {
     /* set cached elements */
     pThis->bSuppOctetFram = pLstnInfo->cnf_params->bSuppOctetFram;
     pThis->bSPFramingFix = pLstnInfo->cnf_params->bSPFramingFix;
+    pThis->compressionMode = pLstnInfo->compressionMode;
+    pThis->compressionDriver = pLstnInfo->compressionDriver;
+    pThis->compressionMaxExpansionRatio = pLstnInfo->compressionMaxExpansionRatio;
+    pThis->compressionMaxDecompressedBytesPerReceive = pLstnInfo->compressionMaxDecompressedBytesPerReceive;
+    pThis->compressionMaxTotalZstdWindowBytes = pLstnInfo->compressionMaxTotalZstdWindowBytes;
     RETiRet;
 }
 
@@ -353,94 +403,18 @@ static rsRetVal defaultDoSubmitMessage(tcps_sess_t *pThis,
     if (cnf_params->dfltTZ[0] != '\0') MsgSetDfltTZ(pMsg, (char *)cnf_params->dfltTZ);
     MsgSetFlowControlType(pMsg, pThis->pSrv->bUseFlowControl ? eFLOWCTL_LIGHT_DELAY : eFLOWCTL_NO_DELAY);
     pMsg->msgFlags = NEEDS_PARSING | PARSE_HOSTNAME;
+    if (pThis->streamDecompressed) {
+        pMsg->msgFlags |= NO_LEGACY_Z_DECOMPRESS;
+    }
     MsgSetRcvFrom(pMsg, pThis->fromHost);
     CHKiRet(MsgSetRcvFromIP(pMsg, pThis->fromHostIP));
     CHKiRet(MsgSetRcvFromPort(pMsg, pThis->fromHostPort));
     MsgSetRuleset(pMsg, cnf_params->pRuleset);
-
-    if (pThis->pLstnInfo->ratelimiter->pShared != NULL && pThis->pLstnInfo->ratelimiter->pShared->per_source_enabled) {
-        const char *per_source_key = NULL;
-        size_t per_source_key_len = 0;
-        if (pThis->pLstnInfo->ratelimiter->pShared->per_source_key_needs_parsing &&
-            (pMsg->msgFlags & NEEDS_PARSING) != 0) {
-            parser.ParseMsg(pMsg);
-        }
-        if (pThis->pLstnInfo->ratelimiter->pShared->per_source_key_mode == RL_PS_KEY_TPL) {
-            if (pThis->pLstnInfo->ratelimiter->pShared->per_source_key_tpl == NULL ||
-                pThis->pLstnInfo->ratelimiter->pShared->per_source_key_tpl_default) {
-                per_source_key = getHOSTNAME(pMsg);
-                per_source_key_len = getHOSTNAMELen(pMsg);
-            } else {
-                if (tplToString(pThis->pLstnInfo->ratelimiter->pShared->per_source_key_tpl, pMsg,
-                                &pThis->perSourceKeyParam, NULL) == RS_RET_OK) {
-                    per_source_key = (const char *)pThis->perSourceKeyParam.param;
-                    per_source_key_len = pThis->perSourceKeyParam.lenStr;
-                }
-            }
-        } else {
-            uchar *pHost = NULL;
-            uchar *pPort = NULL;
-            int hostLen = 0;
-            int portLen = 0;
-
-            switch (pThis->pLstnInfo->ratelimiter->pShared->per_source_key_mode) {
-                case RL_PS_KEY_FROMHOST_IP:
-                    if (pThis->fromHostIP != NULL) {
-                        prop.GetString(pThis->fromHostIP, &pHost, &hostLen);
-                        per_source_key = (const char *)pHost;
-                        per_source_key_len = (size_t)hostLen;
-                    }
-                    break;
-                case RL_PS_KEY_FROMHOST:
-                    if (pThis->fromHost != NULL) {
-                        prop.GetString(pThis->fromHost, &pHost, &hostLen);
-                        per_source_key = (const char *)pHost;
-                        per_source_key_len = (size_t)hostLen;
-                    }
-                    break;
-                case RL_PS_KEY_FROMHOST_IP_PORT:
-                case RL_PS_KEY_FROMHOST_PORT:
-                    if (pThis->fromHostPort != NULL) {
-                        prop.GetString(pThis->fromHostPort, &pPort, &portLen);
-                    }
-                    if (pThis->pLstnInfo->ratelimiter->pShared->per_source_key_mode == RL_PS_KEY_FROMHOST_IP_PORT) {
-                        if (pThis->fromHostIP != NULL) {
-                            prop.GetString(pThis->fromHostIP, &pHost, &hostLen);
-                        }
-                    } else {
-                        if (pThis->fromHost != NULL) {
-                            prop.GetString(pThis->fromHost, &pHost, &hostLen);
-                        }
-                    }
-                    if (pHost == NULL) {
-                        pHost = (uchar *)"";
-                        hostLen = 0;
-                    }
-                    if (pPort == NULL) {
-                        pPort = (uchar *)"";
-                        portLen = 0;
-                    }
-                    if (ensurePerSourceKeyBuf(&pThis->perSourceKeyParam, (size_t)hostLen + 1 + (size_t)portLen) ==
-                        RS_RET_OK) {
-                        memcpy(pThis->perSourceKeyParam.param, pHost, (size_t)hostLen);
-                        pThis->perSourceKeyParam.param[hostLen] = ':';
-                        memcpy(pThis->perSourceKeyParam.param + hostLen + 1, pPort, (size_t)portLen);
-                        pThis->perSourceKeyParam.param[hostLen + 1 + portLen] = '\0';
-                        pThis->perSourceKeyParam.lenStr = (size_t)hostLen + 1 + (size_t)portLen;
-                        per_source_key = (const char *)pThis->perSourceKeyParam.param;
-                        per_source_key_len = pThis->perSourceKeyParam.lenStr;
-                    }
-                    break;
-                case RL_PS_KEY_TPL:
-                default:
-                    break;
-            }
-        }
-        localRet = ratelimitAddMsgPerSource(pThis->pLstnInfo->ratelimiter, pMultiSub, pMsg, per_source_key,
-                                            per_source_key_len, ttGenTime);
-    } else {
-        localRet = ratelimitAddMsg(pThis->pLstnInfo->ratelimiter, pMultiSub, pMsg);
+    if (pThis->bFrameOversize) {
+        writeOversizeMessageLog(pMsg);
     }
+
+    localRet = ratelimitAddMsg(pThis->pLstnInfo->ratelimiter, pMultiSub, pMsg);
 
     if (localRet == RS_RET_OK) {
         STATSCOUNTER_INC(pThis->pLstnInfo->ctrSubmit, pThis->pLstnInfo->mutCtrSubmit);
@@ -448,14 +422,14 @@ static rsRetVal defaultDoSubmitMessage(tcps_sess_t *pThis,
         DBGPRINTF("tcps_sess: message discarded by ratelimit helper\n");
         iRet = RS_RET_OK;
     } else {
-        DBGPRINTF("tcps_sess: ratelimit helper returned error %d, dropping message and continuing\n", localRet);
-        msgDestruct(&pMsg);
+        DBGPRINTF("tcps_sess: ratelimit helper returned error %d, continuing\n", localRet);
         iRet = RS_RET_OK;
     }
 
 finalize_it:
     /* reset status variables */
     pThis->iMsg = 0;
+    pThis->bFrameOversize = 0;
 
     RETiRet;
 }
@@ -478,6 +452,8 @@ static rsRetVal PrepareClose(tcps_sess_t *pThis) {
     DEFiRet;
 
     ISOBJ_TYPE_assert(pThis, tcps_sess);
+
+    CHKiRet(finishCompressedStream(pThis));
 
     if (pThis->inputState == eAtStrtFram) {
         /* this is how it should be. There is no unprocessed
@@ -576,7 +552,9 @@ static rsRetVal Close(tcps_sess_t *pThis) {
     DEFiRet;
 
     ISOBJ_TYPE_assert(pThis, tcps_sess);
-    netstrm.Destruct(&pThis->pStrm);
+    if (pThis->pStrm != NULL) {
+        netstrm.Destruct(&pThis->pStrm);
+    }
     if (pThis->fromHost != NULL) {
         prop.Destruct(&pThis->fromHost);
     }
@@ -630,6 +608,7 @@ static rsRetVal ATTR_NONNULL(1) processDataRcvd(tcps_sess_t *pThis,
     if (pThis->inputState == eAtStrtFram) {
         if (c >= '0' && c <= '9' && pThis->bSuppOctetFram) {
             pThis->inputState = eInOctetCnt;
+            pThis->bFrameOversize = 0;
             pThis->iOctetsRemain = 0;
             pThis->eFraming = TCP_FRAMING_OCTET_COUNTING;
         } else if (c == ' ' && pThis->bSPFramingFix) {
@@ -641,6 +620,7 @@ static rsRetVal ATTR_NONNULL(1) processDataRcvd(tcps_sess_t *pThis,
             FINALIZE;
         } else {
             pThis->inputState = eInMsg;
+            pThis->bFrameOversize = 0;
             pThis->eFraming = TCP_FRAMING_OCTET_STUFFING;
         }
     }
@@ -686,6 +666,7 @@ static rsRetVal ATTR_NONNULL(1) processDataRcvd(tcps_sess_t *pThis,
                 /* emergency, we now need to flush, no matter if we are at end of message or not... */
                 DBGPRINTF("error: message received is larger than max msg size, we %s it - c=%x\n",
                           pThis->pSrv->discardTruncatedMsg == 1 ? "truncate" : "split", c);
+                pThis->bFrameOversize = 1;
                 defaultDoSubmitMessage(pThis, stTime, ttGenTime, pMultiSub);
                 ++(*pnMsgs);
                 if (pThis->pSrv->discardTruncatedMsg == 1) {
@@ -754,6 +735,7 @@ static rsRetVal ATTR_NONNULL(1) processDataRcvd(tcps_sess_t *pThis,
                          cnf_params->pszInputName, peerName, peerIP, peerPort, pThis->iOctetsRemain);
                 pThis->eFraming = TCP_FRAMING_OCTET_STUFFING;
             } else if (pThis->iOctetsRemain > pThis->iMaxLine) {
+                pThis->bFrameOversize = 1;
                 /* while we can not do anything against it, we can at least log an indication
                  * that something went wrong) -- rgerhards, 2008-03-14
                  */
@@ -798,7 +780,7 @@ finalize_it:
  * we have just received a bunch of data! -- rgerhards, 2009-06-16
  */
 #define NUM_MULTISUB 1024
-static rsRetVal DataRcvd(tcps_sess_t *pThis, char *pData, const size_t iLen) {
+static rsRetVal DataRcvdUncompressed(tcps_sess_t *pThis, char *pData, const size_t iLen, const sbool detectTls) {
     multi_submit_t multiSub;
     smsg_t *pMsgs[NUM_MULTISUB];
     struct syslogTime stTime;
@@ -811,7 +793,9 @@ static rsRetVal DataRcvd(tcps_sess_t *pThis, char *pData, const size_t iLen) {
     assert(pData != NULL);
     assert(iLen > 0);
 
-    CHKiRet(maybeDetectTlsClientHello(pThis, pData, iLen));
+    if (detectTls) {
+        CHKiRet(maybeDetectTlsClientHello(pThis, pData, iLen));
+    }
 
     datetime.getCurrTime(&stTime, &ttGenTime, TIME_IN_LOCALTIME);
     multiSub.ppMsgs = pMsgs;
@@ -833,6 +817,565 @@ finalize_it:
     RETiRet;
 }
 #undef NUM_MULTISUB
+
+static rsRetVal DataRcvdUncompressedFromStream(tcps_sess_t *const pThis,
+                                               char *const pData,
+                                               const size_t iLen,
+                                               const sbool detectTls) {
+    const sbool previous = pThis->streamDecompressed;
+    pThis->streamDecompressed = RSTRUE;
+
+    const rsRetVal localRet = DataRcvdUncompressed(pThis, pData, iLen, detectTls);
+    pThis->streamDecompressed = previous;
+    return localRet;
+}
+
+static const char *compressionDriverName(const tcps_sess_t *const pThis) {
+    switch (pThis->compressionDriver) {
+        case TCPSRV_COMPRESS_DRIVER_ZSTD:
+            return "zstd";
+        case TCPSRV_COMPRESS_DRIVER_ZLIB:
+        default:
+            return "zlib";
+    }
+}
+
+static void logCompressedStreamFailure(tcps_sess_t *const pThis, const char *const reason, const char *const detail) {
+    const char *const host = propGetSzStrOrDefault(pThis->fromHost, "(host unknown)");
+    const char *const ip = propGetSzStrOrDefault(pThis->fromHostIP, "(IP unknown)");
+    const char *const port = propGetSzStrOrDefault(pThis->fromHostPort, "(port unknown)");
+
+    pThis->compressedStreamFailed = 1;
+    STATSCOUNTER_INC(pThis->pLstnInfo->ctrDecompressErr, pThis->pLstnInfo->mutCtrDecompressErr);
+    LogError(0, RS_RET_ZLIB_ERR, "imtcp: %s from %s (%s:%s), driver=%s%s%s", reason, host, ip, port,
+             compressionDriverName(pThis), detail == NULL ? "" : ": ", detail == NULL ? "" : detail);
+}
+
+typedef struct decompressReceiveGuard_s {
+    uint64_t decompressedBytes;
+} decompressReceiveGuard_t;
+
+static rsRetVal checkDecompressedBytesLimit(tcps_sess_t *const pThis,
+                                            decompressReceiveGuard_t *const guard,
+                                            const size_t len) {
+    DEFiRet;
+
+    if (UINT64_MAX - guard->decompressedBytes < len) {
+        logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                   "per-receive decompressed byte counter overflowed");
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+    const uint64_t newReceiveTotal = guard->decompressedBytes + len;
+
+    if (pThis->compressionMaxDecompressedBytesPerReceive != 0 &&
+        newReceiveTotal > pThis->compressionMaxDecompressedBytesPerReceive) {
+        logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                   "decompressed bytes exceeded configured per-receive limit");
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+
+    if (UINT64_MAX - pThis->compressionTotalBytesOut < len) {
+        logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                   "stream decompressed byte counter overflowed");
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+    const uint64_t newStreamTotal = pThis->compressionTotalBytesOut + len;
+
+    if (pThis->compressionMaxExpansionRatio != 0) {
+        const uint64_t maxByRatio = pThis->compressionTotalBytesIn > UINT64_MAX / pThis->compressionMaxExpansionRatio
+                                        ? UINT64_MAX
+                                        : pThis->compressionTotalBytesIn * pThis->compressionMaxExpansionRatio;
+        if (newStreamTotal > maxByRatio) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                       "decompressed bytes exceeded configured expansion ratio");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+    }
+
+    guard->decompressedBytes = newReceiveTotal;
+    pThis->compressionTotalBytesOut = newStreamTotal;
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal DataRcvdCompressedZlib(tcps_sess_t *const pThis,
+                                       char *const pData,
+                                       const size_t iLen,
+                                       decompressReceiveGuard_t *const guard) {
+    uchar out[64 * 1024];
+    DEFiRet;
+
+    if (pThis->compressedStreamEnded) {
+        logCompressedStreamFailure(pThis, "received invalid compressed stream", "data after end of zlib stream");
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+
+    if (!pThis->zipInitDone) {
+        memset(&pThis->zstrm, 0, sizeof(pThis->zstrm));
+        const int zret = inflateInit(&pThis->zstrm);
+        if (zret != Z_OK) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream", "zlib inflateInit failed");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        pThis->zipInitDone = 1;
+    }
+
+    pThis->zstrm.next_in = (Bytef *)pData;
+    pThis->zstrm.avail_in = (uInt)iLen;
+
+    do {
+        pThis->zstrm.next_out = out;
+        pThis->zstrm.avail_out = sizeof(out);
+        const uInt oldAvailIn = pThis->zstrm.avail_in;
+        const int zret = inflate(&pThis->zstrm, Z_SYNC_FLUSH);
+        const size_t have = sizeof(out) - pThis->zstrm.avail_out;
+
+        if (have != 0) {
+            CHKiRet(checkDecompressedBytesLimit(pThis, guard, have));
+            STATSCOUNTER_ADD(pThis->pLstnInfo->ctrBytesDecompressed, pThis->pLstnInfo->mutCtrBytesDecompressed, have);
+            CHKiRet(DataRcvdUncompressedFromStream(pThis, (char *)out, have, 0));
+        }
+
+        if (zret == Z_STREAM_END) {
+            pThis->compressedStreamEnded = 1;
+            if (pThis->zstrm.avail_in != 0) {
+                logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                           "data after end of zlib stream");
+                ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+            }
+            release_zlib_decoder(pThis);
+            DBGPRINTF("tcps_sess: released zlib decoder after stream completion\n");
+            break;
+        }
+
+        if (zret != Z_OK && zret != Z_BUF_ERROR) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream", "zlib inflate failed");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        if (zret == Z_BUF_ERROR && have == 0 && pThis->zstrm.avail_in == oldAvailIn) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream", "zlib inflate made no progress");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+    } while (pThis->zstrm.avail_in != 0 || pThis->zstrm.avail_out == 0);
+
+finalize_it:
+    if (iRet != RS_RET_OK) release_zlib_decoder(pThis);
+    RETiRet;
+}
+
+static rsRetVal DataRcvdCompressedZstd(tcps_sess_t *const pThis,
+                                       char *const pData,
+                                       const size_t iLen,
+                                       decompressReceiveGuard_t *const guard) {
+#ifdef ENABLE_LIBZSTD
+    uchar out[64 * 1024];
+    DEFiRet;
+
+    if (pThis->compressedStreamEnded) {
+        logCompressedStreamFailure(pThis, "received invalid compressed stream", "data after end of zstd stream");
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+
+    size_t input_offset = 0;
+    while (pThis->compressionMaxTotalZstdWindowBytes != 0 && !pThis->zstd_frame_header_processed) {
+        ZSTD_frameHeader frame_header;
+        const size_t header_ret =
+            ZSTD_getFrameHeader(&frame_header, pThis->zstd_frame_header, pThis->zstd_frame_header_len);
+        if (ZSTD_isError(header_ret)) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream", ZSTD_getErrorName(header_ret));
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        if (header_ret == 0) {
+            if (frame_header.frameType == ZSTD_frame) {
+                if (!reserve_zstd_window(pThis, frame_header.windowSize)) {
+                    logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                               "zstd decoder window budget exhausted");
+                    ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+                }
+            }
+            pThis->zstd_frame_header_processed = RSTRUE;
+            break;
+        }
+
+        if (header_ret > TCPSRV_ZSTD_FRAME_HEADER_MAX || header_ret <= pThis->zstd_frame_header_len) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream", "invalid zstd frame header size");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+
+        const size_t need = header_ret - pThis->zstd_frame_header_len;
+        const size_t available = iLen - input_offset;
+        const size_t take = need < available ? need : available;
+        memcpy(pThis->zstd_frame_header + pThis->zstd_frame_header_len, pData + input_offset, take);
+        pThis->zstd_frame_header_len += take;
+        input_offset += take;
+        if (take < need) {
+            FINALIZE;
+        }
+    }
+
+    if (pThis->zstdDctx == NULL) {
+        pThis->zstdDctx = ZSTD_createDCtx();
+        if (pThis->zstdDctx == NULL) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream", "zstd context allocation failed");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+    }
+
+    const unsigned input_parts = pThis->compressionMaxTotalZstdWindowBytes == 0 ? 1 : 2;
+    for (unsigned input_part = 0; input_part < input_parts; ++input_part) {
+        ZSTD_inBuffer input;
+        if (pThis->compressionMaxTotalZstdWindowBytes == 0) {
+            input = (ZSTD_inBuffer){pData, iLen, 0};
+        } else if (input_part == 0) {
+            if (pThis->zstd_frame_header_len == 0) {
+                continue;
+            }
+            input = (ZSTD_inBuffer){pThis->zstd_frame_header, pThis->zstd_frame_header_len, 0};
+        } else {
+            input = (ZSTD_inBuffer){pData + input_offset, iLen - input_offset, 0};
+        }
+        if (input.size == 0) {
+            continue;
+        }
+
+        ZSTD_outBuffer output;
+        do {
+            output.dst = out;
+            output.size = sizeof(out);
+            output.pos = 0;
+            const size_t old_input_pos = input.pos;
+            const size_t remaining = ZSTD_decompressStream((ZSTD_DCtx *)pThis->zstdDctx, &output, &input);
+            if (ZSTD_isError(remaining)) {
+                logCompressedStreamFailure(pThis, "received invalid compressed stream", ZSTD_getErrorName(remaining));
+                ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+            }
+
+            if (output.pos != 0) {
+                CHKiRet(checkDecompressedBytesLimit(pThis, guard, output.pos));
+                STATSCOUNTER_ADD(pThis->pLstnInfo->ctrBytesDecompressed, pThis->pLstnInfo->mutCtrBytesDecompressed,
+                                 output.pos);
+                CHKiRet(DataRcvdUncompressedFromStream(pThis, (char *)out, output.pos, 0));
+            }
+
+            if (remaining == 0) {
+                pThis->compressedStreamEnded = 1;
+                if (input.pos != input.size ||
+                    (pThis->compressionMaxTotalZstdWindowBytes != 0 && input_part == 0 && iLen != input_offset)) {
+                    logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                               "data after end of zstd stream");
+                    ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+                }
+                ZSTD_freeDCtx((ZSTD_DCtx *)pThis->zstdDctx);
+                pThis->zstdDctx = NULL;
+                release_zstd_window_reservation(pThis);
+                break;
+            }
+
+            if (input.pos == old_input_pos && output.pos == 0) {
+                break;
+            }
+        } while (input.pos < input.size || output.pos == output.size);
+
+        if (pThis->compressedStreamEnded) {
+            break;
+        }
+    }
+    if (pThis->compressionMaxTotalZstdWindowBytes != 0 && pThis->zstd_frame_header_processed) {
+        /* Incomplete headers exit through FINALIZE above and remain buffered across receives. */
+        pThis->zstd_frame_header_len = 0;
+    }
+
+finalize_it:
+    if (iRet != RS_RET_OK) {
+        ZSTD_freeDCtx((ZSTD_DCtx *)pThis->zstdDctx);
+        pThis->zstdDctx = NULL;
+        release_zstd_window_reservation(pThis);
+    }
+    RETiRet;
+#else
+    DEFiRet;
+    (void)pData;
+    (void)iLen;
+    (void)guard;
+    logCompressedStreamFailure(pThis, "received invalid compressed stream", "zstd support is not built in");
+    ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+finalize_it:
+    RETiRet;
+#endif
+}
+
+static rsRetVal finishCompressedStream(tcps_sess_t *pThis) {
+    DEFiRet;
+
+    if (pThis->compressionMode != TCPSRV_COMPRESS_STREAM_ALWAYS) {
+        FINALIZE;
+    }
+    if (pThis->compressedStreamFailed) {
+        FINALIZE;
+    }
+
+    if (pThis->compressionDriver == TCPSRV_COMPRESS_DRIVER_ZLIB) {
+        if (!pThis->zipInitDone || pThis->compressedStreamEnded) {
+            FINALIZE;
+        }
+        logCompressedStreamFailure(pThis, "detected truncated compressed stream", "zlib stream ended before trailer");
+        release_zlib_decoder(pThis);
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+
+    if (pThis->compressionDriver == TCPSRV_COMPRESS_DRIVER_ZSTD && !pThis->compressedStreamEnded) {
+        if (pThis->zstdDctx == NULL && pThis->zstd_frame_header_len == 0) {
+            FINALIZE;
+        }
+        logCompressedStreamFailure(pThis, "detected truncated compressed stream", "zstd stream ended before trailer");
+        ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal DataRcvd(tcps_sess_t *pThis, char *pData, const size_t iLen) {
+    DEFiRet;
+
+    ISOBJ_TYPE_assert(pThis, tcps_sess);
+    assert(pData != NULL);
+    assert(iLen > 0);
+
+    STATSCOUNTER_ADD(pThis->pLstnInfo->ctrBytesRcvd, pThis->pLstnInfo->mutCtrBytesRcvd, iLen);
+
+    if (pThis->compressionMode != TCPSRV_COMPRESS_STREAM_ALWAYS) {
+        CHKiRet(DataRcvdUncompressed(pThis, pData, iLen, 1));
+    } else {
+        if (UINT64_MAX - pThis->compressionTotalBytesIn < iLen) {
+            logCompressedStreamFailure(pThis, "received invalid compressed stream",
+                                       "stream compressed byte counter overflowed");
+            ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+        }
+        pThis->compressionTotalBytesIn += iLen;
+        decompressReceiveGuard_t guard = {.decompressedBytes = 0};
+        if (pThis->compressionDriver == TCPSRV_COMPRESS_DRIVER_ZSTD) {
+            CHKiRet(DataRcvdCompressedZstd(pThis, pData, iLen, &guard));
+        } else {
+            CHKiRet(DataRcvdCompressedZlib(pThis, pData, iLen, &guard));
+        }
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+#ifdef ENABLE_FUZZING
+typedef struct tcps_sess_fuzz_capture_s {
+    size_t messages;
+    size_t bytes;
+    size_t max_message_size;
+    uint64_t hash;
+    sbool failed;
+} tcps_sess_fuzz_capture_t;
+
+static sbool tcps_sess_fuzz_initialized;
+static sbool tcps_sess_fuzz_class_initialized;
+
+static rsRetVal tcps_sessFuzzSubmit(tcps_sess_t *const session, uchar *const message, const int message_len) {
+    tcps_sess_fuzz_capture_t *const capture = session->pUsr;
+
+    if (capture == NULL || message == NULL || message_len <= 0 || (size_t)message_len > capture->max_message_size ||
+        capture->messages == SIZE_MAX || capture->bytes > SIZE_MAX - (size_t)message_len) {
+        if (capture != NULL) capture->failed = RSTRUE;
+        return RS_RET_ERR;
+    }
+
+    ++capture->messages;
+    capture->bytes += (size_t)message_len;
+    for (int i = 0; i < message_len; ++i) {
+        capture->hash = (capture->hash * 33U) ^ message[i];
+    }
+    return RS_RET_OK;
+}
+
+static size_t tcps_sessFuzzNextChunk(const uint8_t chunk_control, uint32_t *const state, const size_t remaining) {
+    size_t chunk_size;
+
+    switch (chunk_control >> 6) {
+        case 0:
+            chunk_size = remaining;
+            break;
+        case 1:
+            chunk_size = 1;
+            break;
+        case 2:
+            chunk_size = 1U + (chunk_control & 0x3fU);
+            break;
+        default:
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            chunk_size = 1U + (*state & 0x3fU);
+            break;
+    }
+
+    return chunk_size < remaining ? chunk_size : remaining;
+}
+
+rsRetVal tcps_sessFuzzInit(void) {
+    DEFiRet;
+
+    if (tcps_sess_fuzz_initialized) FINALIZE;
+    if (runConf != NULL) ABORT_FINALIZE(RS_RET_ERR);
+
+    CHKiRet(objGetObjInterface(&obj));
+    CHKiRet(tcps_sessClassInit(NULL));
+    tcps_sess_fuzz_class_initialized = RSTRUE;
+    CHKiRet(rsconfConstruct(&runConf));
+    tcps_sess_fuzz_initialized = RSTRUE;
+
+finalize_it:
+    if (iRet != RS_RET_OK) {
+        if (runConf != NULL) rsconfDestruct(&runConf);
+        if (tcps_sess_fuzz_class_initialized) {
+            tcps_sessClassExit();
+            tcps_sess_fuzz_class_initialized = RSFALSE;
+        }
+    }
+    RETiRet;
+}
+
+void tcps_sessFuzzExit(void) {
+    if (!tcps_sess_fuzz_initialized) return;
+
+    if (runConf != NULL) rsconfDestruct(&runConf);
+    tcps_sessClassExit();
+    tcps_sess_fuzz_class_initialized = RSFALSE;
+    tcps_sess_fuzz_initialized = RSFALSE;
+}
+
+rsRetVal tcps_sessFuzzInput(const uint8_t *const data, const size_t size) {
+    static const int max_line_sizes[] = {32, 128, 512, 2048};
+    static const int additional_delimiters[] = {TCPSRV_NO_ADDTL_DELIMITER, 0, '|', '\r'};
+    static const uint64_t expansion_ratios[] = {0, 2, 8, 64};
+    static const uint64_t decompressed_limits[] = {64, 4096, 65536, 1048576};
+    static const uint64_t zstd_window_limits[] = {0, 65536, 262144, 2097152};
+    #ifdef FEATURE_REGEXP
+    static const char *const start_regexes[] = {
+        "^<[0-9]{1,3}>",
+        "^<[0-9]{1,3}>[A-Z][a-z][a-z] [ 0-9][0-9]",
+        "^BEGIN:",
+    };
+    #endif
+    tcps_sess_fuzz_capture_t capture = {0};
+    tcpLstnParams_t params = {0};
+    tcpLstnPortList_t listener = {0};
+    tcpsrv_t server = {0};
+    tcps_sess_t *session = NULL;
+    rsRetVal input_ret = RS_RET_OK;
+    sbool regex_initialized = RSFALSE;
+    sbool regex_active = RSFALSE;
+    sbool atomic_helpers_initialized = RSFALSE;
+    uint32_t chunk_state;
+    size_t offset;
+    size_t processed_bytes = 0;
+    DEFiRet;
+
+    if (!tcps_sess_fuzz_initialized || runConf == NULL) ABORT_FINALIZE(RS_RET_ERR);
+    if (size < 4) FINALIZE;
+
+    const uint8_t mode = data[0] & 0x03U;
+    const sbool use_regex = (data[0] & 0x04U) != 0;
+    const int max_line = max_line_sizes[data[1] & 0x03U];
+
+    runConf->globals.iMaxLine = max_line;
+    params.pszInputName = UCHAR_CONSTANT("fuzz-imtcp");
+    params.bSuppOctetFram = (data[0] & 0x08U) != 0;
+    params.bMultiLine = (data[0] & 0x10U) != 0;
+    params.bSPFramingFix = (data[0] & 0x80U) != 0;
+
+    server.pszOrigin = UCHAR_CONSTANT("fuzz-imtcp-session");
+    server.addtlFrameDelim = additional_delimiters[(data[1] >> 2) & 0x03U];
+    server.maxFrameSize = 200000;
+    server.bDisableLFDelim = (data[0] & 0x40U) != 0;
+    server.discardTruncatedMsg = (data[0] & 0x20U) != 0;
+
+    listener.cnf_params = &params;
+    listener.pSrv = &server;
+    listener.compressionMode = mode == 1 || mode == 2 ? TCPSRV_COMPRESS_STREAM_ALWAYS : TCPSRV_COMPRESS_NEVER;
+    listener.compressionDriver = mode == 2 ? TCPSRV_COMPRESS_DRIVER_ZSTD : TCPSRV_COMPRESS_DRIVER_ZLIB;
+    listener.compressionMaxExpansionRatio = expansion_ratios[(data[3] >> 1) & 0x03U];
+    listener.compressionMaxDecompressedBytesPerReceive = decompressed_limits[(data[3] >> 3) & 0x03U];
+    listener.compressionMaxTotalZstdWindowBytes = zstd_window_limits[(data[3] >> 5) & 0x03U];
+    INIT_ATOMIC_HELPER_MUT64(listener.mutCompressionZstdWindow);
+    atomic_helpers_initialized = RSTRUE;
+    STATSCOUNTER_INIT(listener.ctrSubmit, listener.mutCtrSubmit);
+    STATSCOUNTER_INIT(listener.ctrBytesRcvd, listener.mutCtrBytesRcvd);
+    STATSCOUNTER_INIT(listener.ctrBytesDecompressed, listener.mutCtrBytesDecompressed);
+    STATSCOUNTER_INIT(listener.ctrDecompressErr, listener.mutCtrDecompressErr);
+
+    #ifdef FEATURE_REGEXP
+    if (use_regex) {
+        const size_t regex_index = ((data[1] >> 4) & 0x03U) % (sizeof(start_regexes) / sizeof(start_regexes[0]));
+        const int regex_ret = regexp.regcomp(&listener.start_preg, start_regexes[regex_index], REG_EXTENDED);
+        if (regex_ret != 0) ABORT_FINALIZE(RS_RET_ERR);
+        listener.bHasStartRegex = RSTRUE;
+        regex_initialized = RSTRUE;
+        regex_active = RSTRUE;
+    }
+    #else
+    (void)use_regex;
+    #endif
+
+    CHKiRet(tcps_sessConstruct(&session));
+    session->pSrv = &server;
+    session->pLstnInfo = &listener;
+    session->bSuppOctetFram = params.bSuppOctetFram;
+    session->bSPFramingFix = params.bSPFramingFix;
+    session->compressionMode = listener.compressionMode;
+    session->compressionDriver = listener.compressionDriver;
+    session->compressionMaxExpansionRatio = listener.compressionMaxExpansionRatio;
+    session->compressionMaxDecompressedBytesPerReceive = listener.compressionMaxDecompressedBytesPerReceive;
+    session->compressionMaxTotalZstdWindowBytes = listener.compressionMaxTotalZstdWindowBytes;
+    session->tlsProbeDone = RSTRUE;
+    capture.max_message_size = regex_active ? (size_t)max_line * 2U : (size_t)max_line;
+    capture.hash = 5381U;
+    session->pUsr = &capture;
+    session->DoSubmitMessage = tcps_sessFuzzSubmit;
+    CHKiRet(tcps_sessConstructFinalize(session));
+
+    chunk_state = 0x9e3779b9U ^ data[2];
+    for (offset = 4; offset < size;) {
+        const size_t chunk_size = tcps_sessFuzzNextChunk(data[2], &chunk_state, size - offset);
+        input_ret = DataRcvd(session, (char *)data + offset, chunk_size);
+        processed_bytes += chunk_size;
+        offset += chunk_size;
+        if (input_ret != RS_RET_OK) break;
+    }
+
+    if ((data[3] & 0x01U) != 0 && input_ret == RS_RET_OK) input_ret = PrepareClose(session);
+    if (input_ret != RS_RET_OK && !session->compressedStreamFailed) ABORT_FINALIZE(input_ret);
+    if (capture.failed) ABORT_FINALIZE(RS_RET_ERR);
+
+    const size_t output_budget = session->compressionMode == TCPSRV_COMPRESS_STREAM_ALWAYS
+                                     ? (size_t)session->compressionTotalBytesOut
+                                     : processed_bytes;
+    if (capture.bytes > output_budget || capture.messages > output_budget) ABORT_FINALIZE(RS_RET_ERR);
+
+finalize_it:
+    if (session != NULL) tcps_sessDestruct(&session);
+    #ifdef FEATURE_REGEXP
+    if (regex_initialized) regexp.regfree(&listener.start_preg);
+    #endif
+    if (atomic_helpers_initialized) {
+        if (ATOMIC_LOAD_uint64(&listener.compressionZstdWindowBytesInUse, &listener.mutCompressionZstdWindow) != 0)
+            iRet = RS_RET_ERR;
+        DESTROY_ATOMIC_HELPER_MUT64(listener.mutCtrDecompressErr);
+        DESTROY_ATOMIC_HELPER_MUT64(listener.mutCtrBytesDecompressed);
+        DESTROY_ATOMIC_HELPER_MUT64(listener.mutCtrBytesRcvd);
+        DESTROY_ATOMIC_HELPER_MUT64(listener.mutCtrSubmit);
+        DESTROY_ATOMIC_HELPER_MUT64(listener.mutCompressionZstdWindow);
+    }
+    RETiRet;
+}
+#endif
 
 
 /* queryInterface function
@@ -880,8 +1423,9 @@ BEGINObjClassExit(tcps_sess, OBJ_IS_LOADABLE_MODULE) /* CHANGE class also in END
     objRelease(netstrm, LM_NETSTRMS_FILENAME);
     objRelease(datetime, CORE_COMPONENT);
     objRelease(prop, CORE_COMPONENT);
-    objRelease(parser, CORE_COMPONENT);
+#ifdef FEATURE_REGEXP
     objRelease(regexp, LM_REGEXP_FILENAME);
+#endif
 ENDObjClassExit(tcps_sess)
 
 
@@ -894,8 +1438,9 @@ BEGINObjClassInit(tcps_sess, 1, OBJ_IS_CORE_MODULE) /* class, version - CHANGE c
     CHKiRet(objUse(netstrm, LM_NETSTRMS_FILENAME));
     CHKiRet(objUse(datetime, CORE_COMPONENT));
     CHKiRet(objUse(prop, CORE_COMPONENT));
-    CHKiRet(objUse(parser, CORE_COMPONENT));
+#ifdef FEATURE_REGEXP
     CHKiRet(objUse(regexp, LM_REGEXP_FILENAME));
+#endif
 
     CHKiRet(objUse(glbl, CORE_COMPONENT));
     objRelease(glbl, CORE_COMPONENT);

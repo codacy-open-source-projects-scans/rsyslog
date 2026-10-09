@@ -48,6 +48,8 @@
 #include "stream.h"
 #include "statsobj.h"
 #include "cryprov.h"
+#include "queue_da.h"
+#include "segdisk_store.h"
 
 /* support for the toDelete list */
 typedef struct toDeleteLst_s toDeleteLst_t;
@@ -63,7 +65,8 @@ typedef enum {
     QUEUETYPE_FIXED_ARRAY = 0, /* a simple queue made out of a fixed (initially malloced) array fast but memoryhog */
     QUEUETYPE_LINKEDLIST = 1, /* linked list used as buffer, lower fixed memory overhead but slower */
     QUEUETYPE_DISK = 2, /* disk files used as buffer */
-    QUEUETYPE_DIRECT = 3 /* no queuing happens, consumer is directly called */
+    QUEUETYPE_DIRECT = 3, /* no queuing happens, consumer is directly called */
+    QUEUETYPE_SEGMENTED_DISK = 4 /* log-structured segmented disk queue */
 } queueType_t;
 
 /* queue recovery modes */
@@ -94,6 +97,7 @@ struct queue_s {
         queueType_t qType;
         int nLogDeq; /* number of elements currently logically dequeued */
         int bShutdownImmediate; /* should all workers cease processing messages? */
+        DEF_ATOMIC_HELPER_MUT(mutShutdownImmediate);
         sbool bEnqOnly; /* does queue run in enqueue-only mode (1) or not (0)? */
         sbool bSaveOnShutdown; /* persists everthing on shutdown (if DA!)? 1-yes, 0-no */
         sbool bQueueStarted; /* has queueStart() been called on this queue? 1-yes, 0-no */
@@ -104,7 +108,7 @@ struct queue_s {
         int iCurNumWrkThrd; /* current number of active worker threads */
         int iMinMsgsPerWrkr;
         /* minimum nbr of msgs per worker thread, if more, a new worker is started until max wrkrs */
-        wtp_t *pWtpDA;
+        wtp_t *pWtpDA; /* single-worker DA transfer pool, not the DA disk queue child consumer pool */
         wtp_t *pWtpReg;
         action_t *pAction; /* for action queues, ptr to action object; for main queues unused */
         int iUpdsSincePersist; /* nbr of queue updates since the last persist call */
@@ -151,6 +155,8 @@ struct queue_s {
         rsRetVal (*qAdd)(struct queue_s *pThis, smsg_t *pMsg);
         rsRetVal (*qDeq)(struct queue_s *pThis, smsg_t **ppMsg);
         rsRetVal (*qDel)(struct queue_s *pThis);
+        rsRetVal (*qDeqBatch)(struct queue_s *pThis, batch_t *batch, int max, int *skipped);
+        rsRetVal (*qCompleteBatch)(struct queue_s *pThis, batch_t *batch, int *committed, int *retried);
         /* end type-specific handler */
         /* public entry points (set during construction, permit to set best algorithm for params selected) */
         rsRetVal (*MultiEnq)(qqueue_t *pThis, multi_submit_t *pMultiSub);
@@ -180,6 +186,18 @@ struct queue_s {
         qDeqID deqIDAdd; /* next dequeue ID to use during add to queue store */
         qDeqID deqIDDel; /* queue store delete position */
         int bIsDA; /* is this queue disk assisted? */
+        qda_engine_mode_t diskQueueType; /* configured DA disk child selection */
+        qda_engine_mode_t effectiveDiskQueueType; /* selected DA disk child engine */
+        sbool diskQueueAutoUpgrade; /* move a drained auto-selected classic child to segmented */
+        int diskQueueIdleTimeout; /* segmented DA child idle dematerialization timeout */
+        sbool diskQueueTypeSet;
+        sbool diskQueueAutoUpgradeSet;
+        sbool diskQueueIdleTimeoutSet;
+        sbool segdiskLazyCreate; /* create a fresh segmented store on first append */
+        sbool segdiskDAChild; /* segmented child of an in-memory DA parent */
+        sbool daEngineMarkerPending; /* publish the selected DA engine before first append */
+        uint64_t daActivityGeneration; /* parent enqueue generation for the idle grace period */
+        uint64_t segdiskIdleObservedActivity;
         struct queue_s *pqDA; /* queue for disk-assisted modes */
         struct queue_s *pqParent; /* pointer to the parent (if this is a child queue) */
         int bDAEnqOnly; /* EnqOnly setting for DA queue */
@@ -207,6 +225,7 @@ struct queue_s {
                 int pendingCorruptRet; /* deferred dequeue-time corruption result to recover on next batch */
                 sbool runtimeCorruptionSkip; /* skipped messages in current batch due to runtime corruption */
             } disk;
+            segdisk_store_t *segdisk;
         } tVars;
         sbool useCryprov; /* quicker than checkig ptr (1 vs 8 bytes!) */
         uchar *cryprovName; /* crypto provider to use */
@@ -218,11 +237,35 @@ struct queue_s {
         /* for statistics subsystem */
         statsobj_t *statsobj;
         STATSCOUNTER_DEF(ctrEnqueued, mutCtrEnqueued)
+        STATSCOUNTER_DEF(ctrSizeEnqueued, mutCtrSizeEnqueued) /* cumulative bytes enqueued */
         STATSCOUNTER_DEF(ctrFull, mutCtrFull)
         STATSCOUNTER_DEF(ctrFDscrd, mutCtrFDscrd)
         STATSCOUNTER_DEF(ctrNFDscrd, mutCtrNFDscrd)
+        STATSCOUNTER_DEF(ctrMutexContention, mutCtrMutexContention)
+        STATSCOUNTER_DEF(ctrMutexWaitNs, mutCtrMutexWaitNs)
         int ctrMaxqsize; /* NOT guarded by a mutex */
+        int segdiskBytes;
+        int segdiskSegments;
+        int segdiskCheckpoints;
+        int segdiskReplayed;
+        int segdiskCorruptionEvents;
+        int segdiskCorruptionBytes;
+        int segdiskCorruptionRecords;
+        int segdiskRetryOverageBytes;
+        int segdiskRetryOverageMaxBytes;
+        int segdiskStateWrites;
+        int segdiskForcedStateWrites;
+        int segdiskRecoveryPending;
+        int segdiskRecoveryBytes;
+        int segdiskRecoveryRecords;
+        int segdiskStartupPayloadBytes;
+        int segdiskStartupSegmentFilesProbed;
+        int segdiskCorruptionSegments;
+        int segdiskMaterializations;
+        int segdiskDematerializations;
+        int segdiskIdleCleanupFailures;
         int iSmpInterval; /* line interval of sampling logs */
+        sbool bMutexContentionStats; /* opt-in mutex contention diagnostics */
         int isRunning;
 };
 
@@ -282,6 +325,8 @@ PROTOTYPEpropSetMeth(qqueue, iSmpInterval, int);
 
 #ifdef ENABLE_IMDIAG
 extern unsigned int iOverallQueueSize;
+rsRetVal qqueueSetSegDiskTestFault(qqueue_t *pThis, const char *point, unsigned int hit_count);
+rsRetVal qqueueClearSegDiskTestFault(qqueue_t *pThis);
 #endif
 
 #endif /* #ifndef QUEUE_H_INCLUDED */

@@ -1,13 +1,21 @@
 #!/bin/bash
-# Test HUP reloading of external rate limit policies
-# 1. Start with high limit (pass all)
-# 2. HUP to low limit (drop all)
+# Verify HUP reloading of an external input rate-limit policy: an initial high
+# burst passes all messages, then HUP reloads a zero-burst policy that drops
+# every subsequent message.  The oracle waits for rsyslog's policy-specific
+# reload confirmation rather than relying on a fixed delay, because the HUP
+# diagnostic handshake can time out before a slow or sanitizer-instrumented
+# worker has reloaded the policy.
 
 . ${srcdir:=.}/diag.sh init
 
 # Define ports and files
-export PORT_RCVR="$(get_free_port)"
-export POLICY_FILE="$(pwd)/test_policy_hup.yaml"
+export PORT_RCVR_FILE="${RSYSLOG_DYNNAME}.imudp_port"
+POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.test_policy_hup.yaml"
+export POLICY_FILE
+
+wait_for_policy_reload() {
+	wait_content "ratelimit: HUP reloaded policy 'hup_limiter'" "${RSYSLOG_DYNNAME}.started"
+}
 
 # Create initial policy (High limits)
 echo "interval: 1" > $POLICY_FILE
@@ -18,19 +26,21 @@ generate_conf
 add_conf '
 ratelimit(name="hup_limiter" policy="'$POLICY_FILE'")
 module(load="../plugins/imudp/.libs/imudp" batchSize="1")
-input(type="imudp" port="'$PORT_RCVR'" ratelimit.name="hup_limiter")
+input(type="imudp" address="127.0.0.1" port="0" listenPortFileName="'$PORT_RCVR_FILE'"
+      ratelimit.name="hup_limiter")
 
 template(name="outfmt" type="string" string="RECEIVED RAW: %rawmsg%\n")
 action(type="omfile" file="'$RSYSLOG_OUT_LOG'" template="outfmt")
 '
 startup
+assign_file_content PORT_RCVR "$PORT_RCVR_FILE"
 
 # Phase 1: High Limit (Burst 1000)
 # Send 20 messages. All should pass.
 export SENDMESSAGES=20
 echo "Checking ports for $PORT_RCVR:"
 ss -ulpn | grep $PORT_RCVR
-./tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
+tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
 
 # Allow time for processing
 ./msleep 3000
@@ -44,7 +54,7 @@ if [ $content_count -lt 20 ]; then
 fi
 
 # Reset log file for Phase 2 (clean slate)
-> $RSYSLOG_OUT_LOG
+: > "$RSYSLOG_OUT_LOG"
 
 # Phase 2: Restrictive Limit (Burst 0 - Drop All)
 echo "Updating policy..."
@@ -54,13 +64,12 @@ echo "severity: 0" >> $POLICY_FILE
 
 echo "Sending HUP..."
 issue_HUP
+wait_for_policy_reload
 echo "Checking rsyslog process:"
 ps aux | grep rsyslogd | grep -v grep
 
-./msleep 1000 # wait for HUP to be processed
-
 # Send 20 messages. 0 should pass.
-./tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
+tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
 
 # Allow time for processing
 ./msleep 1000

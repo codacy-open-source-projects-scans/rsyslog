@@ -249,8 +249,8 @@ static int find_first_json_object(wrkrInstanceData_t *pWrkrData,
             return (i >= len) ? 1 : 2; /* no JSON found or scan truncated */
         }
 
-        /* Try to parse JSON starting from this position */
-        size_t remaining = len - i;
+        /* Try to parse JSON starting from this position, bounded by scan window */
+        size_t remaining = scan_end - i;
         json_tokener_reset(pWrkrData->tokener);
 
         struct json_object *json = json_tokener_parse_ex(pWrkrData->tokener, (const char *)(msg + i), remaining);
@@ -259,8 +259,8 @@ static int find_first_json_object(wrkrInstanceData_t *pWrkrData,
             /* Valid JSON object found */
             size_t parsed_len = pWrkrData->tokener->char_offset;
 
-            /* Check for trailing data if allow_trailing is false */
-            if (!allow_trailing && parsed_len < remaining) {
+            /* Check full message for trailing data if allow_trailing is false */
+            if (!allow_trailing) {
                 size_t check_pos = i + parsed_len;
                 while (check_pos < len && isspace(msg[check_pos])) {
                     check_pos++;
@@ -295,16 +295,15 @@ static rsRetVal processJSON(wrkrInstanceData_t *pWrkrData, smsg_t *pMsg, struct 
 
     DBGPRINTF("mmjsonparse: processing already parsed JSON object\n");
 
-    /* JSON is already parsed and validated, just add it to the message */
-    CHKiRet(msgAddJSON(pMsg, pWrkrData->pData->container, json, 0, 0));
-    /* Note: msgAddJSON takes ownership of the json object on success,
-     * but we need to clean up on failure */
+    /* JSON is already parsed and validated, just add it to the message.
+     * msgAddJSON assumes ownership of json and may release it on both
+     * success and error paths, so do not access json after this call.
+     */
+    iRet = msgAddJSON(pMsg, pWrkrData->pData->container, json, 0, 0);
+    json = NULL; /* msgAddJSON takes ownership, including on its error paths. */
+    CHKiRet(iRet);
 
 finalize_it:
-    if (iRet != RS_RET_OK) {
-        /* msgAddJSON failed, we need to clean up the JSON object */
-        json_object_put(json);
-    }
     RETiRet;
 }
 
@@ -467,11 +466,11 @@ BEGINnewActInst
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "cookie")) {
             free(pData->cookie);
-            pData->cookie = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->cookie = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "container")) {
             free(pData->container);
             size_t lenvar = es_strlen(pvals[i].val.d.estr);
-            pData->container = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->container = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             if (pData->container[0] == '$') {
                 /* pre 8.35, the container name needed to be specified without
                  * the leading $. This was confusing, so we now require a full

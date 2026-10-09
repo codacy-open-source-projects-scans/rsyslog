@@ -59,7 +59,7 @@ MODULE_CNFNAME("ompgsql")
 DEF_OMOD_STATIC_DATA;
 
 typedef struct _instanceData {
-    char srv[MAXHOSTNAMELEN + 1]; /* IP or hostname of DB server*/
+    char *srv; /* IP or hostname of DB server*/
     char dbname[_DB_MAXDBLEN + 1]; /* DB name */
     char user[_DB_MAXUNAMELEN + 1]; /* DB user */
     char pass[_DB_MAXPWDLEN + 1]; /* DB user's password */
@@ -126,6 +126,7 @@ static void closePgSQL(wrkrInstanceData_t *pWrkrData) {
 
 BEGINfreeInstance
     CODESTARTfreeInstance;
+    free(pData->srv);
     free(pData->tpl);
 ENDfreeInstance
 
@@ -235,7 +236,8 @@ static int tryExec(uchar *pszCmd, wrkrInstanceData_t *pWrkrData) {
     execState = PQresultStatus(pgRet);
     if (execState != PGRES_COMMAND_OK && execState != PGRES_TUPLES_OK) {
         // complain a lot in case any issues with DB communication
-        LogError(0, execState, "postgres query execution failed: %s", PQresStatus(PQresultStatus(pgRet)));
+        LogError(0, execState, "postgres query execution failed: %s: %s", PQresStatus(execState),
+                 PQresultErrorMessage(pgRet));
         bHadError = 1;
     }
     PQclear(pgRet);
@@ -355,6 +357,7 @@ ENDcommitTransaction
 
 
 static inline void setInstParamDefaults(instanceData *pData) {
+    pData->srv = NULL;
     pData->tpl = NULL;
     pData->multi_row = 100;
     pData->trans_commit = 100;
@@ -380,17 +383,8 @@ BEGINnewActInst
     CODE_STD_STRING_REQUESTparseSelectorAct(1) for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "server")) {
-            cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
-            len = es_strlen(pvals[i].val.d.estr);
-            if (len >= sizeof(pData->srv) - 1) {
-                parser_errmsg(
-                    "ompgsql: srv parameter longer than supported "
-                    "maximum of %d characters",
-                    (int)sizeof(pData->srv) - 1);
-                ABORT_FINALIZE(RS_RET_PARAM_ERROR);
-            }
-            memcpy(pData->srv, cstr, len + 1);
-            free(cstr);
+            free(pData->srv);
+            CHKmalloc(pData->srv = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "port")) {
             pData->port = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "serverport")) {
@@ -438,7 +432,7 @@ BEGINnewActInst
             memcpy(pData->pass, cstr, len + 1);
             free(cstr);
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tpl = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tpl = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "conninfo")) {
             cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
             len = es_strlen(pvals[i].val.d.estr);
@@ -459,7 +453,7 @@ BEGINnewActInst
         }
     }
 
-    if (strlen(pData->conninfo) == 0 && (strlen(pData->srv) == 0 || strlen(pData->dbname) == 0)) {
+    if (strlen(pData->conninfo) == 0 && (pData->srv == NULL || pData->srv[0] == '\0' || strlen(pData->dbname) == 0)) {
         parser_errmsg("ompgsql: must provide conninfo or server and dbname");
         ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
     }
@@ -476,6 +470,7 @@ ENDnewActInst
 
 BEGINparseSelectorAct
     int iPgSQLPropErr = 0;
+    char srv[MAXHOSTNAMELEN + 1] = "";
     CODESTARTparseSelectorAct;
     CODE_STD_STRING_REQUESTparseSelectorAct(1)
         /* first check if this config line is actually for us
@@ -500,9 +495,12 @@ BEGINparseSelectorAct
      * Now we read the PgSQL connection properties
      * and verify that the properties are valid.
      */
-    if (getSubString(&p, pData->srv, MAXHOSTNAMELEN + 1, ',')) iPgSQLPropErr++;
+    if (getSubString(&p, srv, sizeof(srv), ',')) iPgSQLPropErr++;
     dbgprintf("%p:%s\n", p, p);
-    if (*pData->srv == '\0') iPgSQLPropErr++;
+    if (srv[0] == '\0')
+        iPgSQLPropErr++;
+    else
+        CHKmalloc(pData->srv = strdup(srv));
     if (getSubString(&p, pData->dbname, _DB_MAXDBLEN + 1, ',')) iPgSQLPropErr++;
     if (*pData->dbname == '\0') iPgSQLPropErr++;
     if (getSubString(&p, pData->user, _DB_MAXUNAMELEN + 1, ',')) iPgSQLPropErr++;

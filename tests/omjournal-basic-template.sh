@@ -8,14 +8,14 @@ add_conf '
 module(load="../plugins/imtcp/.libs/imtcp")
 module(load="../plugins/omjournal/.libs/omjournal")
 
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 template(name="outfmt" type="string" string="%msg%")
 action(type="omjournal" template="outfmt")
 '
 
 # we generate a cookie so that we can find our record in journal
-COOKIE=`date`
+COOKIE=$(date)
 echo "COOKIE: $COOKIE"
 startup
 tcpflood -m1 -M "\"<133>2011-03-01T11:22:12Z host tag msgh RsysLoG-TESTBENCH $COOKIE\""

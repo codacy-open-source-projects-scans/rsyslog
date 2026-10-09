@@ -1,8 +1,9 @@
+# shellcheck shell=bash
 # RPM build configuration for rsyslog packaging/rpm/
 # Sourced by build-rpms.sh and other scripts.
 
 ARCHOPTIONS="i386 x86_64"
-PLATOPTIONS="epel-8 epel-9 rhel-8 rhel-9"
+PLATOPTIONS="epel-8 epel-9 epel-10 rhel-8 rhel-9 rhel-10"
 
 szBaseDir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 szRpmBaseDir="$szBaseDir/rpmbuild"

@@ -121,14 +121,18 @@ syslog message, you have probably created a table "syslog" with a single
 column "message". In such a case, a Rainerscript list template might look
 like this:
 
+.. rsyslog-doc-sample: validate-config
+   :append: action(type="omfile" file="/dev/null" template="sqlInsertMessage")
+
 .. code-block:: rsyslog
 
    template(
        name="sqlInsertMessage"
        type="list"
+       option.sql="on"
    ) {
        constant(value="insert into syslog(message) values ('")
-       property(name="msg" sql="on")
+       property(name="msg")
        constant(value="')")
    }
 

@@ -63,6 +63,7 @@ PRAGMA_DIAGNOSTIC_POP;
 #include "cfsysline.h"
 #include "parserif.h"
 #include "unicode-helper.h"
+#include "ommongodb_date.h"
 
 MODULE_TYPE_OUTPUT;
 MODULE_TYPE_NOKEEP;
@@ -406,16 +407,9 @@ static int BSONAppendJSONObject(bson_t *doc, const char *name, struct json_objec
         case json_type_string: {
             /* Convert text to ISODATE when needed */
             if (strncmp(name, "date", 5) == 0 || strncmp(name, "time", 5) == 0) {
-                struct tm tm;
                 const char *datestr = json_object_get_string(json);
-                if (strptime(datestr, "%Y-%m-%dT%H:%M:%S:%Z", &tm) != NULL ||
-                    strptime(datestr, "%Y-%m-%dT%H:%M:%S%Z", &tm) != NULL ||
-                    strptime(datestr, "%Y-%m-%dT%H:%M:%SZ", &tm) != NULL) {
-                    tm.tm_isdst = -1;
-                    time_t epoch;
-                    int64 ts;
-                    epoch = mktime(&tm);
-                    ts = 1000 * (int64)epoch;
+                int64_t ts;
+                if (ommongodbParseIsoDateMs(datestr, &ts)) {
                     return BSON_APPEND_DATE_TIME(doc, name, ts);
                 } else {
                     DBGPRINTF("Unknown date format of field '%s' : '%s' \n", name, datestr);
@@ -443,16 +437,14 @@ static int BSONAppendExtendedJSON(bson_t *doc, const char *name, struct json_obj
     if (!json_object_iter_equal(&it, &itEnd)) {
         const char *const key = json_object_iter_peek_name(&it);
         if (strcmp(key, "$date") == 0) {
-            struct tm tm;
-            int64 ts;
+            int64_t ts;
             struct json_object *val;
 
             val = json_object_iter_peek_value(&it);
             DBGPRINTF("ommongodb: extended json date detected %s", json_object_get_string(val));
-            tm.tm_isdst = -1;
-            strptime(json_object_get_string(val), "%Y-%m-%dT%H:%M:%S%z", &tm);
-            ts = 1000 * (int64)mktime(&tm);
-            return BSON_APPEND_DATE_TIME(doc, name, ts);
+            if (ommongodbParseIsoDateMs(json_object_get_string(val), &ts)) {
+                return BSON_APPEND_DATE_TIME(doc, name, ts);
+            }
         }
     }
     return FALSE;
@@ -596,25 +588,25 @@ BEGINnewActInst
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "uristr")) {
-            pData->uristr = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->uristr = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "server")) {
-            pData->server = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->server = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "serverport")) {
-            pData->port = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->port = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "db")) {
-            pData->db = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->db = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "collection")) {
-            pData->collection_name = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->collection_name = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "ssl_ca")) {
-            pData->ssl_ca = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->ssl_ca = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "ssl_cert")) {
-            pData->ssl_cert = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->ssl_cert = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "uid")) {
-            pData->uid = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->uid = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "pwd")) {
-            pData->pwd = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->pwd = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "allowed_error_codes")) {
             const int maxerrcodes = sizeof(pData->allowed_error_codes) / sizeof(uint32_t);
             pData->allowed_error_codes_nbr = pvals[i].val.d.ar->nmemb;

@@ -9,11 +9,11 @@ add_conf '
 template(name="outfmt" type="string" string="*Number is %$.number%*\n")
 
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")'
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")'
 add_conf "
 set \$.number = re_extract(\$msg, '.* ([0-9]+)$', 0, 1, 'none');"
 add_conf '
-action(type="omfile" file=`echo $RSYSLOG_OUT_LOG` template="outfmt")
+action(type="omfile" file="'$RSYSLOG_OUT_LOG'" template="outfmt")
 '
 startup
 tcpflood -m 1 -I $srcdir/testsuites/date_time_msg

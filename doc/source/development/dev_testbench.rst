@@ -66,8 +66,8 @@ How It Works
    conflict with the test's own ``modules:`` section.
 
 2. Tests add their own sections with ``add_yaml_conf``.
-3. Tests must call ``add_yaml_imdiag_input`` inside their ``inputs:`` section
-   so that startup detection works.
+3. imdiag startup detection is already configured by ``generate_conf
+   --yaml-only`` through module-scoped testbench parameters.
 
 Helper Functions
 ~~~~~~~~~~~~~~~~
@@ -79,8 +79,9 @@ Helper Functions
   Append a YAML fragment to ``${TESTCONF_NM}[instance].yaml``.
 
 ``add_yaml_imdiag_input [instance]``
-  Append the imdiag ``inputs:`` entry inside an already-opened ``inputs:``
-  block. **Required** in every yaml-only test for startup detection.
+  Historical compatibility helper. It no longer appends YAML because imdiag is
+  configured by ``generate_conf --yaml-only`` as a module-scoped testbench
+  listener.
 
 Startup detection
 ~~~~~~~~~~~~~~~~~
@@ -89,6 +90,75 @@ Both RainerScript and yaml-only modes use the imdiag port file
 (``${RSYSLOG_DYNNAME}.imdiag[instance].port``) as the sole startup signal.
 ``wait_startup`` polls for this file and fast-fails if rsyslogd exits before
 it appears. No ``.started`` marker file is used.
+
+Proper termination detection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Daemonized tests cannot rely on shell ``wait`` to observe the real rsyslogd
+exit status because the original child exits after forking the daemon. Regular
+``generate_conf`` tests configure imdiag's ``properTerminationFile`` parameter
+automatically from the per-test ``RSYSLOG_DYNNAME`` basename and instance
+suffix. The path is stored in rsyslog core and written as the final action
+before returning from ``main``. ``wait_shutdown`` validates the marker when one
+is configured and the shutdown was initiated through harness helpers that saved
+the rsyslogd pid, so regular shutdown or crash-sensitive tests should use the
+standard ``shutdown_when_empty`` or ``shutdown_immediate`` path instead of
+adding test-local shutdown observers. Use ``set_proper_termination_file`` only
+for special manual-startup or non-generated-config cases, and call
+``check_proper_termination`` directly only when that special path cannot use
+``wait_shutdown``.
+Tests that intentionally kill rsyslogd to create dirty on-disk state must use
+the testbench kill helper so the next ``wait_shutdown`` knows that no clean
+main-return marker is expected for that phase.
+A timeoutGuard abort writes the same file before aborting with
+``status=error`` and ``reason=timeoutGuard``. The harness prints marker content
+before failing so diagnostics such as ``queue.overall.size`` survive in the test
+log.
+
+The shell ``tcpflood`` helper configures a per-invocation proper termination
+marker as well. ``tcpflood`` writes that marker as its final normal action, and
+the wrapper validates it after a zero exit status. Direct ``./tcpflood``
+invocations can opt in with ``-q <file>`` when tcpflood completion is part of
+the test oracle; the option stays single-character for portability to platforms
+without GNU-style long options.
+Tests that intentionally provoke a tcpflood send failure should use the
+``tcpflood --check-only`` wrapper form and assert the rsyslog-side oracle.
+Background tcpflood clients that are expected to finish normally should use
+``start_tcpflood_async`` and ``wait_tcpflood_async``. These helpers preserve the
+intended concurrency while still checking the helper pid status and
+proper-termination marker.
+
+Do not add helper cleanup or observer processes to prove daemon shutdown. They
+have historically caused their own races. ``timeoutGuard`` remains mandatory
+hang protection and must preserve this diagnostic marker behavior when it
+terminates rsyslogd.
+
+Core dump diagnostics
+~~~~~~~~~~~~~~~~~~~~~
+
+Core files are best-effort diagnostics, not the shutdown oracle. The testbench
+tries to enable core files with ``ulimit -c unlimited`` and reports the active
+core policy when a test fails. On Linux this includes ``kernel.core_pattern``,
+``kernel.core_uses_pid``, and ``fs.suid_dumpable`` when those files are
+readable.
+
+Generic core names such as ``core`` and ``core.*`` are not reliable ownership
+evidence under parallel tests. The harness analyzes a core only when it can
+attribute it to the expected process by pid/executable metadata, or when the
+filename is clearly test-specific through ``RSYSLOG_DYNNAME``. If
+``kernel.core_pattern`` pipes crashes to an external collector such as
+``systemd-coredump`` or ``apport``, generic local core scanning is skipped
+because local files may be absent, stale, or unrelated.
+
+Absence of a local core does not weaken a missing or invalid proper termination
+marker: the process still failed to reach the expected shutdown point. In that
+case the harness reports that no owned local core was available. Helper
+processes such as ``tcpflood`` need explicit pid or exit-status checks when
+their health matters; rsyslogd core diagnostics do not prove helper health.
+Use the standard ``tcpflood`` shell helper, or pass ``-q <file>`` to direct
+``./tcpflood`` invocations, when tcpflood completion itself matters.
+Valgrind ``vgcore.*`` files are separate from generic OS core discovery: they
+belong to the supervised Valgrind run and remain a Valgrind failure signal.
 
 Queue and Input Timeouts
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -164,7 +234,6 @@ Example Test
    add_yaml_conf '    string: "%msg:F,58:2%\n"'
    add_yaml_conf ''
    add_yaml_conf 'inputs:'
-   add_yaml_imdiag_input   # required -- provides startup detection
    add_yaml_conf "  - type: imtcp"
    add_yaml_conf '    port: "0"'
    add_yaml_conf "    listenPortFileName: \"${RSYSLOG_DYNNAME}.tcpflood_port\""
@@ -188,4 +257,3 @@ Naming and Registration
 Name yaml-only tests ``yaml-<area>-yamlonly.sh`` (or append ``-yamlonly`` to
 an existing test name). Register them in ``tests/Makefile.am`` under
 ``TESTS_LIBYAML`` so they are skipped on systems without libyaml.
-

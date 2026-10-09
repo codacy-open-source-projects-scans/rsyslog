@@ -120,6 +120,10 @@ Action Parameters
      - .. include:: ../../reference/parameters/mmkubernetes-kubernetesurl.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-mmkubernetes-includenamespacemetadata`
+     - .. include:: ../../reference/parameters/mmkubernetes-includenamespacemetadata.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
    * - :ref:`param-mmkubernetes-skipverifyhost`
      - .. include:: ../../reference/parameters/mmkubernetes-skipverifyhost.rst
         :start-after: .. summary-start
@@ -152,6 +156,10 @@ Action Parameters
      - .. include:: ../../reference/parameters/mmkubernetes-tokenfile.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-mmkubernetes-tokenreloadinterval`
+     - .. include:: ../../reference/parameters/mmkubernetes-tokenreloadinterval.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
 
 .. toctree::
    :hidden:
@@ -169,6 +177,7 @@ Action Parameters
    ../../reference/parameters/mmkubernetes-filenamerulebase
    ../../reference/parameters/mmkubernetes-filenamerules
    ../../reference/parameters/mmkubernetes-kubernetesurl
+   ../../reference/parameters/mmkubernetes-includenamespacemetadata
    ../../reference/parameters/mmkubernetes-skipverifyhost
    ../../reference/parameters/mmkubernetes-srcmetadatapath
    ../../reference/parameters/mmkubernetes-sslpartialchain
@@ -177,6 +186,7 @@ Action Parameters
    ../../reference/parameters/mmkubernetes-tls-myprivkey
    ../../reference/parameters/mmkubernetes-token
    ../../reference/parameters/mmkubernetes-tokenfile
+   ../../reference/parameters/mmkubernetes-tokenreloadinterval
 
 .. _mmkubernetes-statistic-counter:
 

@@ -57,6 +57,7 @@
     #include <sys/port.h>
 #endif
 #include "rsyslog.h" /* error codes etc... */
+#include "rsconf.h"
 #include "dirty.h"
 #include "cfsysline.h" /* access to config file objects */
 #include "module-template.h" /* generic module interface code - very important, read it! */
@@ -106,6 +107,7 @@ DEF_IMOD_STATIC_DATA /* must be present, starts static data */
                                   const size_t outlen); /* see siphash.c */
 
 static int bLegacyCnfModGlobalsPermitted; /* are legacy module-global config parameters permitted? */
+static sbool havePendingDeletes = 0; /* set when files await deferred deletion after FILE_DELETE_DELAY */
 
 #define NUM_MULTISUB 1024 /* default max number of submits */
 #define DFLT_PollInterval 10
@@ -219,6 +221,7 @@ struct act_obj_s {
     int fd; /* fd to file in order to obtain file_id (needs to be preserved across move) */
     strm_t *pStrm; /* its stream (NULL if not assigned) */
     int nRecords; /**< How many records did we process before persisting the stream? */
+    uint64_t lineNum; /* 1-based line/record number used for metadata */
     ratelimit_t *ratelimiter;
     multi_submit_t multiSub;
     int is_symlink;
@@ -336,6 +339,8 @@ static modConfData_t *currModConf = NULL; /* modConf ptr to CURRENT mod conf (ru
 
 
 #ifdef HAVE_INOTIFY_INIT
+enum { IN_FILE_UPDATE_EVENTS = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE };
+
 /* We need to map watch descriptors to our actual objects. Unfortunately, the
  * inotify API does not provide us with any cookie, so a simple O(1) algorithm
  * cannot be done (what a shame...). We assume that maintaining the array is much
@@ -590,9 +595,9 @@ static int in_setupWatch(act_obj_t *const act, const int is_file) {
         goto done;
     }
 
-    wd =
-        inotify_add_watch(ino_fd, act->name,
-                          (is_file) ? IN_MODIFY | IN_DONT_FOLLOW : IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+    wd = inotify_add_watch(ino_fd, act->name,
+                           (is_file) ? IN_FILE_UPDATE_EVENTS | IN_MOVE_SELF | IN_DELETE_SELF | IN_DONT_FOLLOW
+                                     : IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
     if (wd < 0) {
         if (errno == EACCES) { /* There is high probability of selinux denial on top-level paths */
             DBGPRINTF("imfile: permission denied when adding watch for '%s'\n", act->name);
@@ -970,6 +975,7 @@ static void detect_updates(fs_edge_t *const edge) {
                         "detect_updates obj gone away, keep '%s' "
                         "open: %" PRId64 "/%" PRId64 "/%" PRId64 "s!\n",
                         act_name, (int64_t)act->time_to_delete, (int64_t)ttNow, (int64_t)ttNow - act->time_to_delete);
+                    havePendingDeletes = 1;
                     pollFile(act);
                 }
                 break;
@@ -1565,64 +1571,109 @@ finalize_it:
  * not freed - this must be done by the caller.
  */
 #define MAX_OFFSET_REPRESENTATION_NUM_BYTES 20
+#define MAX_LINENUM_REPRESENTATION_NUM_BYTES 20
 static rsRetVal ATTR_NONNULL(1, 2)
-    enqLine(act_obj_t *const act, cstr_t *const __restrict__ cstrLine, const int64 strtOffs) {
+    enqLine(act_obj_t *const act, cstr_t *const __restrict__ cstrLine, const int64 strtOffs, const uint64_t lineNum) {
     DEFiRet;
-    const instanceConf_t *const inst = act->edge->instarr[0];  // TODO: same file, multiple instances?
-    smsg_t *pMsg;
     uchar file_offset[MAX_OFFSET_REPRESENTATION_NUM_BYTES + 1];
-    const uchar *metadata_names[2] = {(uchar *)"filename", (uchar *)"fileoffset"};
-    const uchar *metadata_values[2];
+    uchar line_number[MAX_LINENUM_REPRESENTATION_NUM_BYTES + 1];
+    const uchar *metadata_names[3] = {(uchar *)"filename", (uchar *)"fileoffset", (uchar *)"line_number"};
+    const uchar *metadata_values[3];
     const size_t msgLen = cstrLen(cstrLine);
+    smsg_t **msgs = NULL;
+    int lenBuf;
 
     if (msgLen == 0) {
         /* we do not process empty lines */
         FINALIZE;
     }
 
-    CHKiRet(msgConstruct(&pMsg));
-    MsgSetFlowControlType(pMsg, eFLOWCTL_FULL_DELAY);
-    MsgSetInputName(pMsg, pInputName);
-    if (inst->addCeeTag) {
-        /* Make sure we account for terminating null byte */
-        size_t ceeMsgSize = msgLen + CONST_LEN_CEE_COOKIE + 1;
-        char *ceeMsg;
-        CHKmalloc(ceeMsg = malloc(ceeMsgSize));
-        memcpy(ceeMsg, CONST_CEE_COOKIE, CONST_LEN_CEE_COOKIE);
-        memcpy(ceeMsg + CONST_LEN_CEE_COOKIE, rsCStrGetSzStrNoNULL(cstrLine), msgLen + 1);
-        MsgSetRawMsg(pMsg, ceeMsg, ceeMsgSize);
-        free(ceeMsg);
-    } else {
-        MsgSetRawMsg(pMsg, (char *)rsCStrGetSzStrNoNULL(cstrLine), msgLen);
-    }
-    MsgSetMSGoffs(pMsg, 0); /* we do not have a header... */
-    MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
-    MsgSetTAG(pMsg, inst->pszTag, inst->lenTag);
-    msgSetPRI(pMsg, inst->iFacility | inst->iSeverity);
-    MsgSetRuleset(pMsg, inst->pBindRuleset);
-    if (inst->addMetadata) {
-        if (act->source_name) {
-            metadata_values[0] = (const uchar *)act->source_name;
+    CHKmalloc(msgs = calloc(act->edge->ninst, sizeof(smsg_t *)));
+
+    for (int inst_idx = 0; inst_idx < act->edge->ninst; ++inst_idx) {
+        const instanceConf_t *const inst = act->edge->instarr[inst_idx];
+
+        CHKiRet(msgConstruct(&msgs[inst_idx]));
+        MsgSetFlowControlType(msgs[inst_idx], eFLOWCTL_FULL_DELAY);
+        MsgSetInputName(msgs[inst_idx], pInputName);
+        if (inst->addCeeTag) {
+            /* Make sure we account for terminating null byte */
+            size_t ceeMsgSize = msgLen + CONST_LEN_CEE_COOKIE + 1;
+            char *ceeMsg;
+            CHKmalloc(ceeMsg = malloc(ceeMsgSize));
+            memcpy(ceeMsg, CONST_CEE_COOKIE, CONST_LEN_CEE_COOKIE);
+            memcpy(ceeMsg + CONST_LEN_CEE_COOKIE, rsCStrGetSzStrNoNULL(cstrLine), msgLen + 1);
+            MsgSetRawMsg(msgs[inst_idx], ceeMsg, ceeMsgSize);
+            free(ceeMsg);
         } else {
-            metadata_values[0] = (const uchar *)act->name;
+            MsgSetRawMsg(msgs[inst_idx], (char *)rsCStrGetSzStrNoNULL(cstrLine), msgLen);
         }
-        snprintf((char *)file_offset, MAX_OFFSET_REPRESENTATION_NUM_BYTES + 1, "%lld", strtOffs);
-        metadata_values[1] = file_offset;
-        msgAddMultiMetadata(pMsg, metadata_names, metadata_values, 2);
+        MsgSetMSGoffs(msgs[inst_idx], 0); /* we do not have a header... */
+        MsgSetHOSTNAME(msgs[inst_idx], glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+        MsgSetTAG(msgs[inst_idx], inst->pszTag, inst->lenTag);
+        msgSetPRI(msgs[inst_idx], inst->iFacility | inst->iSeverity);
+        MsgSetRuleset(msgs[inst_idx], inst->pBindRuleset);
+        if (inst->addMetadata) {
+            if (act->source_name) {
+                metadata_values[0] = (const uchar *)act->source_name;
+            } else {
+                metadata_values[0] = (const uchar *)act->name;
+            }
+            lenBuf = snprintf((char *)file_offset, sizeof(file_offset), "%lld", strtOffs);
+            if (lenBuf < 0) {
+                ABORT_FINALIZE(RS_RET_ERR);
+            }
+            file_offset[MAX_OFFSET_REPRESENTATION_NUM_BYTES] = '\0';
+            metadata_values[1] = file_offset;
+            lenBuf = snprintf((char *)line_number, sizeof(line_number), "%llu", (unsigned long long)lineNum);
+            if (lenBuf < 0) {
+                ABORT_FINALIZE(RS_RET_ERR);
+            }
+            line_number[MAX_LINENUM_REPRESENTATION_NUM_BYTES] = '\0';
+            metadata_values[2] = line_number;
+            msgAddMultiMetadata(msgs[inst_idx], metadata_names, metadata_values, 3);
+        }
+
+        msgs[inst_idx]->msgFlags = msgs[inst_idx]->msgFlags | inst->msgFlag;
     }
 
-    if (inst->perMinuteRateLimits.maxBytesPerMinute || inst->perMinuteRateLimits.maxLinesPerMinute) {
-        CHKiRet(checkPerMinuteRateLimits((per_minute_rate_limit_t *)&inst->perMinuteRateLimits, msgLen));
+    for (int inst_idx = 0; inst_idx < act->edge->ninst; ++inst_idx) {
+        const instanceConf_t *const inst = act->edge->instarr[inst_idx];
+
+        if (inst->perMinuteRateLimits.maxBytesPerMinute || inst->perMinuteRateLimits.maxLinesPerMinute) {
+            const rsRetVal localRet =
+                checkPerMinuteRateLimits((per_minute_rate_limit_t *)&inst->perMinuteRateLimits, msgLen);
+            if (localRet == RS_RET_RATE_LIMITED && act->edge->ninst > 1) {
+                msgDestruct(&msgs[inst_idx]);
+                continue;
+            } else if (localRet != RS_RET_OK) {
+                if (inst->delay_perMsg) {
+                    srSleep(inst->delay_perMsg / 1000000, inst->delay_perMsg % 1000000);
+                }
+                ABORT_FINALIZE(localRet);
+            }
+        }
+
+        if (inst->delay_perMsg) {
+            srSleep(inst->delay_perMsg / 1000000, inst->delay_perMsg % 1000000);
+        }
     }
 
-    if (inst->delay_perMsg) {
-        srSleep(inst->delay_perMsg % 1000000, inst->delay_perMsg / 1000000);
+    for (int inst_idx = 0; inst_idx < act->edge->ninst; ++inst_idx) {
+        if (msgs[inst_idx] != NULL) {
+            ratelimitAddMsg(act->ratelimiter, &act->multiSub, msgs[inst_idx]);
+            msgs[inst_idx] = NULL;
+        }
     }
-
-    pMsg->msgFlags = pMsg->msgFlags | inst->msgFlag;
-
-    ratelimitAddMsg(act->ratelimiter, &act->multiSub, pMsg);
 finalize_it:
+    if (msgs != NULL) {
+        for (int inst_idx = 0; inst_idx < act->edge->ninst; ++inst_idx) {
+            if (msgs[inst_idx] != NULL) {
+                msgDestruct(&msgs[inst_idx]);
+            }
+        }
+    }
+    free(msgs);
     RETiRet;
 }
 /* try to open a file which has a state file. If the state file does not
@@ -1704,6 +1755,15 @@ static rsRetVal ATTR_NONNULL(1) openFileWithStateFile(act_obj_t *const act) {
                       saved_gen, act->inode_gen);
             ABORT_FINALIZE(RS_RET_ERR);
         }
+    }
+
+    fjson_object_object_get_ex(json, "line_number", &jval);
+    if (jval != NULL) {
+        if (!fjson_object_is_type(jval, fjson_type_int)) {
+            LogError(0, RS_RET_ERR, "imfile: invalid line_number in state file for '%s'", act->name);
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
+        act->lineNum = (uint64_t)fjson_object_get_int64(jval);
     }
 
     fjson_object_object_get_ex(json, "prev_line_segment", &jval);
@@ -1861,6 +1921,7 @@ static rsRetVal ATTR_NONNULL() pollFileReal(act_obj_t *act, cstr_t **pCStr) {
             startOffs = act->pStrm->iCurrOffs; /* disable check */
         }
         runModConf->bHadFileData = 1; /* this is just a flag, so set it and forget it */
+        ++act->lineNum;
         /* account bytes and lines processed for this file */
         if (act->pStrm != NULL) {
             int64_t endOffs = act->pStrm->iCurrOffs;
@@ -1869,7 +1930,7 @@ static rsRetVal ATTR_NONNULL() pollFileReal(act_obj_t *act, cstr_t **pCStr) {
             }
             STATSCOUNTER_INC(act->linesProcessed, act->mutLinesProcessed);
         }
-        CHKiRet(enqLine(act, *pCStr, strtOffs)); /* process line */
+        CHKiRet(enqLine(act, *pCStr, strtOffs, act->lineNum)); /* process line */
         rsCStrDestruct(pCStr); /* discard string (must be done by us!) */
         if (inst->iPersistStateInterval > 0 && ++act->nRecords >= inst->iPersistStateInterval) {
             persistStrmState(act);
@@ -2040,6 +2101,55 @@ static rsRetVal ATTR_NONNULL() checkInstance(instanceConf_t *const inst) {
     }
 finalize_it:
     RETiRet;
+}
+
+static int imfileOptStrEq(const uchar *const a, const uchar *const b) {
+    if (a == NULL || b == NULL) {
+        return a == b;
+    }
+    return !strcmp((const char *)a, (const char *)b);
+}
+
+
+static int imfileInstancesEquivalent(const instanceConf_t *const a, const instanceConf_t *const b) {
+    return imfileOptStrEq(a->pszFileName, b->pszFileName) && imfileOptStrEq(a->pszTag, b->pszTag) &&
+           imfileOptStrEq(a->pszStateFile, b->pszStateFile) && imfileOptStrEq(a->pszBindRuleset, b->pszBindRuleset) &&
+           a->nMultiSub == b->nMultiSub &&
+           a->perMinuteRateLimits.maxBytesPerMinute == b->perMinuteRateLimits.maxBytesPerMinute &&
+           a->perMinuteRateLimits.maxLinesPerMinute == b->perMinuteRateLimits.maxLinesPerMinute &&
+           a->iPersistStateInterval == b->iPersistStateInterval &&
+           a->bPersistStateAfterSubmission == b->bPersistStateAfterSubmission && a->iFacility == b->iFacility &&
+           a->iSeverity == b->iSeverity && a->readTimeout == b->readTimeout && a->delay_perMsg == b->delay_perMsg &&
+           a->bRMStateOnDel == b->bRMStateOnDel && a->bRMStateOnMove == b->bRMStateOnMove &&
+           a->readMode == b->readMode && imfileOptStrEq(a->startRegex, b->startRegex) &&
+           imfileOptStrEq(a->endRegex, b->endRegex) && a->discardTruncatedMsg == b->discardTruncatedMsg &&
+           a->msgDiscardingError == b->msgDiscardingError && a->escapeLF == b->escapeLF &&
+           a->reopenOnTruncate == b->reopenOnTruncate && a->addCeeTag == b->addCeeTag &&
+           a->addMetadata == b->addMetadata && a->freshStartTail == b->freshStartTail &&
+           a->fileNotFoundError == b->fileNotFoundError && a->maxLinesAtOnce == b->maxLinesAtOnce &&
+           a->trimLineOverBytes == b->trimLineOverBytes && a->ignoreOlderThan == b->ignoreOlderThan &&
+           a->msgFlag == b->msgFlag && imfileOptStrEq(a->escapeLFString, b->escapeLFString);
+}
+
+
+static void imfileWarnDuplicateInstances(const modConfData_t *const modConf) {
+    const instanceConf_t *inst;
+    const instanceConf_t *other;
+    for (inst = modConf->root; inst != NULL; inst = inst->next) {
+        for (other = inst->next; other != NULL; other = other->next) {
+            if (imfileInstancesEquivalent(inst, other)) {
+                const uchar *const fileName =
+                    (inst->pszFileName == NULL) ? UCHAR_CONSTANT("(unset)") : inst->pszFileName;
+                const uchar *const tag = (inst->pszTag == NULL) ? UCHAR_CONSTANT("(unset)") : inst->pszTag;
+                LogMsg(0, NO_ERRCODE, LOG_WARNING,
+                       "imfile: duplicate file monitor for '%s' with tag '%s' has identical "
+                       "delivery parameters; this is valid but usually indicates a duplicate "
+                       "configuration entry",
+                       fileName, tag);
+                break;
+            }
+        }
+    }
 }
 
 
@@ -2406,11 +2516,11 @@ BEGINcheckCnf
     for (inst = pModConf->root; inst != NULL; inst = inst->next) {
         std_checkRuleset(pModConf, inst);
     }
+    imfileWarnDuplicateInstances(pModConf);
     if (pModConf->root == NULL) {
-        LogError(0, RS_RET_NO_LISTNERS,
-                 "imfile: no files configured to be monitored - "
-                 "no input will be gathered");
-        iRet = RS_RET_NO_LISTNERS;
+        LogMsg(0, NO_ERRCODE, LOG_WARNING,
+               "imfile: no files configured to be monitored - "
+               "no input will be gathered");
     }
 ENDcheckCnf
 
@@ -2499,6 +2609,7 @@ static void do_initial_poll_run(void) {
     for (instanceConf_t *inst = runModConf->root; inst != NULL; inst = inst->next) {
         inst->freshStartTail = 0;
     }
+    rsconfSignalReady();
 }
 
 
@@ -2545,6 +2656,9 @@ static void ATTR_NONNULL(1) in_dbg_showEv(const struct inotify_event *ev) {
     if (ev->mask & IN_CLOSE_WRITE) {
         dbgprintf("INOTIFY event: watch IN_CLOSE_WRITE\n");
     }
+    if (ev->mask & IN_Q_OVERFLOW) {
+        dbgprintf("INOTIFY event: watch IN_Q_OVERFLOW\n");
+    }
     if (ev->mask & IN_CLOSE_NOWRITE) {
         dbgprintf("INOTIFY event: watch IN_CLOSE_NOWRITE\n");
     }
@@ -2576,7 +2690,7 @@ static void ATTR_NONNULL(1) in_dbg_showEv(const struct inotify_event *ev) {
 
 
 static void ATTR_NONNULL(1, 2) in_handleFileEvent(struct inotify_event *ev, const wd_map_t *const etry) {
-    if (ev->mask & IN_MODIFY) {
+    if (ev->mask & IN_FILE_UPDATE_EVENTS) {
         DBGPRINTF("fs_node_notify_file_update: act->name '%s'\n", etry->act->name);
         pollFile(etry->act);
     } else {
@@ -2609,13 +2723,32 @@ static void flag_in_move(fs_edge_t *const edge, const char *name_moved) {
 }
 
 static void ATTR_NONNULL(1) in_processEvent(struct inotify_event *ev) {
-    if (ev->mask & IN_IGNORED) {
-        DBGPRINTF("imfile: got IN_IGNORED event\n");
+    if (ev->mask & IN_Q_OVERFLOW) {
+        LogMsg(0, RS_RET_ERR, LOG_WARNING, "imfile: inotify queue overflow, scanning configured files");
+        fs_node_walk(runModConf->conf_tree, poll_tree);
         goto done;
     }
 
-    DBGPRINTF("in_processEvent process Event %x for %s\n", ev->mask, ev->name);
+    DBGPRINTF("in_processEvent process Event %x for %s\n", ev->mask, ev->len > 0 ? ev->name : "");
     const wd_map_t *const etry = wdmapLookup(ev->wd);
+    if (ev->mask & IN_IGNORED) {
+        if (etry != NULL) {
+            act_obj_t *const act = etry->act;
+            fs_node_t *const node = act->edge->node;
+
+            DBGPRINTF("imfile: watch %d for '%s' was removed, rescanning\n", ev->wd, act->name);
+            if (act->wd == ev->wd) {
+                act->wd = -1;
+            }
+            wdmapDel(ev->wd);
+            fs_node_walk(node, poll_tree);
+            fs_node_walk(node, in_retryMissingWatches);
+        } else {
+            DBGPRINTF("imfile: got IN_IGNORED for already removed watch %d\n", ev->wd);
+        }
+        goto done;
+    }
+
     if (etry == NULL) {
         LogMsg(0, RS_RET_INTERNAL_ERROR, LOG_WARNING,
                "imfile: internal error? "
@@ -2624,18 +2757,26 @@ static void ATTR_NONNULL(1) in_processEvent(struct inotify_event *ev) {
                ev->wd);
         goto done;
     }
+    fs_node_t *const node = etry->act->edge->node;
     DBGPRINTF("in_processEvent process Event %x is_file %d, act->name '%s'\n", ev->mask, etry->act->edge->is_file,
               etry->act->name);
 
     if ((ev->mask & IN_MOVED_FROM)) {
-        flag_in_move(etry->act->edge->node->edges, ev->name);
+        flag_in_move(node->edges, ev->name);
     }
-    if (ev->mask & (IN_MOVED_FROM | IN_MOVED_TO)) {
-        fs_node_walk(etry->act->edge->node, poll_tree);
+    if (ev->mask & (IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF | IN_DELETE_SELF)) {
+        /* Drain the old inode before reconciling names and watches. A file watch
+         * follows an inode across rename, so without this rescan the newly-created
+         * pathname can remain unwatched after a rapid log rotation. */
+        if (etry->act->edge->is_file && !(etry->act->is_symlink)) {
+            pollFile(etry->act);
+        }
+        fs_node_walk(node, poll_tree);
+        fs_node_walk(node, in_retryMissingWatches);
     } else if (etry->act->edge->is_file && !(etry->act->is_symlink)) {
         in_handleFileEvent(ev, etry);  // esentially poll_file()!
     } else {
-        fs_node_walk(etry->act->edge->node, poll_tree);
+        fs_node_walk(node, poll_tree);
     }
 done:
     return;
@@ -2649,7 +2790,9 @@ static rsRetVal do_inotify(void) {
     int currev;
     static int last_timeout = 0;
     time_t last_fallback = 0;
+    time_t last_delete_check = 0;
     struct pollfd pollfd;
+    int bSignaledReady = 0;
     DEFiRet;
 
     CHKiRet(wdmapInit());
@@ -2658,11 +2801,12 @@ static rsRetVal do_inotify(void) {
         LogError(errno, RS_RET_INOTIFY_INIT_FAILED,
                  "imfile: Init inotify "
                  "instance failed ");
-        return RS_RET_INOTIFY_INIT_FAILED;
+        ABORT_FINALIZE(RS_RET_INOTIFY_INIT_FAILED);
     }
     DBGPRINTF("inotify fd %d\n", ino_fd);
 
     do_initial_poll_run();
+    bSignaledReady = 1;
 
     while (glbl.GetGlobalInputTermState() == 0) {
         int r;
@@ -2684,6 +2828,14 @@ static rsRetVal do_inotify(void) {
                 poll_timeout = fallback_timeout;
             }
         }
+        /* Cap poll() so we wake up to clean up deleted-file FDs even
+         * when no inotify events arrive. */
+        if (havePendingDeletes) {
+            const int delete_timeout = (FILE_DELETE_DELAY + 1) * 1000;
+            if (poll_timeout == -1 || delete_timeout < poll_timeout) {
+                poll_timeout = delete_timeout;
+            }
+        }
         r = poll(&pollfd, 1, poll_timeout);
 
         if (r == -1 && errno == EINTR) {
@@ -2702,6 +2854,14 @@ static rsRetVal do_inotify(void) {
                     in_doFallbackScan();
                     last_fallback = now;
                 }
+            }
+            /* poll() timed out — re-check deleted files whose
+             * FILE_DELETE_DELAY has now elapsed. */
+            if (havePendingDeletes) {
+                DBGPRINTF("pending deletes exist, running tree walk to re-check\n");
+                havePendingDeletes = 0;
+                fs_node_walk(runModConf->conf_tree, poll_tree);
+                last_delete_check = time(NULL);
             }
             continue;
         } else if (r == -1) {
@@ -2728,6 +2888,17 @@ static rsRetVal do_inotify(void) {
                 if (last_fallback == 0 || last_fallback + runModConf->inotifyFallbackInterval <= now) {
                     in_doFallbackScan();
                     last_fallback = now;
+                }
+            }
+            /* Under sustained event load poll() never times out, so
+             * also check here, rate-limited to once per FILE_DELETE_DELAY. */
+            if (havePendingDeletes) {
+                time_t now = time(NULL);
+                if (last_delete_check == 0 || last_delete_check + FILE_DELETE_DELAY + 1 <= now) {
+                    DBGPRINTF("pending deletes exist (event path), running tree walk to re-check\n");
+                    havePendingDeletes = 0;
+                    fs_node_walk(runModConf->conf_tree, poll_tree);
+                    last_delete_check = now;
                 }
             }
             rd = read(ino_fd, iobuf, sizeof(iobuf));
@@ -2758,7 +2929,11 @@ static rsRetVal do_inotify(void) {
     }
 
 finalize_it:
-    close(ino_fd);
+    if (!bSignaledReady) rsconfSignalReady();
+    if (ino_fd >= 0) {
+        close(ino_fd);
+        ino_fd = -1;
+    }
     RETiRet;
 }
 
@@ -2817,6 +2992,7 @@ static rsRetVal do_fen(void) {
     /* create port instance */
     if ((glport = port_create()) == -1) {
         LogError(errno, RS_RET_FEN_INIT_FAILED, "do_fen INIT Port failed ");
+        rsconfSignalReady();
         return RS_RET_FEN_INIT_FAILED;
     }
 
@@ -2917,6 +3093,7 @@ BEGINwillRun
     CHKiRet(prop.Construct(&pInputName));
     CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imfile"), sizeof("imfile") - 1));
     CHKiRet(prop.ConstructFinalize(pInputName));
+    rsconfRegisterReadiness();
 finalize_it:
 ENDwillRun
 
@@ -3049,6 +3226,8 @@ static rsRetVal ATTR_NONNULL() persistStrmState(act_obj_t *const act) {
     json_object_object_add(json, "strt_offs", jval);
     jval = json_object_new_int64((int64_t)act->inode_gen);
     json_object_object_add(json, "inode_gen", jval);
+    jval = json_object_new_int64((int64_t)act->lineNum);
+    json_object_object_add(json, "line_number", jval);
 
     const uchar *const prevLineSegment = strmGetPrevLineSegment(act->pStrm);
     if (prevLineSegment != NULL) {

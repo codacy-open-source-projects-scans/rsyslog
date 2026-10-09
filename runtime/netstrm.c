@@ -145,14 +145,15 @@ static rsRetVal ATTR_NONNULL(1, 3, 5) LstnInit(netstrms_t *pNS,
                                                const int iSessMax,
                                                const tcpLstnParams_t *const cnf_params) {
     DEFiRet;
-    const char *ns = cnf_params->pszNetworkNamespace;
-    int netns_fd = -1;
 
     ISOBJ_TYPE_assert(pNS, netstrms);
     assert(fAddLstn != NULL);
     assert(cnf_params->pszPort != NULL);
 
 #ifdef HAVE_SETNS
+    const char *ns = cnf_params->pszNetworkNamespace;
+    int netns_fd = -1;
+
     if (ns) {
         CHKiRet(net.netns_save(&netns_fd));
         CHKiRet(net.netns_switch(ns));
@@ -297,6 +298,23 @@ finalize_it:
     RETiRet;
 }
 
+/**
+ * @brief Set additional CA certificate sources on the active netstream
+ * driver.
+ * @param pThis Netstream instance whose driver should receive the setting.
+ * @param file Comma-separated file list or strict ``pkcs11:`` URI list to
+ * forward to the driver.
+ * @return RS_RET_OK on success or a driver-specific error code.
+ */
+static rsRetVal SetDrvrTlsCAExtraFiles(netstrm_t *const pThis, const uchar *const file) {
+    DEFiRet;
+    NULL_CHECK(pThis);
+    iRet = pThis->Drvr.SetTlsCAExtraFiles(pThis->pDrvrData, file);
+
+finalize_it:
+    RETiRet;
+}
+
 static rsRetVal SetDrvrTlsKeyFile(netstrm_t *const pThis, const uchar *const file) {
     DEFiRet;
     NULL_CHECK(pThis);
@@ -384,6 +402,17 @@ static rsRetVal SetKeepAliveIntvl(netstrm_t *pThis, int keepAliveIntvl) {
     DEFiRet;
     NULL_CHECK(pThis);
     iRet = pThis->Drvr.SetKeepAliveIntvl(pThis->pDrvrData, keepAliveIntvl);
+
+finalize_it:
+    RETiRet;
+}
+
+/* TCP user timeout option
+ */
+static rsRetVal SetTcpUserTimeout(netstrm_t *pThis, int tcpUserTimeout) {
+    DEFiRet;
+    NULL_CHECK(pThis);
+    iRet = pThis->Drvr.SetTcpUserTimeout(pThis->pDrvrData, tcpUserTimeout);
 
 finalize_it:
     RETiRet;
@@ -508,6 +537,7 @@ BEGINobjQueryInterface(netstrm)
     pIf->SetKeepAliveProbes = SetKeepAliveProbes;
     pIf->SetKeepAliveTime = SetKeepAliveTime;
     pIf->SetKeepAliveIntvl = SetKeepAliveIntvl;
+    pIf->SetTcpUserTimeout = SetTcpUserTimeout;
     pIf->SetGnutlsPriorityString = SetGnutlsPriorityString;
     pIf->SetDrvrCheckExtendedKeyUsage = SetDrvrCheckExtendedKeyUsage;
     pIf->SetDrvrPrioritizeSAN = SetDrvrPrioritizeSAN;
@@ -515,6 +545,7 @@ BEGINobjQueryInterface(netstrm)
     pIf->SetDrvrTlsRevocationCheck = SetDrvrTlsRevocationCheck;
     pIf->SetDrvrTlsCAFile = SetDrvrTlsCAFile;
     pIf->SetDrvrTlsCRLFile = SetDrvrTlsCRLFile;
+    pIf->SetDrvrTlsCAExtraFiles = SetDrvrTlsCAExtraFiles;
     pIf->SetDrvrTlsKeyFile = SetDrvrTlsKeyFile;
     pIf->SetDrvrTlsCertFile = SetDrvrTlsCertFile;
     pIf->SetDrvrRemoteSNI = SetDrvrRemoteSNI;

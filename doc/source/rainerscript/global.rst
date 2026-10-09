@@ -127,7 +127,18 @@ The following parameters can be set:
   Note that earlier versions of rsyslog worked the opposite way. More
   information about the change can be found in `rsyslog-error-reporting-improved <http://www.rsyslog.com/rsyslog-error-reporting-improved>`_.
 
+- **systemd.notifyReadyDelay** binary (on/off), default "off"
 
+  When set to "on", rsyslog delays the systemd ``READY=1`` notification until
+  input modules that explicitly participate in startup readiness have completed
+  their initialisation, or until the readiness wait times out. This can help
+  deployments where services ordered after rsyslog must not begin until inputs
+  such as imfile have loaded their startup state.
+
+  The default is "off" to preserve the historical startup behavior: rsyslog
+  sends ``READY=1`` as soon as the daemon reaches the normal post-startup
+  notification point. Modules that do not participate in the readiness scheme
+  are unaffected.
 
 - **stdlog.channelspec**
 
@@ -145,7 +156,13 @@ The following parameters can be set:
 
 - **defaultNetstreamDriver**
 
-  Set it to "ossl", "gtls" or "mbedtls" to enable TLS.
+  Set it to "ossl", "gtls" or "mbedtls" to select a TLS-capable driver.
+  TLS is used only when stream driver mode is also set to TLS mode
+  (for example, ``StreamDriverMode="1"`` on actions that use the driver).
+  With ``global(compatibility.defaults.secure="strict")``, ``omfwd`` and
+  ``imtcp`` promote an omitted stream-driver mode to TLS mode when this default
+  selects a TLS-capable driver. Explicit mode ``0`` remains an explicit
+  plain-TCP request and is rejected with a TLS-capable effective driver.
   This `guide <http://www.rsyslog.com/doc/rsyslog_secure_tls.html>`_
   shows how to use TLS.
 
@@ -156,6 +173,36 @@ The following parameters can be set:
 
   Note: some modules provide separate parameters that allow overriding this
   setting (e.g., :doc:`imrelp's MaxDataSize parameter <../../configuration/modules/imrelp>`).
+
+- **maxOpenFiles**
+
+  Configures the maximum number of files that the rsyslog process may keep
+  open at the same time. This includes regular files and sockets, so it also
+  affects the practical upper bound for concurrent TCP connections and dynamic
+  output files.
+
+  The default is the operating-system process limit. The value is applied with
+  ``setrlimit(RLIMIT_NOFILE)`` during configuration activation, before rsyslog
+  drops privileges. The request can still fail if operating-system policy,
+  service manager limits, or the current hard limit do not permit the requested
+  value. On systemd systems, ``LimitNOFILE=`` in the service unit is often the
+  preferred place to raise the hard limit.
+
+  Example:
+
+  .. code-block:: none
+
+     global(maxOpenFiles="2000")
+
+  YAML equivalent:
+
+  .. code-block:: yaml
+
+     global:
+       maxOpenFiles: 2000
+
+  The legacy ``$MaxOpenFiles`` directive remains supported for existing
+  configurations, but new configurations should use ``global(maxOpenFiles=...)``.
 
 .. _global_janitorInterval:
 
@@ -219,6 +266,16 @@ The following parameters can be set:
 
   If "off", suppress warnings issued when messages are received
   from non-authorized machines (those, that are in no AllowedSender list).
+
+- **parser.dropTrailingCROnReception** [on/off] available 8.2606.0+
+
+  **Default:** off
+
+  If "on", remove a single carriage return (CR) character from the end
+  of each received message after the normal trailing LF handling has run.
+  This is useful for senders that include CRLF line endings in the message
+  payload. The default is "off" so existing configurations keep the CR
+  byte when it is part of the original message.
 
 - **parser.parseHostnameAndTag** [on/off] available 8.6.0+
 

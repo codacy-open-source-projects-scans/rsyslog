@@ -17,6 +17,17 @@ if sys.version_info >= (3, 11):
         print(f"Warning: Could not set asyncio event loop policy: {e}", file=sys.stderr)
 
 try:
+    loop = asyncio.get_event_loop()
+    if loop.is_closed():
+        raise RuntimeError("current asyncio event loop is closed")
+except RuntimeError:
+    # pysnmp's asyncio UDP transport still calls get_event_loop().
+    # Python 3.14 no longer creates a main-thread loop implicitly.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    print("Created asyncio event loop for pysnmp transport", file=sys.stderr)
+
+try:
     from pysnmp.entity import engine, config
     from pysnmp.carrier.asyncio.dgram import udp  # Changed from asyncore to asyncio
     from pysnmp.entity.rfc3413 import ntfrcv
@@ -55,13 +66,18 @@ if len(sys.argv) > 4:
 
 # Create output files
 print(f"Creating output files: {szOutputfile}, {szSnmpLogfile}", file=sys.stderr)
-outputFile = open(szOutputfile,"w+")
-logFile = open(szSnmpLogfile,"a+")
+outputFile = open(szOutputfile, "w+")
+try:
+    logFile = open(szSnmpLogfile, "a+")
+except Exception:
+    outputFile.close()
+    raise
 print("Output files created successfully", file=sys.stderr)
 
 # Assemble MIB viewer
 mibBuilder = builder.MibBuilder()
-compiler.addMibCompiler(mibBuilder, sources=['file:///usr/share/snmp/mibs', 'file:///var/lib/snmp/mibs', '/usr/local/share/snmp/mibs/'])
+compiler.addMibCompiler(mibBuilder, sources=['file:///usr/share/snmp/mibs',
+                        'file:///var/lib/snmp/mibs', '/usr/local/share/snmp/mibs/'])
 mibViewController = view.MibViewController(mibBuilder)
 # Pre-load MIB modules we expect to work with
 try:
@@ -114,7 +130,7 @@ def cbReceiverSnmp(snmpEngine, stateReference, contextEngineId, contextName, var
     transportDomain, transportAddress = snmpEngine.msgAndPduDsp.get_transport_info(stateReference)
     if (bDebug):
         szDebug = str("Notification From: %s, Domain: %s, SNMP Engine: %s, Context: %s" %
-            (transportAddress, transportDomain, contextEngineId.prettyPrint(), contextName.prettyPrint()))
+                      (transportAddress, transportDomain, contextEngineId.prettyPrint(), contextName.prettyPrint()))
         print(szDebug)
         logFile.write(szDebug)
         logFile.flush()
@@ -122,7 +138,8 @@ def cbReceiverSnmp(snmpEngine, stateReference, contextEngineId, contextName, var
     # Create output String
     szOut = "Trap Source{}, Trap OID {}".format(transportAddress, transportDomain)
 
-    varBinds = [rfc1902.ObjectType(rfc1902.ObjectIdentity(x[0]), x[1]).resolveWithMib(mibViewController) for x in varBinds]
+    varBinds = [rfc1902.ObjectType(rfc1902.ObjectIdentity(
+        x[0]), x[1]).resolveWithMib(mibViewController) for x in varBinds]
 
     for name, val in varBinds:
         # Append to output String
@@ -130,7 +147,7 @@ def cbReceiverSnmp(snmpEngine, stateReference, contextEngineId, contextName, var
 
         if isinstance(val, OctetString):
             if (name.prettyPrint() != "SNMP-COMMUNITY-MIB::snmpTrapAddress.0"):
-                szOctets = val.asOctets()#.rstrip('\r').rstrip('\n')
+                szOctets = val.asOctets()  # .rstrip('\r').rstrip('\n')
                 szOut = szOut + ", Octets: {}".format(szOctets)
         if (bDebug):
             print('%s = %s' % (name.prettyPrint(), val.prettyPrint()))
@@ -145,14 +162,18 @@ print("Registering notification receiver", file=sys.stderr)
 ntfrcv.NotificationReceiver(snmpEngine, cbReceiverSnmp)
 
 # Run I/O dispatcher which would receive queries and send confirmations
-print("Starting transport dispatcher", file=sys.stderr)
 try:
-    snmpEngine.transportDispatcher.runDispatcher()
-except KeyboardInterrupt:
-    print("Received keyboard interrupt, shutting down", file=sys.stderr)
-except Exception as e:
-    print(f"Exception in dispatcher: {e}", file=sys.stderr)
-    raise
+    try:
+        print("Starting transport dispatcher", file=sys.stderr)
+        snmpEngine.transportDispatcher.runDispatcher()
+    except KeyboardInterrupt:
+        print("Received keyboard interrupt, shutting down", file=sys.stderr)
+    except Exception as e:
+        print(f"Exception in dispatcher: {e}", file=sys.stderr)
+        raise
+    finally:
+        cleanup_started_file()
+        snmpEngine.transportDispatcher.closeDispatcher()
 finally:
-    cleanup_started_file()
-    snmpEngine.transportDispatcher.closeDispatcher()
+    outputFile.close()
+    logFile.close()

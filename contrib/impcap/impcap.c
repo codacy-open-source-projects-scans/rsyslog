@@ -41,6 +41,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <signal.h>
+#include <limits.h>
 #include <json.h>
 
 #include <pcap.h>
@@ -185,17 +186,17 @@ BEGINnewInpInst
     for (i = 0; i < inppblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(inppblk.descr[i].name, "interface")) {
-            inst->interface = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->interface = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "file")) {
-            inst->filePath = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->filePath = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "promiscuous")) {
             inst->promiscuous = (uint8_t)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "filter")) {
-            inst->filter = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->filter = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "tag")) {
-            inst->tag = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->tag = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "ruleset")) {
-            inst->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "no_buffer")) {
             inst->immediateMode = (uint8_t)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "buffer_size")) {
@@ -235,9 +236,9 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "metadata_only")) {
             loadModConf->metadataOnly = (uint8_t)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "metadata_container")) {
-            loadModConf->metadataContainer = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->metadataContainer = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "data_container")) {
-            loadModConf->dataContainer = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->dataContainer = (char *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             dbgprintf("impcap: non-handled param %s in beginSetModCnf\n", modpblk.descr[i].name);
         }
@@ -491,9 +492,11 @@ ENDfreeCnf
 char *stringToHex(char *string, size_t length) {
     const char *hexChar = "0123456789ABCDEF";
     char *retBuf;
-    uint16_t i;
+    size_t i;
 
+    if (length > (((size_t)-1) - 1) / 2) return NULL;
     retBuf = malloc((2 * length + 1) * sizeof(char));
+    if (retBuf == NULL) return NULL;
     for (i = 0; i < length; ++i) {
         retBuf[2 * i] = hexChar[(string[i] & 0xF0) >> 4];
         retBuf[2 * i + 1] = hexChar[string[i] & 0x0F];
@@ -551,7 +554,18 @@ void packet_parse(uchar *arg, const struct pcap_pkthdr *pkthdr, const uchar *pac
 
     json_object_object_add(jown, "net_bytes_total", json_object_new_int(pkthdr->len));
 
-    data_ret_t *dataLeft = eth_parse(packet, pkthdr->caplen, jown);
+    if (pkthdr->caplen > INT_MAX) {
+        DBGPRINTF("impcap : captured packet too large to parse: %u\n", pkthdr->caplen);
+        msgDestruct(&pMsg);
+        json_object_put(jown);
+        return;
+    }
+    data_ret_t *dataLeft = eth_parse(packet, (int)pkthdr->caplen, jown);
+    if (dataLeft == NULL) {
+        msgDestruct(&pMsg);
+        json_object_put(jown);
+        return;
+    }
 
     json_object_object_add(jown, "net_bytes_data", json_object_new_int(dataLeft->size));
     char *dataHex = stringToHex(dataLeft->pData, dataLeft->size);
@@ -571,18 +585,10 @@ void packet_parse(uchar *arg, const struct pcap_pkthdr *pkthdr, const uchar *pac
 /* This is used to terminate the plugin.
  */
 static void doSIGTTIN(int __attribute__((unused)) sig) {
-    pthread_t tid = pthread_self();
-    const int bTerminate = ATOMIC_FETCH_32BIT(&bTerminateInputs, &mutTerminateInputs);
-    DBGPRINTF("impcap: awoken via SIGTTIN; bTerminateInputs: %d\n", bTerminate);
-    if (bTerminate) {
-        for (instanceConf_t *inst = runModConf->root; inst != NULL; inst = inst->next) {
-            if (pthread_equal(tid, inst->tid)) {
-                pcap_breakloop(inst->device);
-                DBGPRINTF("impcap: thread %lx, termination requested via SIGTTIN - telling libpcap\n",
-                          (long unsigned int)tid);
-            }
-        }
-    }
+    /* pcap_breakloop() is called by the controller before this signal is sent.
+     * The empty handler only interrupts a blocking capture syscall on platforms
+     * where libpcap cannot wake it from another thread.
+     */
 }
 
 /*
@@ -639,6 +645,7 @@ BEGINrunInput
 
     DBGPRINTF("impcap: received close signal, signaling instance threads...\n");
     for (inst = runModConf->root; inst != NULL; inst = inst->next) {
+        pcap_breakloop(inst->device);
         pthread_kill(inst->tid, SIGTTIN);
     }
 

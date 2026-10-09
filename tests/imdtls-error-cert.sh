@@ -1,9 +1,12 @@
 #!/bin/bash
 # added 2018-11-07 by Rainer Gerhards
 # This file is part of the rsyslog project, released under ASL 2.0
+# Verify that imdtls reports TLS object load errors during startup. This
+# fixture intentionally pairs an invalid private key file with a certificate
+# path so startup fails before any listener becomes functional. No traffic is
+# sent; the configured rsyslog diagnostics are the pass/fail oracle.
 . ${srcdir:=.}/diag.sh init
 generate_conf
-export PORT_RCVR="$(get_free_port)"
 
 add_conf '
 global(	defaultNetstreamDriverCAFile="'$srcdir/tls-certs/ca.pem'"
@@ -13,7 +16,7 @@ global(	defaultNetstreamDriverCAFile="'$srcdir/tls-certs/ca.pem'"
 
 module(	load="../plugins/imdtls/.libs/imdtls" )
 input(	type="imdtls"
-	port="'$PORT_RCVR'")
+	port="0")
 
 action(type="omfile" file="'$RSYSLOG_OUT_LOG'")
 '
@@ -23,6 +26,6 @@ startup
 sleep 5 # TODO: FIXME - just checking if we terminate too early
 shutdown_when_empty
 wait_shutdown
-content_check "Error: Certificate file could not be accessed"
+content_check "Error: Key could not be accessed"
 content_check "OpenSSL Error Stack:"
 exit_test

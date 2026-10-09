@@ -38,8 +38,20 @@ specify module parameters, use
 
 
 Note that legacy parameters **do not** affect new-style RainerScript configuration
-objects. See :doc:`basic configuration structure doc <../basic_structure>` to
-learn about different configuration languages in use by rsyslog.
+objects. The reverse direction is also not a supported configuration pattern:
+module-level ``omfile`` parameters are defaults for RainerScript
+``action(type="omfile" ...)`` objects, not a reliable way to configure legacy
+selector actions such as ``*.* /var/log/messages`` or ``*.* ?dynafile``.
+
+For new configurations, keep file output configuration in RainerScript and put
+ownership, permission, template, and destination settings either on the
+``module(load="builtin:omfile" ...)`` default or directly on each
+``action(type="omfile" ...)`` object. Do not mix legacy selector actions with
+RainerScript ``omfile`` module/action parameters when exact ownership,
+permission, or template behavior matters.
+
+See :doc:`basic configuration structure doc <../basic_structure>` to learn
+about different configuration languages in use by rsyslog.
 
 .. note::
 
@@ -62,7 +74,9 @@ learn about different configuration languages in use by rsyslog.
    ../../reference/parameters/omfile-dirowner
    ../../reference/parameters/omfile-dirownernum
    ../../reference/parameters/omfile-dynafile
+   ../../reference/parameters/omfile-dynafile-dangerouspermitpathescape
    ../../reference/parameters/omfile-dynafile-donotsuspend
+   ../../reference/parameters/omfile-dynafile-restricttemplatetype
    ../../reference/parameters/omfile-dynafilecachesize
    ../../reference/parameters/omfile-failonchownfailure
    ../../reference/parameters/omfile-file
@@ -71,6 +85,7 @@ learn about different configuration languages in use by rsyslog.
    ../../reference/parameters/omfile-filegroupnum
    ../../reference/parameters/omfile-fileowner
    ../../reference/parameters/omfile-fileownernum
+   ../../reference/parameters/omfile-followsymlinks
    ../../reference/parameters/omfile-flushinterval
    ../../reference/parameters/omfile-flushontxend
    ../../reference/parameters/omfile-iobuffersize
@@ -135,6 +150,10 @@ Module Parameters
      - .. include:: ../../reference/parameters/omfile-filegroupnum.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-omfile-followsymlinks`
+     - .. include:: ../../reference/parameters/omfile-followsymlinks.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
    * - :ref:`param-omfile-dirowner`
      - .. include:: ../../reference/parameters/omfile-dirowner.rst
         :start-after: .. summary-start
@@ -153,6 +172,14 @@ Module Parameters
         :end-before: .. summary-end
    * - :ref:`param-omfile-dynafile-donotsuspend`
      - .. include:: ../../reference/parameters/omfile-dynafile-donotsuspend.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omfile-dynafile-dangerouspermitpathescape`
+     - .. include:: ../../reference/parameters/omfile-dynafile-dangerouspermitpathescape.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omfile-dynafile-restricttemplatetype`
+     - .. include:: ../../reference/parameters/omfile-dynafile-restricttemplatetype.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
    * - :ref:`param-omfile-compression-driver`
@@ -226,6 +253,10 @@ selects whether a static or dynamic file (name) shall be written to.
      - .. include:: ../../reference/parameters/omfile-dynafile.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-omfile-dynafile-dangerouspermitpathescape`
+     - .. include:: ../../reference/parameters/omfile-dynafile-dangerouspermitpathescape.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
    * - :ref:`param-omfile-closetimeout`
      - .. include:: ../../reference/parameters/omfile-closetimeout.rst
         :start-after: .. summary-start
@@ -272,6 +303,10 @@ selects whether a static or dynamic file (name) shall be written to.
         :end-before: .. summary-end
    * - :ref:`param-omfile-filecreatemode`
      - .. include:: ../../reference/parameters/omfile-filecreatemode.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omfile-followsymlinks`
+     - .. include:: ../../reference/parameters/omfile-followsymlinks.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
    * - :ref:`param-omfile-dircreatemode`

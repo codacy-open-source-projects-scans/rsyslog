@@ -43,6 +43,7 @@ RUN	yum -y update && \
 	libstdc++ \
 	libtool \
 	libuuid-devel \
+	libyaml-devel \
 	lsof \
 	mysql-devel \
 	nc \
@@ -80,7 +81,7 @@ RUN	wget -O /etc/yum.repos.d/network:messaging:zeromq:git-stable.repo https://do
 	yum -y install czmq-devel
 	# end of this RUN
 	#wget -O /etc/yum.repos.de/network:messaging:zeromq:git-stable.repo  https://download.opensuse.org/repositories/network:messaging:zeromq:git-stable/CentOS_6/network:messaging:zeromq:git-stable.repo && \
-RUN 	find / -name "pgm*"
+RUN 	find / -name "pgm*" || true
 RUN	mkdir /usr/lib64/pgm-5.2
 RUN	mkdir /usr/lib64/pgm-5.2/include
 # unfortunately, tcl-devel does not properly setup required bits in the environment
@@ -260,6 +261,7 @@ RUN	cd helper-projects \
 RUN	cd helper-projects && \
 	git clone https://github.com/civetweb/civetweb.git \
 	&& cd civetweb \
+	&& git checkout v1.16 \
 	&& (unset CFLAGS; make -j build ; make install-headers ; make install-slib ) \
 	&& cd .. \
 	&& rm -rf civetweb \
@@ -302,6 +304,7 @@ ENV RSYSLOG_CONFIGURE_OPTIONS \
 	--enable-mmdblookup \
 	--enable-mmfields \
 	--enable-mmjsonparse \
+	--enable-imkubernetes \
 	--enable-mmkubernetes \
 	--enable-mmnormalize \
 	--enable-mmpstrucdata \

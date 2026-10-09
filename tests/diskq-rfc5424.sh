@@ -15,15 +15,16 @@ fi
 
 . ${srcdir:=.}/diag.sh init
 export NUMMESSAGES=10
+QUEUE_TYPE=${QUEUE_TYPE:-disk}
 generate_conf
 add_conf '
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" ruleset="rs")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" ruleset="rs")
 
 
 template(name="outfmt" type="string" string="%msg:F,58:2%\n")
 
-ruleset(name="rs2" queue.type="disk" queue.filename="rs2_q"
+ruleset(name="rs2" queue.type="'$QUEUE_TYPE'" queue.filename="rs2_q"
 	queue.spoolDirectory="'${RSYSLOG_DYNNAME}'.spool") {
 	set $!tmp=$msg;
 	action(type="omfile" file=`echo $RSYSLOG_OUT_LOG` template="outfmt")

@@ -31,6 +31,9 @@ install-sh
 missing
 compile
 rsyslogd
+/tools/fuzz_rsyslog_message
+/tools/fuzz_imtcp_session
+/fuzz-imtcp-corpus-work/
 rsyslog.service
 ylwrap
 *.orig
@@ -62,6 +65,7 @@ checklog
 logfile*
 *.conf
 !tests/testsuites/*.conf
+!packaging/docker/rsyslog/minimal/02-noise-drop.conf
 # packaging/ubuntu: exclude from *.conf and rsyslog.service
 !packaging/ubuntu/**/*.conf
 !packaging/ubuntu/**/rsyslog.service
@@ -101,8 +105,10 @@ utils/*
 *.sw*
 clang_output_*
 tools/logctl
+tools/msggen
 tools/rscryutil
 tools/rscryutil.1
+tools/rsyslog_diag_hostname
 /bin/
 # RPM CI build output
 /build-result/
@@ -125,7 +131,28 @@ _codeql_detected_source_root
 doc/.venv-docs/
 plugins/impstats/remote.pb-c.c
 plugins/impstats/remote.pb-c.h
+plugins/impstats/remote.pb-c.stamp
+tests/runtime_unit_gss_token_util
+tests/runtime_unit_impcap_arp_parser
+tests/runtime_unit_linkedlist
+tests/runtime_unit_mmaitag_gemini_response
+tests/runtime_unit_msg_replace
+tests/runtime_unit_ommongodb_date
+tests/runtime_unit_parser_pri
+tests/runtime_unit_stringbuf
 
 # Python cache artifacts
 __pycache__/
 *.py[cod]
+
+# Local machine-specific Codex notes
+AGENTS.local.md
+
+# Codex container validation marker
+.codex/container_validated.marker
+
+# Local Codex security review packages and receipts
+.codex/security-review/
+
+# Reviewed container outcome and source/log identity audit
+.codex/container_validation.json

@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -50,6 +51,7 @@
 #include "rsyslog.h"
 #include "wti.h"
 #include "ratelimit.h"
+#include "queue.h"
 #include "parser.h"
 #include "linkedlist.h"
 #include "ruleset.h"
@@ -128,11 +130,16 @@ char *txt;
 int len;
 {
     struct srcrep reply;
+    const char *msgtxt;
 
+    msgtxt = (txt == NULL) ? "" : txt;
     reply.svrreply.rtncode = msgno;
     /* AIXPORT :  srv was corrected to syslogd */
     RS_COPY_LITERAL(reply.svrreply.objname, "syslogd");
-    snprintf(reply.svrreply.rtnmsg, SRCMIN(sizeof(reply.svrreply.rtnmsg) - 1, strlen(txt)), "%s", txt);
+    if (snprintf(reply.svrreply.rtnmsg, sizeof(reply.svrreply.rtnmsg), "%s", msgtxt) < 0) {
+        reply.svrreply.rtnmsg[0] = '\0';
+    }
+    reply.svrreply.rtnmsg[sizeof(reply.svrreply.rtnmsg) - 1] = '\0';
     srchdr = srcrrqs((char *)&srcpacket);
     srcsrpy(srchdr, (char *)&reply, len, cont);
 }
@@ -158,6 +165,34 @@ static void aix_close_it(int i) {
 /* AIXPORT : end  */
 
 
+static rsRetVal checkConfigOutputDoesNotOverwriteInput(const char *const outputPath, const char *const configPath) {
+    struct stat outputStat;
+    struct stat configStat;
+
+    if (outputPath == NULL || !strcmp(outputPath, "-") || configPath == NULL) {
+        return RS_RET_OK;
+    }
+
+    if (!strcmp(outputPath, configPath)) {
+        fprintf(stderr, "rsyslogd: -o output path must not be the same as the input config file '%s'\n", configPath);
+        return RS_RET_ERR;
+    }
+
+    if (stat(configPath, &configStat) != 0) {
+        return RS_RET_OK;
+    }
+    if (stat(outputPath, &outputStat) != 0) {
+        return RS_RET_OK;
+    }
+    if (configStat.st_dev == outputStat.st_dev && configStat.st_ino == outputStat.st_ino) {
+        fprintf(stderr, "rsyslogd: -o output path '%s' resolves to the same file as input config file '%s'\n",
+                outputPath, configPath);
+        return RS_RET_ERR;
+    }
+
+    return RS_RET_OK;
+}
+
 DEFobjCurrIf(obj) DEFobjCurrIf(prop) DEFobjCurrIf(parser) DEFobjCurrIf(ruleset) DEFobjCurrIf(net) DEFobjCurrIf(rsconf)
     DEFobjCurrIf(module) DEFobjCurrIf(datetime) DEFobjCurrIf(glbl)
 
@@ -182,15 +217,11 @@ void rsyslogdDoDie(int sig);
 #endif
 
 /* global data items */
-static pthread_mutex_t mutChildDied;
-static int bChildDied = 0;
-static pthread_mutex_t mutHadHUP;
-static int bHadHUP;
+static volatile sig_atomic_t bChildDied = 0;
+static volatile sig_atomic_t bHadHUP = 0;
+static volatile sig_atomic_t bHUPInProgress = 0;
 static int doFork = 1; /* fork - run in daemon mode - read-only after startup */
-int bFinished = 0; /* used by termination signal handler, read-only except there
-                    * is either 0 or the number of the signal that requested the
-                    * termination.
-                    */
+static volatile sig_atomic_t bFinished = 0; /* signal number requesting termination, or 0 */
 const char *PidFile = NULL;
 #define NO_PIDFILE "NONE"
 int iConfigVerify = 0; /* is this just a config verify run? */
@@ -205,6 +236,7 @@ int bHaveMainQueue = 0; /* set to 1 if the main queue - in queueing mode - is av
 prop_t *pInternalInputName = NULL; /* there is only one global inputName for all internally-generated messages */
 ratelimit_t *internalMsg_ratelimiter = NULL; /* ratelimiter for rsyslog-own messages */
 int send_to_all = 0; /* send message to all IPv4/IPv6 addresses */
+static uchar *properTerminationFile = NULL; /* testbench-only final shutdown marker path */
 
 static struct queuefilenames_s {
     struct queuefilenames_s *next;
@@ -230,17 +262,14 @@ static int setsid(void) {
 }
 #endif
 
-/* helper for imdiag. Returns if HUP processing has been requested or
- * is not yet finished. We know this is racy, but imdiag handles this
- * part by repeating operations. The mutex look is primarily to force
- * a memory barrier, so that we have a change to see changes already
- * written, but not present in the core's cache.
+/* helper for imdiag. Returns if HUP processing has been requested or is not
+ * yet finished. We know this is racy, but imdiag handles this part by
+ * repeating operations. sig_atomic_t keeps access signal-handler safe; callers
+ * must treat the answer as a transient observation.
  * 2023-07-26 Rainer Gerhards
  */
 int get_bHadHUP(void) {
-    pthread_mutex_lock(&mutHadHUP);
-    const int ret = bHadHUP;
-    pthread_mutex_unlock(&mutHadHUP);
+    const int ret = PREFER_LOAD_INT(&bHadHUP) || PREFER_LOAD_INT(&bHUPInProgress);
     /* note: at this point ret can already be invalid */
     return ret;
 }
@@ -677,6 +706,17 @@ static void printVersion(void) {
 #else
     printf("\tFEATURE_IMPSTATS_PUSH:\t\t\tNo\n");
 #endif
+#if defined(ENABLE_WOLFSSL)
+    printf("\tTLS network stream driver:\t\twolfSSL\n");
+#elif defined(ENABLE_OPENSSL)
+    printf("\tTLS network stream driver:\t\tOpenSSL\n");
+#elif defined(ENABLE_GNUTLS)
+    printf("\tTLS network stream driver:\t\tGnuTLS\n");
+#elif defined(ENABLE_MBEDTLS)
+    printf("\tTLS network stream driver:\t\tMbed TLS\n");
+#else
+    printf("\tTLS network stream driver:\t\tnone\n");
+#endif
     /* we keep the following message to so that users don't need
      * to wonder.
      */
@@ -769,7 +809,7 @@ finalize_it:
  * it helps us keep up the overall concurrency level.
  * rgerhards, 2010-06-09
  */
-static rsRetVal preprocessBatch(batch_t *pBatch, int *pbShutdownImmediate) {
+static rsRetVal preprocessBatch(batch_t *pBatch, wti_t *pWti) {
     prop_t *ip;
     prop_t *fqdn;
     prop_t *localName;
@@ -779,7 +819,7 @@ static rsRetVal preprocessBatch(batch_t *pBatch, int *pbShutdownImmediate) {
     rsRetVal localRet;
     DEFiRet;
 
-    for (i = 0; i < pBatch->nElem && !*pbShutdownImmediate; i++) {
+    for (i = 0; i < pBatch->nElem && !wtiIsShutdownImmediate(pWti); i++) {
         pMsg = pBatch->pElem[i].pMsg;
         if ((pMsg->msgFlags & NEEDS_ACLCHK_U) != 0) {
             DBGPRINTF("msgConsumer: UDP ACL must be checked for message (hostname-based)\n");
@@ -825,12 +865,12 @@ finalize_it:
 static rsRetVal msgConsumer(void __attribute__((unused)) * notNeeded, batch_t *pBatch, wti_t *pWti) {
     DEFiRet;
     assert(pBatch != NULL);
-    preprocessBatch(pBatch, pWti->pbShutdownImmediate);
+    preprocessBatch(pBatch, pWti);
     ruleset.ProcessBatch(pBatch, pWti);
     // TODO: the BATCH_STATE_COMM must be set somewhere down the road, but we
     // do not have this yet and so we emulate -- 2010-06-10
     int i;
-    for (i = 0; i < pBatch->nElem && !*pWti->pbShutdownImmediate; i++) {
+    for (i = 0; i < pBatch->nElem && !wtiIsShutdownImmediate(pWti); i++) {
         pBatch->eltState[i] = BATCH_STATE_COMM;
     }
     RETiRet;
@@ -1135,7 +1175,8 @@ rsRetVal logmsgInternal(int iErr, const syslog_pri_t pri, const uchar *const msg
         }
     }
     if (emit_to_stderr || iConfigVerify) {
-        if ((ourConf != NULL && ourConf->globals.bAllMsgToStderr) || pri2sev(pri) == LOG_ERR)
+        if ((ourConf != NULL && ourConf->globals.bAllMsgToStderr) || pri2sev(pri) == LOG_ERR ||
+            (iConfigVerify && pri2sev(pri) <= LOG_WARNING))
             fprintf(stderr, "rsyslogd: %s\n", (bufModMsg == NULL) ? (char *)msg : bufModMsg);
     }
     if (emit_supress_msg) {
@@ -1377,9 +1418,7 @@ static void hdlr_enable(int sig, void (*hdlr)()) {
 }
 
 static void hdlr_sighup(void) {
-    pthread_mutex_lock(&mutHadHUP);
-    bHadHUP = 1;
-    pthread_mutex_unlock(&mutHadHUP);
+    PREFER_STORE_INT(&bHadHUP, 1);
     /* at least on FreeBSD we seem not to necessarily awake the main thread.
      * So let's do it explicitely.
      */
@@ -1388,9 +1427,7 @@ static void hdlr_sighup(void) {
 }
 
 static void hdlr_sigchld(void) {
-    pthread_mutex_lock(&mutChildDied);
-    bChildDied = 1;
-    pthread_mutex_unlock(&mutChildDied);
+    PREFER_STORE_INT(&bChildDied, 1);
 }
 
 static void rsyslogdDebugSwitch(void) {
@@ -1676,6 +1713,8 @@ static void initAll(int argc, char **argv) {
     }
 
     if (iRet != RS_RET_END_OF_LINKEDLIST) FINALIZE;
+
+    CHKiRet(checkConfigOutputDoesNotOverwriteInput(configOutputPath, (const char *)ConfFile));
 
     if (iTranslateFmt != RSCONF_TRANSLATE_NONE) {
         if (!iConfigVerify) {
@@ -2093,7 +2132,7 @@ static void doHUP(void) {
 void rsyslogdDoDie(int sig) {
 #define MSG1 "DoDie called.\n"
 #define MSG2 "DoDie called 5 times - unconditional exit\n"
-    static int iRetries = 0; /* debug aid */
+    static volatile sig_atomic_t iRetries = 0; /* debug aid */
     dbgprintf(MSG1);
     if (Debug == DEBUG_FULL) {
         if (write(1, MSG1, sizeof(MSG1) - 1) == -1) {
@@ -2195,13 +2234,9 @@ static rsRetVal wait_timeout(const sigset_t *sigmask, int timeout_ms) {
             stepTimeout.tv_sec = step_ms / 1000;
             stepTimeout.tv_nsec = (step_ms % 1000) * 1000000L;
 
-            pthread_mutex_lock(&mutHadHUP);
-            if (bFinished || bHadHUP) {
-                pthread_mutex_unlock(&mutHadHUP);
+            if (bFinished || PREFER_LOAD_INT(&bHadHUP)) {
                 break;
             }
-            pthread_mutex_unlock(&mutHadHUP);
-
             FD_ZERO(&rfds);
             if (rswatch_fd != -1) {
                 FD_SET(rswatch_fd, &rfds);
@@ -2331,7 +2366,6 @@ static void mainloop(void) {
     time_t tTime;
     sigset_t origmask;
     sigset_t sigblockset;
-    int need_free_mutex;
     uint64_t next_janitor_run_ms;
 
     sigemptyset(&sigblockset);
@@ -2345,30 +2379,16 @@ static void mainloop(void) {
 
         sigemptyset(&origmask);
         pthread_sigmask(SIG_BLOCK, &sigblockset, &origmask);
-        pthread_mutex_lock(&mutChildDied);
-        need_free_mutex = 1;
-        if (bChildDied) {
-            bChildDied = 0;
-            pthread_mutex_unlock(&mutChildDied);
-            need_free_mutex = 0;
+        if (PREFER_LOAD_INT(&bChildDied)) {
+            PREFER_STORE_INT(&bChildDied, 0);
             reapChild();
         }
-        if (need_free_mutex) {
-            pthread_mutex_unlock(&mutChildDied);
-        }
 
-        pthread_mutex_lock(&mutHadHUP);
-        need_free_mutex = 1;
-        if (bHadHUP) {
-            need_free_mutex = 0;
-            pthread_mutex_unlock(&mutHadHUP);
+        if (PREFER_LOAD_INT(&bHadHUP)) {
+            PREFER_STORE_INT(&bHadHUP, 0);
+            PREFER_STORE_INT(&bHUPInProgress, 1);
             doHUP();
-            pthread_mutex_lock(&mutHadHUP);
-            bHadHUP = 0;
-            pthread_mutex_unlock(&mutHadHUP);
-        }
-        if (need_free_mutex) {
-            pthread_mutex_unlock(&mutHadHUP);
+            PREFER_STORE_INT(&bHUPInProgress, 0);
         }
 
         processImInternal();
@@ -2406,6 +2426,91 @@ static void mainloop(void) {
 
 /* Finalize and destruct all actions.
  */
+rsRetVal rsyslogdSetProperTerminationFile(const uchar *path) {
+    uchar *newPath = NULL;
+
+    if (path != NULL && path[0] != '\0') {
+        const size_t lenPath = strlen((const char *)path) + 1;
+        newPath = malloc(lenPath);
+        if (newPath == NULL) return RS_RET_OUT_OF_MEMORY;
+        memcpy(newPath, path, lenPath);
+    }
+
+    free(properTerminationFile);
+    properTerminationFile = newPath;
+    return RS_RET_OK;
+}
+
+
+int rsyslogdWriteTerminationMarker(const char *status, const char *reason, const char *phase) {
+    if (properTerminationFile == NULL || properTerminationFile[0] == '\0') return 0;
+
+    if (status == NULL) status = "unknown";
+    if (reason == NULL) reason = "unknown";
+    if (phase == NULL) phase = "unknown";
+
+#ifndef O_NOFOLLOW
+    fprintf(stderr,
+            "rsyslogd: proper termination file '%s' cannot be safely opened: "
+            "O_NOFOLLOW is unavailable on this platform\n",
+            (const char *)properTerminationFile);
+    return 1;
+#else
+    int fd = open((const char *)properTerminationFile, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "rsyslogd: error opening proper termination file '%s': %s\n",
+                (const char *)properTerminationFile, strerror(errno));
+        return 1;
+    }
+
+    #ifdef ENABLE_IMDIAG
+    const unsigned overallQueueSize = PREFER_FETCH_32BIT(iOverallQueueSize);
+    #else
+    const unsigned overallQueueSize = 0;
+    #endif
+    char buf[512];
+    const int len = snprintf(buf, sizeof(buf),
+                             "status=%s\nreason=%s\npid=%d\nsignal=%d\nversion=%s\nphase=%s\n"
+                             "queue.overall.size=%u\n",
+                             status, reason, (int)getpid(), (int)bFinished, VERSION, phase, overallQueueSize);
+    if (len < 0 || (size_t)len >= sizeof(buf)) {
+        fprintf(stderr, "rsyslogd: error formatting proper termination file '%s'\n",
+                (const char *)properTerminationFile);
+        close(fd);
+        return 1;
+    }
+
+    const char *cursor = buf;
+    size_t remaining = (size_t)len;
+    while (remaining > 0) {
+        const ssize_t written = write(fd, cursor, remaining);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "rsyslogd: error writing proper termination file '%s': %s\n",
+                    (const char *)properTerminationFile, strerror(errno));
+            close(fd);
+            return 1;
+        }
+        if (written == 0) {
+            fprintf(stderr, "rsyslogd: short write to proper termination file '%s'\n",
+                    (const char *)properTerminationFile);
+            close(fd);
+            return 1;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+
+    if (close(fd) != 0) {
+        fprintf(stderr, "rsyslogd: error closing proper termination file '%s': %s\n",
+                (const char *)properTerminationFile, strerror(errno));
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+
 static void rsyslogd_destructAllActions(void) {
     ruleset.DestructAllActions(runConf);
     PREFER_STORE_0_TO_INT(&bHaveMainQueue); /* flag that internal messages need to be temporarily stored */
@@ -2416,7 +2521,7 @@ static void rsyslogd_destructAllActions(void) {
 static void deinitAll(void) {
     char buf[256];
 
-    DBGPRINTF("exiting on signal %d\n", bFinished);
+    DBGPRINTF("exiting on signal %d\n", (int)bFinished);
 
     /* IMPORTANT: we should close the inputs first, and THEN send our termination
      * message. If we do it the other way around, logmsgInternal() may block on
@@ -2443,7 +2548,7 @@ static void deinitAll(void) {
                        "swVersion=\"" VERSION
                        "\" x-pid=\"%d\" x-info=\"https://www.rsyslog.com\"]"
                        " exiting on signal %d.",
-                       (int)glblGetOurPid(), bFinished);
+                       (int)glblGetOurPid(), (int)bFinished);
         errno = 0;
         logmsgInternal(NO_ERRCODE, LOG_SYSLOG | LOG_INFO, (uchar *)buf, 0);
     }
@@ -2511,6 +2616,9 @@ static void deinitAll(void) {
  * @param argv Array of argument strings.
  * @return 0 on clean exit, non-zero on error.
  */
+#ifdef RSYSLOG_FUZZ_TARGET
+int rsyslogd_main(int argc, char **argv);
+#endif
 int main(int argc, char **argv) {
 #if defined(_AIX)
     /* SRC support : fd 0 (stdin) must be the SRC socket
@@ -2518,8 +2626,6 @@ int main(int argc, char **argv) {
      * internally by rsyslogd.
      */
 
-    pthread_mutex_init(&mutHadHUP, NULL);
-    pthread_mutex_init(&mutChildDied, NULL);
     rs_cstr_copy(progname, argv[0], sizeof(progname));
     addrsz = sizeof(srcaddr);
     if ((rc = getsockname(0, &srcaddr, &addrsz)) < 0) {
@@ -2563,11 +2669,17 @@ int main(int argc, char **argv) {
 
     initAll(argc, argv);
 #ifdef HAVE_LIBSYSTEMD
+    if (rsconfShouldDelayReadyNotify(runConf)) {
+        rsconfWaitForModulesReady();
+    }
     if (sd_watchdog_enabled(0, &systemdWatchdogUsec) > 0) {
         systemdWatchdogEnabled = 1;
         dbgprintf("systemd watchdog enabled with interval %llu usec\n", (unsigned long long)systemdWatchdogUsec);
     }
     sd_notify(0, "READY=1");
+    if (rsconfShouldDelayReadyNotify(runConf)) {
+        rsconfReadyNotifySent();
+    }
     dbgprintf("done signaling to systemd that we are ready!\n");
 #endif
     DBGPRINTF("max message size: %d\n", glblGetMaxLine(runConf));
@@ -2580,7 +2692,5 @@ int main(int argc, char **argv) {
     LogMsg(0, RS_RET_OK, LOG_DEBUG, "rsyslogd shutting down");
     deinitAll();
     osf_close();
-    pthread_mutex_destroy(&mutChildDied);
-    pthread_mutex_destroy(&mutHadHUP);
-    return 0;
+    return rsyslogdWriteTerminationMarker("ok", "normal", "main-return");
 }

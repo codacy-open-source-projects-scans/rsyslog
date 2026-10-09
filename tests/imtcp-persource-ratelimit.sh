@@ -1,26 +1,34 @@
 #!/bin/bash
-## Test per-source ratelimiting for imtcp using a YAML policy.
+## Test per-source ratelimiting for imtcp using the canonical ratelimit
+## policy YAML. The oracle is that the shared ratelimit API drops the noisy
+## sender while allowing the override sender through; imtcp itself does not
+## compute or pass a per-source key.
 
 . ${srcdir:=.}/diag.sh init
 
-export POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.persource.yaml"
-export INPUT_FILE="$(pwd)/${RSYSLOG_DYNNAME}.input"
+POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.persource.yaml"
+export POLICY_FILE
+INPUT_FILE="$(pwd)/${RSYSLOG_DYNNAME}.input"
+export INPUT_FILE
 
 cat > "$POLICY_FILE" <<EOF
-default:
-  max: 5
-  window: 2s
-overrides:
-  - key: "quiethost"
-    max: 50
+perSource:
+  enabled: true
+  keyTemplate: "PerSourceKey"
+  default:
+    max: 5
     window: 2s
+  overrides:
+    - key: "quiethost"
+      max: 50
+      window: 2s
 EOF
 
 generate_conf
 add_conf '
 template(name="PerSourceKey" type="string" string="%hostname%")
 
-ratelimit(name="per_source" perSource="on" perSourcePolicy="'$POLICY_FILE'" perSourceKeyTpl="PerSourceKey")
+ratelimit(name="per_source" policy="'$POLICY_FILE'")
 
 module(load="../plugins/imtcp/.libs/imtcp")
 input(type="imtcp"
@@ -35,7 +43,7 @@ startup
 
 tcp_port=$(cat $RSYSLOG_DYNNAME.tcp.port)
 
-> "$INPUT_FILE"
+: > "$INPUT_FILE"
 for i in $(seq 1 20); do
     echo "<13>Jan 1 00:00:00 noisyhost app: msgnum:$i" >> "$INPUT_FILE"
 done
@@ -43,7 +51,7 @@ for i in $(seq 1 5); do
     echo "<13>Jan 1 00:00:00 quiethost app: msgnum:$i" >> "$INPUT_FILE"
 done
 
-./tcpflood -p"$tcp_port" -I "$INPUT_FILE"
+tcpflood -p"$tcp_port" -I "$INPUT_FILE"
 
 shutdown_when_empty
 wait_shutdown

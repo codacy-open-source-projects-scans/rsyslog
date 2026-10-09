@@ -2,9 +2,9 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-AC_INIT([rsyslog],[8.2606.0.daily],[rsyslog@lists.adiscon.com])     # UPDATE on release
+AC_INIT([rsyslog],[8.2610.0.daily],[rsyslog@lists.adiscon.com])     # UPDATE on release
 AC_DEFINE(VERSION_YEAR,  26, [year part of real rsyslog version])   # UPDATE on release
-AC_DEFINE(VERSION_MONTH,  6, [month part of real rsyslog version])  # UPDATE on release
+AC_DEFINE(VERSION_MONTH, 10, [month part of real rsyslog version])  # UPDATE on release
 
 AM_INIT_AUTOMAKE([tar-pax subdir-objects])
 
@@ -56,23 +56,14 @@ AC_CANONICAL_HOST
 
 if test "$GCC" = "yes"
 then
-	m4_ifdef([AX_IS_RELEASE], [
-		AX_IS_RELEASE([git-directory])
-		m4_ifdef([AX_COMPILER_FLAGS], [
-			AX_COMPILER_FLAGS(,,,,[-Wunused-parameter -Wmissing-field-initializers])
-			# unfortunately, AX_COMPILER_FLAGS does not provide a way to override
-			# the default -Wno-error=warning" flags. So we do this via sed below.
-			# Note: we *really* want to have this error out during CI testing!
-			# rgerhards, 2018-05-09
-			WARN_CFLAGS="$(echo "$WARN_CFLAGS" | sed s/-Wno-error=/-W/g)"
-		], [
-			CFLAGS="$CFLAGS -W -Wall -Wformat-security -Wshadow -Wcast-align -Wpointer-arith -Wmissing-format-attribute -g"
-			AC_MSG_WARN([missing AX_COMPILER_FLAGS macro, not using it])
-		])
-	], [
-		CFLAGS="$CFLAGS -W -Wall -Wformat-security -Wshadow -Wcast-align -Wpointer-arith -Wmissing-format-attribute -g"
-		AC_MSG_WARN([missing AX_IS_RELEASE macro, not using AX_COMPILER_FLAGS macro because of this])
-	])
+	m4_pattern_forbid([^AX_])
+	AX_IS_RELEASE([git-directory])
+	AX_COMPILER_FLAGS(,,,,[-Wunused-parameter -Wmissing-field-initializers])
+	# unfortunately, AX_COMPILER_FLAGS does not provide a way to override
+	# the default -Wno-error=warning" flags. So we do this via sed below.
+	# Note: we *really* want to have this error out during CI testing!
+	# rgerhards, 2018-05-09
+	WARN_CFLAGS="$(echo "$WARN_CFLAGS" | sed s/-Wno-error=/-W/g)"
 else
 	AC_MSG_WARN([compiler is not GCC or close compatible, not using ax_compiler_flags because of this (CC=$CC)])
 fi
@@ -166,11 +157,24 @@ AC_COMPILE_IFELSE( [AC_LANG_PROGRAM([[#include <limits.h>]],
                  )
 
 # Checks for libraries.
-PKG_CHECK_MODULES([LIBYAML], [yaml-0.1], [
-	AC_DEFINE([HAVE_LIBYAML], [1], [Define if libyaml is available])
-	have_libyaml=yes
+AC_ARG_ENABLE(libyaml,
+	[AS_HELP_STRING([--disable-libyaml],
+		[Disable libyaml-backed YAML configuration and policy file support @<:@default=enabled@:>@])],
+	[case "${enableval}" in
+	 yes) enable_libyaml="yes" ;;
+	  no) enable_libyaml="no" ;;
+	   *) AC_MSG_ERROR(bad value ${enableval} for --enable-libyaml) ;;
+	 esac],
+	[enable_libyaml="yes"]
+)
+AS_IF([test "x$enable_libyaml" = "xyes"], [
+	PKG_CHECK_MODULES([LIBYAML], [yaml-0.1], [
+		AC_DEFINE([HAVE_LIBYAML], [1], [Define if libyaml is available])
+		have_libyaml=yes
+	], [
+		AC_MSG_ERROR([libyaml support is enabled by default but yaml-0.1 was not found. Install libyaml development files or configure with --disable-libyaml.])
+	])
 ], [
-	AC_MSG_WARN([libyaml not found, rate limiting policies from files and YAML configuration support will be disabled])
 	have_libyaml=no
 ])
 AM_CONDITIONAL(HAVE_LIBYAML, test x$have_libyaml = xyes)
@@ -184,10 +188,14 @@ RT_LIBS="$RT_LIBS $LIBS"
 LIBS=
 AC_SEARCH_LIBS(dlopen, dl)
 DL_LIBS=$LIBS
+LIBS=
+AC_SEARCH_LIBS(gai_error, anl)
+GAI_LIBS=$LIBS
 LIBS=$save_LIBS
 
 AC_SUBST(RT_LIBS)
 AC_SUBST(DL_LIBS)
+AC_SUBST(GAI_LIBS)
 
 # Checks for header files.
 AC_HEADER_RESOLV
@@ -211,7 +219,31 @@ AC_CHECK_HEADERS([malloc.h],[],[],[
      #endif
   ]
 ])
-AC_CHECK_HEADERS([fcntl.h locale.h netdb.h netinet/in.h paths.h stddef.h stdlib.h string.h sys/file.h sys/ioctl.h sys/param.h sys/socket.h sys/time.h sys/stat.h unistd.h utmp.h utmpx.h sys/epoll.h sys/prctl.h sys/select.h getopt.h linux/close_range.h linux/fs.h])
+AC_CHECK_HEADERS([fcntl.h locale.h netdb.h netinet/in.h paths.h stddef.h stdlib.h string.h sys/file.h sys/ioctl.h sys/param.h sys/socket.h sys/time.h sys/stat.h sys/queue.h unistd.h utmp.h utmpx.h sys/epoll.h sys/prctl.h sys/select.h getopt.h linux/close_range.h linux/fs.h])
+
+AC_MSG_CHECKING([for STAILQ macros in sys/queue.h])
+AC_COMPILE_IFELSE(
+    [AC_LANG_PROGRAM(
+        [[
+#include <stddef.h> /* for NULL, used by STAILQ_INIT */
+#include <sys/queue.h>
+struct stailq_test_entry {
+    STAILQ_ENTRY(stailq_test_entry) link;
+};
+STAILQ_HEAD(stailq_test_head, stailq_test_entry);
+        ]],
+        [[
+struct stailq_test_head head;
+STAILQ_INIT(&head);
+return STAILQ_EMPTY(&head) ? 0 : 1;
+        ]]
+    )],
+    [
+        AC_MSG_RESULT([yes])
+        AC_DEFINE([HAVE_SYS_QUEUE_STAILQ], [1], [Define if sys/queue.h provides STAILQ macros])
+    ],
+    [AC_MSG_RESULT([no])]
+)
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -482,7 +514,8 @@ if test "$enable_ffaup" = "yes"; then
 		AC_CHECK_HEADER([faup/faup.h], [
 			FAUP_LIBS="-lfaupl"
 			AC_SUBST(FAUP_LIBS)],
-			[AC_MSG_ERROR([Unable to add faup support for URL parsing.])])
+			[AC_MSG_ERROR([Unable to add faup support for URL parsing.])],
+			[#include <stdint.h>])
 	])
 fi
 
@@ -742,6 +775,12 @@ if test "x$enable_imjournal" = "xyes" -o "x$enable_imjournal" = "xoptional"; the
                  ])
 	    ])
 	])
+	if test "x$imjournal_use_dummy" != "xyes"; then
+		save_libs=$LIBS
+		LIBS="$LIBS $LIBSYSTEMD_JOURNAL_LIBS"
+		AC_CHECK_FUNCS(sd_journal_open_namespace,,)
+		LIBS=$save_libs
+	fi
 fi
 AM_CONDITIONAL(IMJOURNAL_USE_DUMMY, test x$imjournal_use_dummy = xyes)
 AM_CONDITIONAL(ENABLE_IMJOURNAL, test x$enable_imjournal = xyes -o x$enable_imjournal = xoptional)
@@ -897,6 +936,48 @@ if test "$enable_coverage" = "yes"; then
 fi
 AM_CONDITIONAL([ENABLE_COVERAGE], [test "x$enable_coverage" = xyes])
 
+# libFuzzer targets
+AC_ARG_ENABLE([fuzzing],
+        [AS_HELP_STRING([--enable-fuzzing], [Build libFuzzer targets @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_fuzzing="yes" ;;
+          no) enable_fuzzing="no" ;;
+           *) AC_MSG_ERROR([bad value ${enableval} for --enable-fuzzing]) ;;
+         esac],
+        [enable_fuzzing="no"]
+)
+AC_ARG_VAR([LIB_FUZZING_ENGINE],
+        [linker flags or library providing the libFuzzer main function])
+if test "$enable_fuzzing" = "yes"; then
+        if test -z "$LIB_FUZZING_ENGINE"; then
+                if $CC --version 2>/dev/null | grep -i clang >/dev/null; then
+                        LIB_FUZZING_ENGINE="-fsanitize=fuzzer"
+                else
+                        AC_MSG_ERROR([
+--enable-fuzzing requires Clang or an explicit LIB_FUZZING_ENGINE])
+                fi
+        fi
+        save_LDFLAGS="$LDFLAGS"
+        LDFLAGS="$LDFLAGS $LIB_FUZZING_ENGINE"
+        AC_MSG_CHECKING([whether the fuzzing engine links])
+        AC_LINK_IFELSE(
+                [AC_LANG_SOURCE([[
+#include <stddef.h>
+#include <stdint.h>
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+        return data == NULL && size != 0;
+}
+                ]])],
+                [AC_MSG_RESULT([yes])],
+                [AC_MSG_FAILURE([
+the fuzzing engine does not link; set LIB_FUZZING_ENGINE to usable linker flags])])
+        LDFLAGS="$save_LDFLAGS"
+        AC_DEFINE([ENABLE_FUZZING], [1], [Define to 1 when libFuzzer targets are enabled.])
+fi
+AC_SUBST([LIB_FUZZING_ENGINE])
+AM_CONDITIONAL([ENABLE_FUZZING], [test "x$enable_fuzzing" = xyes])
+
 
 # total debugless: highest performance, but no way at all to enable debug
 # logging
@@ -953,6 +1034,14 @@ AC_ARG_ENABLE(usertools,
         [enable_usertools=no]
 )
 AM_CONDITIONAL(ENABLE_USERTOOLS, test x$enable_usertools = xyes)
+enable_segqueue_tool=no
+if test x$enable_usertools = xyes; then
+        AC_PATH_PROG([PYTHON3], [python3], [no])
+        AS_IF([test x$PYTHON3 = xno],
+                [AC_MSG_WARN([python3 not found; rsyslog-segqueue will not be installed or tested])],
+                [enable_segqueue_tool=yes])
+fi
+AM_CONDITIONAL(ENABLE_SEGQUEUE_TOOL, test x$enable_segqueue_tool = xyes)
 
 
 # MySQL support
@@ -1208,9 +1297,9 @@ AM_CONDITIONAL(ENABLE_OMHTTP, test x$enable_omhttp = xyes)
 
 
 # capability to enable elasticsearch testbench tests. This requries that an ES test
-# environment is present on the local (127.0.0.1) machine.
-# we support a "minimal" mode to take care of travis where we cannot run all tests
-# due to runtime constraints
+# environment is present on the local (127.0.0.1) machine. The "minimal" mode is
+# kept for CI jobs that need a reduced Elasticsearch test set due to runtime
+# constraints.
 AC_ARG_ENABLE(elasticsearch_tests,
         [AS_HELP_STRING([--enable-elasticsearch-tests],[enable Elasticsearch specific tests in testbench @<:@default=no@:>@])],
         [case "${enableval}" in
@@ -1274,6 +1363,22 @@ AC_ARG_ENABLE(wolfssl,
 	enable_wolfssl=no
 ])
 AM_CONDITIONAL(ENABLE_WOLFSSL, [test "x$enable_wolfssl" = "xyes"])
+
+rsyslog_wolfssl_has_crl=no
+rsyslog_wolfssl_has_ocsp=no
+if test "x$enable_wolfssl" = "xyes"; then
+	save_CFLAGS=$CFLAGS
+	CFLAGS="$CFLAGS $WOLFSSL_CFLAGS"
+	AC_CHECK_DECL([HAVE_CRL],
+		[rsyslog_wolfssl_has_crl=yes],
+		[AC_MSG_ERROR([wolfSSL must be built with --enable-crl to support rsyslog certificate revocation lists])],
+		[[#include <wolfssl/options.h>]])
+	AC_CHECK_DECL([HAVE_OCSP],
+		[rsyslog_wolfssl_has_ocsp=yes],
+		[AC_MSG_ERROR([wolfSSL must be built with --enable-ocsp to support rsyslog OCSP revocation checking])],
+		[[#include <wolfssl/options.h>]])
+	CFLAGS=$save_CFLAGS
+fi
 
 # openssl support
 AC_ARG_ENABLE(openssl,
@@ -1406,38 +1511,23 @@ AC_ARG_ENABLE(libgcrypt,
         [enable_libgcrypt=yes]
 )
 if test "x$enable_libgcrypt" = "xyes"; then
-        # Check for the modern pkg-config method first
-        AC_CHECK_PROG([HAVE_PKG_CONFIG], [pkg-config], [yes], [no])
-        if test "x${HAVE_PKG_CONFIG}" = "xno"; then
-                # Fallback to the outdated libgcrypt-config approach
-                AC_PATH_PROG([LIBGCRYPT_CONFIG],[libgcrypt-config],[no])
-                if test "x${LIBGCRYPT_CONFIG}" = "xno"; then
-                        AC_MSG_FAILURE([libgcrypt-config not found in PATH and pkg-config is not available. libgcrypt is missing.])
-                fi
-                AC_CHECK_LIB(
-                        [gcrypt],
-                        [gcry_cipher_open],
-                        [LIBGCRYPT_CFLAGS="`${LIBGCRYPT_CONFIG} --cflags`"
-                        LIBGCRYPT_LIBS="`${LIBGCRYPT_CONFIG} --libs`"
-                        ],
-                        [AC_MSG_FAILURE([libgcrypt is missing])],
-                        [`${LIBGCRYPT_CONFIG} --libs --cflags`]
-                )
-        else
-                # Use the preferred pkg-config approach
-                AC_CHECK_LIB(
-                        [gcrypt],
-                        [gcry_cipher_open],
-                        [LIBGCRYPT_CFLAGS="`pkg-config --cflags libgcrypt gpg-error`"
-                        LIBGCRYPT_LIBS="`pkg-config --libs libgcrypt gpg-error`"
-                        ],
-                        [AC_MSG_FAILURE([libgcrypt is missing])],
-                        [`pkg-config --libs --cflags libgcrypt gpg-error`]
-                )
-		if test "x${LIBGCRYPT_CFLAGS}" = "x" && test "x${LIBGCRYPT_LIBS}" = "x";then
-			AC_PATH_PROG([LIBGCRYPT_CONFIG],[libgcrypt-config],[no])
+        PKG_CHECK_MODULES(
+                [LIBGCRYPT],
+                [libgcrypt gpg-error],
+                [
+                        AC_CHECK_LIB(
+                                [gcrypt],
+                                [gcry_cipher_open],
+                                [:],
+                                [AC_MSG_FAILURE([libgcrypt is missing])],
+                                [${LIBGCRYPT_LIBS}]
+                        )
+                ],
+                [
+                        # Fallback to the outdated libgcrypt-config approach
+                        AC_PATH_PROG([LIBGCRYPT_CONFIG],[libgcrypt-config],[no])
                         if test "x${LIBGCRYPT_CONFIG}" = "xno"; then
-                                AC_MSG_FAILURE([libgcrypt-config not found in PATH and pkgconfig file of libgcrypt is not available. libgcrypt is missing.])
+                                AC_MSG_FAILURE([libgcrypt-config not found in PATH and pkg-config is unavailable or could not find libgcrypt/gpg-error. libgcrypt is missing.])
                         fi
                         AC_CHECK_LIB(
                                 [gcrypt],
@@ -1448,8 +1538,8 @@ if test "x$enable_libgcrypt" = "xyes"; then
                                 [AC_MSG_FAILURE([libgcrypt is missing])],
                                 [`${LIBGCRYPT_CONFIG} --libs --cflags`]
                         )
-		fi
-        fi
+                ]
+        )
         AC_DEFINE([ENABLE_LIBGCRYPT], [1], [Indicator that LIBGCRYPT is present])
 fi
 AM_CONDITIONAL(ENABLE_LIBGCRYPT, test x$enable_libgcrypt = xyes)
@@ -1470,28 +1560,39 @@ AC_ARG_ENABLE(libzstd,
         [enable_libzstd=no]
 )
 if test "x$enable_libzstd" = "xyes"; then
+    save_CFLAGS="$CFLAGS"
     save_LIBS="$LIBS"
     PKG_CHECK_MODULES([ZSTD], zstd >= 1.4.0, [],
         [
-	LIBS="$LIBS -lzstd"
-	ZSTD_LIBS="-lzstd"
-	AC_SUBST(ZSTD_LIBS)
-	AC_SEARCH_LIBS(ZSTD_compressStream2, zstd,
-            [AC_COMPILE_IFELSE(
-                [AC_LANG_PROGRAM(
-                    [[ #include <zstd.h> ]],
-                    [[
-		       ZSTD_CCtx* cctx = ZSTD_createCCtx();
-		       ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, 5);
-                    ]]
-                )],
-                [],
-                [AC_MSG_ERROR([libzstd version must be >= 1.4.0])]
-            )],
-            [AC_MSG_ERROR([libzstd not found])]
-        )]
+		LIBS="$LIBS -lzstd"
+		ZSTD_LIBS="-lzstd"
+		AC_SUBST(ZSTD_LIBS)
+		AC_SEARCH_LIBS(ZSTD_compressStream2, zstd, [], [AC_MSG_ERROR([libzstd not found])])
+	]
     )
+    CFLAGS="$CFLAGS $ZSTD_CFLAGS"
+    LIBS="$LIBS $ZSTD_LIBS"
+    AC_MSG_CHECKING([for libzstd streaming API >= 1.4.0])
+    AC_LINK_IFELSE(
+        [AC_LANG_PROGRAM(
+            [[ #include <zstd.h> ]],
+            [[
+	       ZSTD_CCtx* cctx = ZSTD_createCCtx();
+	       ZSTD_inBuffer input = {0};
+	       ZSTD_outBuffer output = {0};
+	       size_t ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 1);
+	       ret = ZSTD_compressStream2(cctx, &output, &input, ZSTD_e_continue) + ret;
+	       ZSTD_freeCCtx(cctx);
+	       return ZSTD_isError(ret) ? 1 : 0;
+            ]]
+        )],
+        [AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])
+         AC_MSG_ERROR([libzstd version must provide ZSTD_CCtx_setParameter and ZSTD_compressStream2])]
+    )
+    CFLAGS="$save_CFLAGS"
     LIBS="$save_LIBS"
+    AC_DEFINE([ENABLE_LIBZSTD], [1], [Indicator that LIBZSTD is present])
 fi
 AM_CONDITIONAL(ENABLE_LIBZSTD, test x$enable_libzstd = xyes)
 
@@ -1642,6 +1743,17 @@ AC_ARG_ENABLE(imdiag,
         [enable_imdiag=no]
 )
 
+# imbeats support
+AC_ARG_ENABLE(imbeats,
+        [AS_HELP_STRING([--enable-imbeats],[Enable Beats/Lumberjack v2 input module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_imbeats="yes" ;;
+          no) enable_imbeats="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-imbeats) ;;
+         esac],
+        [enable_imbeats=no]
+)
+
 
 # mmnormalize
 AC_ARG_ENABLE(mmnormalize,
@@ -1664,11 +1776,66 @@ if test "x$enable_mmnormalize" = "xyes"; then
 
 	AX_CHECK_DEFINED([[#include <lognorm-features.h>]],LOGNORM_REGEX_SUPPORTED,[lognorm_regex_supported="yes"],)
 
+	# --enable-turbo / --disable-turbo override for TurboVM autodetection.
+	# default=auto: honour lognorm-features.h like before.
+	# --disable-turbo: force the non-turbo code path even when liblognorm
+	#                  has TurboVM compiled in (useful for CI matrix).
+	# --enable-turbo:  fail hard if liblognorm lacks TURBO — avoids silent
+	#                  fallback when the user explicitly asked for it.
+	AC_ARG_ENABLE(turbo,
+	        [AS_HELP_STRING([--disable-turbo],[Disable liblognorm TurboVM acceleration in mmnormalize @<:@default=auto@:>@])],
+	        [case "${enableval}" in
+	         yes) enable_turbo="yes" ;;
+	          no) enable_turbo="no" ;;
+	           *) AC_MSG_ERROR(bad value ${enableval} for --enable-turbo) ;;
+	         esac],
+	        [enable_turbo=auto]
+	)
+	if test "x$enable_turbo" = "xno"; then
+		lognorm_turbo_supported="no"
+	else
+		AX_CHECK_DEFINED([[#include <lognorm-features.h>]],LOGNORM_TURBO_SUPPORTED,[lognorm_turbo_supported="yes"],)
+		# The public Turbo API lives in the dedicated installed header
+		# lognorm-turbo.h (liblognorm >= 2.1.0). Older turbo builds defined
+		# LOGNORM_TURBO_SUPPORTED but only shipped internal headers, which we
+		# no longer use. Require the public header so we build strictly
+		# against the opaque contract.
+		lognorm_turbo_header_missing="no"
+		if test "x$lognorm_turbo_supported" = "xyes"; then
+			AC_CHECK_HEADER([lognorm-turbo.h],[],
+				[lognorm_turbo_supported="no"; lognorm_turbo_header_missing="yes"])
+		fi
+		# ln_fast_result_is_truncated() post-dates the first public turbo
+		# header, so LOGNORM_TURBO_SUPPORTED does not imply it. Probe for it
+		# separately; mmnormalize only declines a truncated result when the
+		# installed liblognorm can report one.
+		lognorm_turbo_truncation_supported="no"
+		if test "x$lognorm_turbo_supported" = "xyes"; then
+			AC_CHECK_DECL([ln_fast_result_is_truncated],
+				[AC_DEFINE(HAVE_LN_FAST_RESULT_IS_TRUNCATED, 1,
+					[liblognorm exposes ln_fast_result_is_truncated()])
+				lognorm_turbo_truncation_supported="yes"],
+				[], [[#include <lognorm-turbo.h>]])
+		fi
+		if test "x$enable_turbo" = "xyes" -a "x$lognorm_turbo_supported" != "xyes"; then
+			if test "x$lognorm_turbo_header_missing" = "xyes"; then
+				AC_MSG_ERROR([--enable-turbo was requested but the public header lognorm-turbo.h is missing. Upgrade liblognorm to >= 2.1.0 (built with --enable-turbo).])
+			else
+				AC_MSG_ERROR([--enable-turbo was requested but LOGNORM_TURBO_SUPPORTED is not defined in lognorm-features.h. Upgrade liblognorm or rebuild it with --enable-turbo.])
+			fi
+		fi
+	fi
+
 	CFLAGS="$save_CFLAGS"
 	LIBS="$save_LIBS"
 fi
 AM_CONDITIONAL(LOGNORM_REGEX_SUPPORTED, test x$lognorm_regex_supported = xyes)
+AM_CONDITIONAL(LOGNORM_TURBO_SUPPORTED, test x$lognorm_turbo_supported = xyes)
+AM_CONDITIONAL(LOGNORM_TURBO_TRUNCATION_SUPPORTED, test x$lognorm_turbo_truncation_supported = xyes)
 AM_CONDITIONAL(ENABLE_MMNORMALIZE, test x$enable_mmnormalize = xyes)
+if test "x$lognorm_turbo_supported" = "xyes"; then
+	AC_DEFINE(HAVE_LOGNORM_TURBO, 1, [liblognorm has turbo VM support])
+fi
 
 # mmleefparse
 AC_ARG_ENABLE(mmleefparse,
@@ -1921,18 +2088,6 @@ AC_ARG_ENABLE(mmsnareparse,
 AM_CONDITIONAL(ENABLE_MMSNAREPARSE, test x$enable_mmsnareparse = xyes)
 
 
-# experimental omfile-hardened module
-AC_ARG_ENABLE(omfile-hardened,
-        [AS_HELP_STRING([--enable-omfile-hardened],[Enable omfile-hardened support @<:@default=no@:>@])],
-        [case "${enableval}" in
-         yes) enable_omfile_hardened="yes" ;;
-          no) enable_omfile_hardened="no" ;;
-           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omfile-hardened) ;;
-         esac],
-        [enable_omfile_hardened=no]
-)
-AM_CONDITIONAL(ENABLE_OMFILE_HARDENED, test x$enable_omfile_hardened = xyes)
-
 
 # RELP support
 AC_ARG_ENABLE(relp,
@@ -1964,6 +2119,8 @@ if test "x$enable_relp" = "xyes"; then
                       [AC_DEFINE([HAVE_RELPENGINESETTLSLIBBYNAME], [1], [Define if relpEngineSetTLSLibByName exists.])])
         AC_CHECK_FUNC([relpSrvSetTlsConfigCmd],
                       [AC_DEFINE([HAVE_RELPENGINESETTLSCFGCMD], [1], [Define if relpSrvSetTlsConfigCmd exists.])])
+        AC_CHECK_FUNC([relpCltSetKeepAlive],
+                      [AC_DEFINE([HAVE_RELPCLTSETKEEPALIVE], [1], [Define if relpCltSetKeepAlive exists.])])
         AC_CHECK_FUNC([relpSrvSetTlsConfigCmd],
                       [HAVE_RELPENGINESETTLSCFGCMD=1])
 
@@ -2198,6 +2355,20 @@ fi
 AM_CONDITIONAL(ENABLE_IMFILE_TESTS, test x$enable_imfile_tests = xyes)
 
 
+# settings for the fifo input module
+AC_ARG_ENABLE(imfifo,
+        [AS_HELP_STRING([--enable-imfifo],[fifo input module enabled @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_imfifo="yes" ;;
+          no) enable_imfifo="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-imfifo) ;;
+         esac],
+        [enable_imfifo=no]
+)
+AM_CONDITIONAL(ENABLE_IMFIFO, test x$enable_imfifo = xyes)
+
+
+
 # settings for the docker log input module
 AC_ARG_ENABLE(imdocker,
         [AS_HELP_STRING([--enable-imdocker],[input docker module enabled @<:@default=no@:>@])],
@@ -2213,6 +2384,21 @@ if test "x$enable_imdocker" = "xyes"; then
 	PKG_CHECK_MODULES([CURL], [libcurl >= 7.40.0])
 fi
 AM_CONDITIONAL(ENABLE_IMDOCKER, test x$enable_imdocker = xyes)
+
+AC_ARG_ENABLE(imkubernetes,
+        [AS_HELP_STRING([--enable-imkubernetes],[input kubernetes log module enabled @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_imkubernetes="yes" ;;
+          no) enable_imkubernetes="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-imkubernetes) ;;
+         esac],
+        [enable_imkubernetes=no]
+)
+if test "x$enable_imkubernetes" = "xyes"; then
+	AC_CHECK_HEADERS([curl/curl.h glob.h])
+	PKG_CHECK_MODULES([CURL], [libcurl >= 7.40.0])
+fi
+AM_CONDITIONAL(ENABLE_IMKUBERNETES, test x$enable_imkubernetes = xyes)
 
 AC_ARG_ENABLE(imdocker-tests,
         [AS_HELP_STRING([--enable-imdocker-tests],[Enable imdocker tests @<:@default=no@:>@])],
@@ -2543,6 +2729,7 @@ if test "x$enable_imdiag" = "xyes"; then
 	AC_DEFINE([ENABLE_IMDIAG], [1], [Indicator that IMDIAG is present])
 fi
 AM_CONDITIONAL(ENABLE_IMDIAG, test x$enable_imdiag = xyes)
+AM_CONDITIONAL(ENABLE_IMBEATS, test x$enable_imbeats = xyes)
 AM_CONDITIONAL(ENABLE_OMSTDOUT, test x$enable_omstdout = xyes)
 AM_CONDITIONAL(ENABLE_IMPSTATS, test x$enable_impstats = xyes)
 AM_CONDITIONAL(ENABLE_IMPSTATS_PUSH, test x$enable_impstats_push = xyes)
@@ -2818,6 +3005,17 @@ AC_ARG_ENABLE(omazuredce_tests,
 )
 AM_CONDITIONAL(ENABLE_OMAZUREDCE_TESTS, test x$enable_omazuredce_tests = xyes)
 
+AC_ARG_ENABLE(omawslogshlc_tests,
+        [AS_HELP_STRING([--enable-omawslogshlc-tests],[Enable omawslogshlc tests @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omawslogshlc_tests="yes" ;;
+          no) enable_omawslogshlc_tests="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omawslogshlc-tests) ;;
+         esac],
+        [enable_omawslogshlc_tests=no]
+)
+AM_CONDITIONAL(ENABLE_OMAWSLOGSHLC_TESTS, test x$enable_omawslogshlc_tests = xyes)
+
 AC_ARG_ENABLE(kafka_tests,
         [AS_HELP_STRING([--enable-kafka-tests],[Enable Kafka tests, needs Java @<:@default=no@:>@])],
         [case "${enableval}" in
@@ -2952,6 +3150,65 @@ if test "x$enable_omazuredce" = "xyes" -o "x$enable_omazuredce" = "xoptional"; t
 	])
 fi
 AM_CONDITIONAL(ENABLE_OMAZUREDCE, test x$enable_omazuredce = xyes -o x$enable_omazuredce = xoptional)
+
+# omawslogshlc support for output module (CloudWatch Logs via HLC endpoint)
+AC_ARG_ENABLE(omawslogshlc,
+        [AS_HELP_STRING([--enable-omawslogshlc],[Compiles omawslogshlc output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omawslogshlc="yes" ;;
+          no) enable_omawslogshlc="no" ;;
+         optional) enable_omawslogshlc="optional" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omawslogshlc) ;;
+         esac],
+        [enable_omawslogshlc=no]
+)
+if test "x$enable_omawslogshlc" = "xyes" -o "x$enable_omawslogshlc" = "xoptional"; then
+	PKG_CHECK_MODULES([CURL], [libcurl], , [
+		AS_IF([test x$enable_omawslogshlc = xyes],
+			AC_MSG_FAILURE([omawslogshlc requires libcurl])
+		)
+		enable_omawslogshlc="no"
+	])
+fi
+AM_CONDITIONAL(ENABLE_OMAWSLOGSHLC, test x$enable_omawslogshlc = xyes -o x$enable_omawslogshlc = xoptional)
+
+# Amazon Kinesis Data Streams PutRecord output, signed by libcurl.
+AC_ARG_ENABLE(omkinesis,
+        [AS_HELP_STRING([--enable-omkinesis],[Compiles omkinesis output module (requires libcurl >= 7.75.0) @<:@default=optional@:>@])],
+        [case "${enableval}" in
+         yes|no|optional) enable_omkinesis="${enableval}" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omkinesis) ;;
+         esac],
+        [enable_omkinesis=optional])
+AS_IF([test "x$enable_omkinesis" = "xyes" -o "x$enable_omkinesis" = "xoptional"], [
+        PKG_CHECK_MODULES([OMKINESIS_CURL], [libcurl >= 7.75.0], [], [
+                AS_IF([test "x$enable_omkinesis" = "xyes"],
+                      [AC_MSG_FAILURE([omkinesis requires libcurl >= 7.75.0])],
+                      [enable_omkinesis=no])
+        ])
+        AS_IF([test "x$enable_omkinesis" != "xno"], [
+                rsyslog_saved_CPPFLAGS="$CPPFLAGS"
+                rsyslog_saved_LIBS="$LIBS"
+                CPPFLAGS="$CPPFLAGS $OMKINESIS_CURL_CFLAGS"
+                LIBS="$OMKINESIS_CURL_LIBS $LIBS"
+                AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <curl/curl.h>]],
+                        [[CURLoption option = CURLOPT_AWS_SIGV4;
+                          CURLU *url = curl_url();
+                          char *host = 0;
+                          curl_url_set(url, CURLUPART_URL, "https://example.com", 0);
+                          curl_url_get(url, CURLUPART_HOST, &host, 0);
+                          curl_free(host);
+                          curl_url_cleanup(url);
+                          return option == 0;]])], [], [
+                        AS_IF([test "x$enable_omkinesis" = "xyes"],
+                              [AC_MSG_FAILURE([omkinesis requires libcurl AWS SigV4 and URL API support])],
+                              [enable_omkinesis=no])
+                ])
+                CPPFLAGS="$rsyslog_saved_CPPFLAGS"
+                LIBS="$rsyslog_saved_LIBS"
+        ])
+])
+AM_CONDITIONAL(ENABLE_OMKINESIS, test "x$enable_omkinesis" = "xyes" -o "x$enable_omkinesis" = "xoptional")
 
 # omazureeventhubs support for output module
 AC_ARG_ENABLE(omazureeventhubs,
@@ -3503,11 +3760,13 @@ AC_CONFIG_FILES([Makefile \
 		plugins/omruleset/Makefile \
 		plugins/omuxsock/Makefile \
 		plugins/imfile/Makefile \
+		plugins/imfifo/Makefile \
 		plugins/imsolaris/Makefile \
 		plugins/imptcp/Makefile \
 		plugins/impstats/Makefile \
 		plugins/imrelp/Makefile \
 		plugins/imdiag/Makefile \
+		plugins/imbeats/Makefile \
 		plugins/imkafka/Makefile \
 		plugins/omtesting/Makefile \
 		plugins/omgssapi/Makefile \
@@ -3521,31 +3780,33 @@ AC_CONFIG_FILES([Makefile \
 		plugins/omudpspoof/Makefile \
 		plugins/ommongodb/Makefile \
 		plugins/mmnormalize/Makefile \
-        plugins/mmjsonparse/Makefile \
-        plugins/mmjsontransform/Makefile \
-        plugins/mmleefparse/Makefile \
+		plugins/mmjsonparse/Makefile \
+		plugins/mmjsontransform/Makefile \
+		plugins/mmleefparse/Makefile \
 		plugins/mmaudit/Makefile \
 		plugins/mmanon/Makefile \
 		plugins/mmrm1stspace/Makefile \
 		plugins/mmutf8fix/Makefile \
-        plugins/mmfields/Makefile \
-        plugins/mmpstrucdata/Makefile \
-        plugins/mmaitag/Makefile \
-        plugins/omelasticsearch/Makefile \
+		plugins/mmfields/Makefile \
+		plugins/mmpstrucdata/Makefile \
+		plugins/mmaitag/Makefile \
+		plugins/omelasticsearch/Makefile \
 		plugins/omclickhouse/Makefile \
 		plugins/mmsnmptrapd/Makefile \
 		plugins/pmlastmsg/Makefile \
 		plugins/mmdblookup/Makefile \
 		plugins/omazureeventhubs/Makefile \
 		plugins/omazuredce/Makefile \
+		plugins/omawslogshlc/Makefile \
+		plugins/omkinesis/Makefile \
 		plugins/imdtls/Makefile \
 		plugins/omdtls/Makefile \
 		contrib/mmdarwin/Makefile \
 		contrib/omhttp/Makefile \
-        contrib/fmhash/Makefile \
-        contrib/fmunflatten/Makefile \
-        plugins/fmpcre/Makefile \
-        contrib/ffaup/Makefile \
+		contrib/fmhash/Makefile \
+		contrib/fmunflatten/Makefile \
+		plugins/fmpcre/Makefile \
+		contrib/ffaup/Makefile \
 		contrib/pmsnare/Makefile \
 		contrib/pmpanngfw/Makefile \
 		contrib/pmaixforwardedfrom/Makefile \
@@ -3564,8 +3825,8 @@ AC_CONFIG_FILES([Makefile \
 		contrib/omamqp1/Makefile \
 		contrib/omtcl/Makefile \
 		contrib/imbatchreport/Makefile \
-		contrib/omfile-hardened/Makefile \
 		contrib/mmkubernetes/Makefile \
+		contrib/imkubernetes/Makefile \
 		contrib/impcap/Makefile \
 		contrib/imtuxedoulog/Makefile \
 		contrib/improg/Makefile \
@@ -3613,7 +3874,9 @@ echo "    plain tcp input module enabled:           $enable_imptcp"
 echo "    DTLS udp input module enabled:            $enable_imdtls"
 echo "    imdiag enabled:                           $enable_imdiag"
 echo "    file input module enabled:                $enable_imfile"
+echo "    fifo input module enabled:                $enable_imfifo"
 echo "    docker log input module enabled:          $enable_imdocker"
+echo "    kubernetes log input module enabled:      $enable_imkubernetes"
 echo "    Solaris input module enabled:             $enable_imsolaris"
 echo "    periodic statistics module enabled:       $enable_impstats"
 echo "    imczmq input module enabled:              $enable_imczmq"
@@ -3621,6 +3884,7 @@ echo "    imjournal input module enabled:           $enable_imjournal"
 if test "$enable_imjournal" = "optional"; then
 echo "        imjournal use dummy:                  $imjournal_use_dummy"
 fi
+echo "    imbeats input module enabled:             $enable_imbeats"
 echo "    imbatchreport input module enabled:       $enable_imbatchreport"
 echo "    imkafka module will be compiled:          $enable_imkafka"
 if test "$enable_imkafka" = "optional"; then
@@ -3634,7 +3898,6 @@ echo "    imhiredis input module enabled:           $enable_imhiredis"
 echo
 echo "---{ output plugins }---"
 echo "    Mail support enabled:                     $enable_mail"
-echo "    omfile-hardened module will be compiled:  $enable_omfile_hardened"
 echo "    omprog module will be compiled:           $enable_omprog"
 echo "    omstdout module will be compiled:         $enable_omstdout"
 echo "    omsendertrack module will be compiled:    $enable_omsendertrack"
@@ -3656,6 +3919,8 @@ echo "    omkafka module will be compiled:          $enable_omkafka"
 echo "    omhiredis module will be compiled:        $enable_omhiredis"
 echo "    omazureeventhubs module will be compiled: $enable_omazureeventhubs"
 echo "    omazuredce module will be compiled:       $enable_omazuredce"
+echo "    omawslogshlc module will be compiled:     $enable_omawslogshlc"
+echo "    omkinesis module will be compiled:        $enable_omkinesis"
 echo "    omdtls module will be compiled:           $enable_omdtls"
 echo
 echo "---{ parser modules }---"
@@ -3703,6 +3968,8 @@ echo
 echo "---{ protocol support }---"
 echo "    openssl network stream driver enabled:    $enable_openssl"
 echo "    wolfssl network stream driver enabled:    $enable_wolfssl"
+echo "        with CRL support:                     $rsyslog_wolfssl_has_crl"
+echo "        with OCSP support:                    $rsyslog_wolfssl_has_ocsp"
 echo "    GnuTLS network stream driver enabled:     $enable_gnutls"
 echo "    Mbed TLS network stream driver enabled:   $enable_mbedtls"
 echo "    GSSAPI Kerberos 5 support enabled:        $enable_gssapi_krb5"
@@ -3734,6 +4001,7 @@ echo "    Kafka Tests enabled:                      $enable_kafka_tests"
 echo "    Redis Tests enabled:                      $enable_redis_tests"
 echo "    Omazureeventhubs Tests enabled:           $enable_omazureeventhubs_tests"
 echo "    Omazuredce Tests enabled:                 $enable_omazuredce_tests"
+echo "    Omawslogshlc Tests enabled:               $enable_omawslogshlc_tests"
 echo "    Imdocker Tests enabled:                   $enable_imdocker_tests"
 echo "    imtcp tests enabled:                      $enable_imtcp_tests"
 echo "    gnutls tests enabled:                     $enable_gnutls_tests"
@@ -3742,6 +4010,7 @@ echo "    systemd journal tests enabled:            $enable_journal_tests"
 echo "    SNMP Tests enabled:                       $enable_snmp_tests"
 echo "    Flaky Tests enabled:                      $enable_flaky_tests"
 echo "    Debug mode enabled:                       $enable_debug"
+echo "    libFuzzer targets enabled:                $enable_fuzzing"
 echo "    (total) debugless mode enabled:           $enable_debugless"
 echo "    Diagnostic tools enabled:                 $enable_diagtools"
 echo "    End-User tools enabled:                   $enable_usertools"

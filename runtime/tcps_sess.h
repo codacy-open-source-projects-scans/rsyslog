@@ -25,9 +25,21 @@
 #include "rsyslog.h"
 #include "obj.h"
 #include "prop.h"
+#include <zlib.h>
 
 /* a forward-definition, we are somewhat cyclic */
 struct tcpsrv_s;
+
+#define TCPSRV_COMPRESS_NEVER 0
+#define TCPSRV_COMPRESS_STREAM_ALWAYS 2
+
+#define TCPSRV_COMPRESS_DRIVER_ZLIB 0
+#define TCPSRV_COMPRESS_DRIVER_ZSTD 1
+
+#define TCPSRV_COMPRESS_MAX_EXPANSION_RATIO_DEFAULT 1024
+#define TCPSRV_COMPRESS_MAX_DECOMPRESSED_BYTES_PER_RECEIVE_DEFAULT (64ULL * 1024ULL * 1024ULL)
+#define TCPSRV_COMPRESS_MAX_TOTAL_ZSTD_WINDOW_BYTES_DEFAULT (64ULL * 1024ULL * 1024ULL)
+#define TCPSRV_ZSTD_FRAME_HEADER_MAX 18
 
 /* the tcps_sess object */
 struct tcps_sess_s {
@@ -46,6 +58,7 @@ struct tcps_sess_s {
             eInMsgTruncating,
             eInMsgCheckMultiLine
         } inputState; /* our current state */
+        sbool bFrameOversize; /* current frame exceeded maxMessageSize before submit */
         int iOctetsRemain; /* Number of Octets remaining in message */
         TCPFRAMINGMODE eFraming;
         uchar *pMsg; /* message (fragment) received */
@@ -54,7 +67,6 @@ struct tcps_sess_s {
         prop_t *fromHostPort;
         int iCurrLine; /* 2nd char of current line in regex framing mode */
         uchar *pMsg_save; /* message (fragment) save area in regex framing mode */
-        actWrkrIParams_t perSourceKeyParam; /**< reusable template buffer */
         void *pUsr; /* a user-pointer */
         rsRetVal (*DoSubmitMessage)(tcps_sess_t *, uchar *, int); /* submit message callback */
         int iMaxLine; /* fast lookup buffer for config property */
@@ -63,6 +75,23 @@ struct tcps_sess_s {
         uchar tlsProbeBuf[5]; /**< first bytes received for TLS client detection */
         sbool tlsProbeDone; /**< indicates TLS client detection has been completed */
         sbool tlsMismatchWarned; /**< avoids logging the same TLS mismatch twice */
+        uint8_t compressionMode;
+        uint8_t compressionDriver;
+        uint64_t compressionMaxExpansionRatio;
+        uint64_t compressionMaxDecompressedBytesPerReceive;
+        uint64_t compressionMaxTotalZstdWindowBytes;
+        uint64_t compressionTotalBytesIn;
+        uint64_t compressionTotalBytesOut;
+        sbool zipInitDone;
+        sbool compressedStreamEnded;
+        sbool compressedStreamFailed;
+        sbool streamDecompressed;
+        z_stream zstrm;
+        void *zstdDctx;
+        uchar zstd_frame_header[TCPSRV_ZSTD_FRAME_HEADER_MAX];
+        size_t zstd_frame_header_len;
+        sbool zstd_frame_header_processed;
+        uint64_t zstd_window_reservation;
 };
 
 
@@ -101,6 +130,12 @@ ENDinterface(tcps_sess)
 /* prototypes */
 PROTOTYPEObjFull(tcps_sess);
 PROTOTYPEObjDebugPrint(tcps_sess);
+
+#ifdef ENABLE_FUZZING
+rsRetVal tcps_sessFuzzInit(void);
+rsRetVal tcps_sessFuzzInput(const uint8_t *data, size_t size);
+void tcps_sessFuzzExit(void);
+#endif
 
 
 #endif /* #ifndef INCLUDED_TCPS_SESS_H */

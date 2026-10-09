@@ -10,7 +10,7 @@ global(	defaultNetstreamDriverCAFile="'$srcdir/tls-certs/ca-fail.pem'"
 )
 
 module(load="../plugins/imtcp/.libs/imtcp" StreamDriver.Name="ossl" StreamDriver.Mode="1")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 action(type="omfile" file="'$RSYSLOG_OUT_LOG'")
 '
@@ -18,6 +18,7 @@ action(type="omfile" file="'$RSYSLOG_OUT_LOG'")
 startup
 shutdown_when_empty
 wait_shutdown
-content_check "Error: CA certificate could not be accessed"
+content_check "Error: CA certificate '"
+content_check "could not be accessed"
 content_check "OpenSSL Error Stack:"
 exit_test

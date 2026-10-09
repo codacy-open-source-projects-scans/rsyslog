@@ -1,3 +1,7 @@
+.. meta::
+   :description: Reference for rsyslog queue parameters, including memory, disk, and disk-assisted queue behavior.
+   :keywords: rsyslog, queue parameters, disk queue, segmented disk, disk assisted, RainerScript, YAML
+
 ************************
 General Queue Parameters
 ************************
@@ -23,6 +27,13 @@ set up by default.
 
 To fully understand queue parameters and how they interact, be sure to
 read the :doc:`queues <../concepts/queues>` documentation.
+
+.. summary-start
+
+Queue parameters configure main, ruleset, and action queue capacity,
+concurrency, persistence, disk-assisted behavior, and shutdown policy.
+
+.. summary-end
 
 
 Configuration Parameters
@@ -55,6 +66,87 @@ created in a specific directory, specify ``queue.spoolDirectory``
 for this. The filename is used to build to complete path for queue
 files.
 
+For the experimental ``segmentedDisk`` queue type, ``queue.filename`` is
+required. Configuration fails if it is omitted.
+
+
+queue.diskQueueType
+-------------------
+
+.. csv-table::
+   :header: "type", "default", "mandatory", "|FmtObsoleteName| directive"
+   :widths: auto
+   :class: parameter-table
+
+   "word", "auto", "no", "none"
+
+Selects the disk engine used by a disk-assisted ``FixedArray`` or
+``LinkedList`` queue. It does not change the memory-first behavior: no disk
+store is created until the queue spills past its high watermark.
+
+Accepted values are:
+
+* ``auto``: use ``segmentedDisk`` for a fresh queue. Existing classic ``.qi``
+  or numeric queue files select ``Disk`` and emit a warning. Existing
+  segmented state selects ``segmentedDisk``.
+* ``disk``: require the classic disk queue engine.
+* ``segmentedDisk``: require the segmented engine.
+
+The selection is recorded in a small versioned
+``<queue.filename>.da-engine`` file. Malformed markers, mixed classic and
+segmented stores, and an explicit engine that conflicts with existing data
+fail queue initialization. ``auto`` selects classic ``Disk`` when encryption
+or a classic-only corruption mode is configured. Explicit ``segmentedDisk``
+rejects those unsupported options.
+
+For a fresh segmented selection, neither the marker nor the ``.segq`` store is
+created until the first spill. The marker is made durable before the store is
+materialized. Idle cleanup removes the store but retains that marker.
+
+This parameter has no legacy directive alias. Outside a disk-assisted memory
+queue it is reported as dirty configuration and ignored.
+
+
+queue.diskQueueAutoUpgrade
+--------------------------
+
+.. csv-table::
+   :header: "type", "default", "mandatory", "|FmtObsoleteName| directive"
+   :widths: auto
+   :class: parameter-table
+
+   "binary", "off", "no", "none"
+
+Applies only when ``queue.diskQueueType="auto"``. With the default ``off``, an
+automatically selected classic engine remains sticky after its backlog drains.
+With ``on``, the next clean restart after that drain selects an unmaterialized
+segmented child. Records are never converted and engines never switch while a
+process is running.
+
+
+queue.diskQueueIdleTimeout
+--------------------------
+
+.. csv-table::
+   :header: "type", "default", "mandatory", "|FmtObsoleteName| directive"
+   :widths: auto
+   :class: parameter-table
+
+   "integer", "60000", "no", "none"
+
+Controls how long, in milliseconds, an empty segmented disk-assisted child
+remains materialized. After the complete interval passes without new producer
+or disk-transfer activity, rsyslog durably removes the empty segmented store
+and lets its final disk-consumer worker terminate. The engine marker remains.
+A later spill recreates both the store and workers transparently.
+
+``0`` requests cleanup immediately after a safe drain. ``-1`` disables runtime
+dematerialization. Recovery work, in-flight batches, retries, or uncertain
+cleanup state postpone cleanup. This timeout is independent of
+``queue.timeoutWorkerThreadShutdown`` and applies only to an effective
+segmented disk-assisted child. A nondefault value with explicit classic
+``disk`` is dirty configuration and is ignored.
+
 
 queue.spoolDirectory
 --------------------
@@ -70,6 +162,10 @@ This is the directory into which queue files will be stored. Note
 that the directory must exist, it is NOT automatically created by
 rsyslog. If no spoolDirectory is specified, the work directory is
 used.
+
+The experimental ``segmentedDisk`` queue type requires either this parameter
+or a configured global work directory. The selected directory must already
+exist.
 
 
 queue.size
@@ -300,6 +396,14 @@ However, disk queues can be set to write bookkeeping information on checkpoints
 checkpoint interval is set to one, no data can be lost, but the queue is
 exceptionally slow.
 
+For ``queue.type="segmentedDisk"``, the same default of ``0`` applies. A
+positive interval counts records by which the contiguous commit frontier
+advanced, not batches and not out-of-order worker completions. A larger value
+reduces state-file writes and SSD wear but can replay more already-processed
+records after a crash. Topology transitions, segment-ID reservation, deletion,
+and clean shutdown can force additional state writes regardless of this
+interval.
+
 
 queue.syncqueuefiles
 --------------------
@@ -328,10 +432,17 @@ queue.onCorruption
 
    "word", "safe", "no", "none"
 
-Controls how rsyslog handles disk queue corruption detected during startup.
-This applies to queue files and checkpoint state (``.qi``).
+Controls how rsyslog handles disk queue corruption. Classic disk queues can
+detect corruption during startup; segmented disk queues defer payload checks
+until dequeue.
 
-Supported values are:
+``segmentedDisk`` currently accepts only ``safe``. For that backend, safe mode
+performs record-level salvage: corrupt framed records are skipped and scanning
+continues at the next valid record. A crash-left active segment becomes a lazy
+recovery segment while a newly reserved active segment accepts new messages.
+The classic disk queue has separate corruption policies and behavior.
+
+For the classic disk queue, supported values are:
 
 * ``safe``: detect corruption, move queue files to a timestamped
   ``.bad`` directory, and start with a fresh disk queue.
@@ -367,6 +478,29 @@ It provides a way to sample data each N events, instead of processing all, in or
 to reduce resources usage (disk, bandwidth...)
 
 
+queue.mutexContentionStats
+--------------------------
+
+.. csv-table::
+   :header: "type", "default", "mandatory", "|FmtObsoleteName| directive"
+   :widths: auto
+   :class: parameter-table
+
+   "binary", "off", "no", "none"
+
+Enables mutex contention diagnostics for this queue only. When enabled together
+with impstats, the queue reports ``mutex.contention`` and ``mutex.wait_ns``.
+The diagnostic probes runtime producer and consumer mutex acquisition paths
+with ``trylock``; startup and shutdown coordination are intentionally outside
+the metric's scope. Enable it temporarily for the queue under investigation
+rather than globally. Configure this option before starting the queue; changing
+queue parameters on reload can replace a queue and its pending in-memory work.
+Action queues use the same parameter with the ``queue.`` prefix, for example
+``queue.mutexContentionStats="on"`` in an action definition. In YAML,
+configure ``queue.mutexContentionStats: on`` under the corresponding
+``mainqueue``.
+
+
 queue.type
 ----------
 
@@ -377,9 +511,15 @@ queue.type
 
    "word", "Direct", "no", "``$ActionQueueType``"
 
-Specifies the type of queue that will be used. Possible options are "FixedArray",
-"LinkedList", "Direct" or "Disk". For more information read the documentation
-for :doc:`queues <../concepts/queues>`.
+Specifies the type of queue that will be used. Possible options are
+``FixedArray``, ``LinkedList``, ``Direct``, ``Disk``, or the experimental
+``segmentedDisk`` pure-disk backend. For more information read the
+documentation for :doc:`queues <../concepts/queues>`.
+
+``segmentedDisk`` must be configured through modern object parameters; the
+legacy ``$ActionQueueType`` directive does not accept it. It requires
+``queue.filename`` plus either ``queue.spoolDirectory`` or a global work
+directory.
 
 
 queue.workerThreads
@@ -473,6 +613,7 @@ queue.timeoutEnqueue
 
 This timeout value is used when the queue is full. If rsyslog cannot
 enqueue a message within the timeout period, the message is discarded.
+A value of ``0`` discards the message immediately when the queue is full.
 Note that this is setting of last resort (assuming defaults are used
 for the queue settings or proper parameters are set): all delayable
 inputs (like imtcp or imfile) have already been pushed back at this
@@ -527,7 +668,9 @@ queue.maxFileSize
 
    "integer", "1m/16m", "no", "``$ActionQueueMaxFileSize``"
 
-Specifies the maximum size for the disk-assisted queue file.
+Specifies the maximum size for a disk queue file. For ``segmentedDisk`` it is
+the target size of each segment; a single oversized record is stored in a
+dedicated segment and may exceed this target.
 Parameter can be specified in Mebibyte or Gibibyte, default for action
 queues is 1m and for ruleset queues 16m (1m = 1024*1024).
 
@@ -542,7 +685,17 @@ queue.saveOnShutdown
 
    "binary", "off", "no", "``$ActionQueueSaveOnShutdown``"
 
-This parameter specifies if data should be saved at shutdown.
+This parameter specifies if queued data should be saved during an
+orderly rsyslog shutdown. It applies to disk-assisted queues, letting
+rsyslog persist messages that are still in the memory portion of the
+queue before the process exits.
+
+The setting does not protect messages that are still in memory when the
+process is killed without graceful shutdown handling, for example by
+``SIGKILL``, the kernel OOM killer, a system crash, or power loss. Use a
+pure disk queue plus appropriate ``queue.checkpointInterval`` and
+``queue.syncqueuefiles`` settings when crash durability is more important
+than throughput.
 
 
 queue.dequeueSlowDown

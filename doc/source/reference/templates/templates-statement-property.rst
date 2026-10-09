@@ -36,10 +36,38 @@ Parameters
 
 - ``date.inUTC`` – show date in UTC. Available since 8.18.0.
 - ``caseConversion`` – convert text case; ``lower`` or ``upper``
-- ``controlCharacters`` – handle control characters: ``escape``, ``space``,
-  or ``drop``
-- ``securePath`` – create safe paths for dynafile templates; ``drop`` or
-  ``replace``
+- ``controlCharacters`` – handle control characters: ``escape``,
+  ``escape-octal``, ``space``, or ``drop``. ``escape`` keeps the legacy
+  decimal ``#010`` style, while ``escape-octal`` uses the octal ``#012`` style
+  used by receive-time control-character escaping.
+
+  RainerScript example:
+
+  .. code-block:: none
+
+     template(name="octal-control" type="list") {
+         property(name="msg" controlCharacters="escape-octal")
+         constant(value="\n")
+     }
+
+  YAML example:
+
+  .. code-block:: yaml
+
+     templates:
+       - name: octal-control
+         type: list
+         elements:
+           - property:
+               name: msg
+               controlCharacters: escape-octal
+           - constant:
+               value: "\n"
+- ``securePath`` – escape a property for use as one path component in an
+  ``omfile`` dynafile template; ``drop`` removes path separators and
+  ``replace`` changes them to ``_``. Use ``replace`` for message-derived
+  fields such as host names, application names, program names, or parsed
+  variables.
 - ``format`` – field format. Supported values:
 
   - ``csv`` – generate CSV data
@@ -86,6 +114,31 @@ Parameters
   - ``auto`` – use number if integer, otherwise string
   - ``bool`` – emit ``true`` unless value is empty or ``0``
 
+  ``dataType`` does not create JSON arrays or objects from strings. If the
+  incoming message text contains JSON such as ``["a","b"]``, parse it first
+  with :ref:`mmjsonparse <ref-mmjsonparse>`. If an already extracted property
+  contains JSON text, parse that string with :doc:`parse_json()
+  <../../rainerscript/functions/rs-parse_json>`. Then render the parsed
+  property with ``format="jsonf"``. Rsyslog intentionally does not provide
+  ``dataType="array"`` for templates.
+
 - ``onEmpty`` – for ``jsonf`` format only; handling of empty values:
   ``keep``, ``skip``, or ``null``
 
+Dynafile path components
+------------------------
+
+When a list template is used as an ``omfile`` ``dynaFile`` name, apply
+``securePath="replace"`` to every property that can be influenced by the
+message or sender. Fixed directory separators belong in ``constant()``
+statements; do not apply ``securePath`` to the complete path.
+
+.. code-block:: none
+
+   template(name="DynFile" type="list") {
+     constant(value="/var/log/hosts/")
+     property(name="hostname" securePath="replace")
+     constant(value="/")
+     property(name="programname" securePath="replace")
+     constant(value=".log")
+   }

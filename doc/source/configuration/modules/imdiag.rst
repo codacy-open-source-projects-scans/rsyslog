@@ -5,16 +5,23 @@ imdiag: Diagnostic instrumentation
 :Author: Rainer Gerhards
 :Available since: at least 5.x
 
+.. warning::
+
+   **Testing and controlled diagnostics**
+
+   This module is intended for the testbench and controlled diagnostics. It
+   provides message injection and queue control over TCP and has no internal
+   access control (ACLs). Limit exposure to trusted hosts with external
+   controls such as firewalls or host isolation.
+
 Purpose
 -------
 
 The imdiag input module exposes a TCP-based diagnostics and control channel
-that can inject messages into the
-main queue, wait for queues to drain, coordinate statistics reporting, and
-exercise other helper functions used by the rsyslog testbench. While imdiag is
-primarily intended for automated testing, it can also be used to diagnose
-production systems. Because the interface permits queue control and message
-injection, it **must only be exposed to trusted hosts**.
+that can inject messages into the main queue, wait for queues to drain,
+coordinate statistics reporting, and exercise other helper functions used by the
+rsyslog testbench. Because the interface permits queue control and message
+injection, expose it only to trusted hosts in controlled environments.
 
 Configuration Parameters
 ------------------------
@@ -37,8 +44,8 @@ Module Parameters
      - .. include:: ../../reference/parameters/imdiag-aborttimeout.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
-   * - :ref:`param-imdiag-listenportfilename-module`
-     - .. include:: ../../reference/parameters/imdiag-listenportfilename-module.rst
+   * - :ref:`param-imdiag-properterminationfile`
+     - .. include:: ../../reference/parameters/imdiag-properterminationfile.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
    * - :ref:`param-imdiag-mainmsgqueuetimeoutshutdown`
@@ -69,16 +76,6 @@ Module Parameters
      - .. include:: ../../reference/parameters/imdiag-maxsessions.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
-
-Input Parameters
-~~~~~~~~~~~~~~~~
-
-.. list-table::
-   :widths: 30 70
-   :header-rows: 1
-
-   * - Parameter
-     - Summary
    * - :ref:`param-imdiag-listenportfilename`
      - .. include:: ../../reference/parameters/imdiag-listenportfilename.rst
         :start-after: .. summary-start
@@ -115,10 +112,9 @@ ephemeral port, and records the chosen port for the testbench to read.
 
 .. code-block:: rsyslog
 
-   module(load="imdiag")
-   input(type="imdiag"
-         listenPortFileName="/var/run/rsyslog/imdiag.port"
-         serverRun="0")
+   module(load="imdiag"
+          listenPortFileName="/var/run/rsyslog/imdiag.port"
+          serverRun="0")
 
 YAML-only testbench configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -137,7 +133,9 @@ that it does not conflict with the test's own ``modules:`` section.
    testbench_modules:
      - load: "../plugins/imdiag/.libs/imdiag"
        listenportfilename: "test.imdiag.port"
+       serverrun: "0"
        aborttimeout: "580"
+       properterminationfile: "./rstb.example.proper-termination"
        mainmsgqueuetimeoutshutdown: "10000"
        mainmsgqueuetimeoutenqueue: "30000"
        inputshutdowntimeout: "60000"
@@ -148,8 +146,6 @@ that it does not conflict with the test's own ``modules:`` section.
      - load: "../plugins/imtcp/.libs/imtcp"
 
    inputs:
-     - type: imdiag
-       port: "0"
      - type: imtcp
        port: "0"
 
@@ -157,6 +153,7 @@ that it does not conflict with the test's own ``modules:`` section.
    :hidden:
 
    ../../reference/parameters/imdiag-aborttimeout
+   ../../reference/parameters/imdiag-properterminationfile
    ../../reference/parameters/imdiag-listenportfilename-module
    ../../reference/parameters/imdiag-mainmsgqueuetimeoutshutdown
    ../../reference/parameters/imdiag-mainmsgqueuetimeoutenqueue

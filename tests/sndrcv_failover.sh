@@ -18,11 +18,10 @@ export RSYSLOG_DEBUGLOG="log"
 # start up the instances
 #export RSYSLOG_DEBUG="debug nostdout noprintmutexaction"
 generate_conf
-export PORT_RCVR="$(get_free_port)"
 add_conf '
 # then SENDER sends to this port (not tcpflood!)
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 $template outfmt,"%msg:F,58:2%\n"
 $template dynfile,"'$RSYSLOG_OUT_LOG'" # trick to use relative path names!

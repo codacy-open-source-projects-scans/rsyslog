@@ -3,7 +3,9 @@
 # check for INVALID fingerprint!
 # This file is part of the rsyslog project, released under ASL 2.0
 . ${srcdir:=.}/diag.sh init
-export NUMMESSAGES=10000
+
+export NUMMESSAGES=3
+export QUEUE_EMPTY_CHECK_FUNC=wait_file_lines
 #export RSYSLOG_DEBUG="debug nostdout"
 #export RSYSLOG_DEBUGLOG="log"
 generate_conf
@@ -21,12 +23,13 @@ module(	load="../plugins/imtcp/.libs/imtcp"
 	StreamDriver.AuthMode="x509/fingerprint"
 	PermittedPeer=["SHA1:FF:C6:62:D5:9D:25:9F:BC:F3:CB:61:FA:D2:B3:8B:61:88:D7:06:C3"] # INVALID!
 	)
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" )
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" )
 
 action(type="omfile" file="'$RSYSLOG_OUT_LOG'")
 '
 startup
 tcpflood --check-only -p'$TCPFLOOD_PORT' -m$NUMMESSAGES -Ttls -x$srcdir/tls-certs/ca.pem -Z$srcdir/tls-certs/cert.pem -z$srcdir/tls-certs/key.pem
+shutdown_when_empty
 wait_shutdown
 content_check --regex "peer fingerprint .* unknown"
 exit_test

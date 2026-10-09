@@ -58,11 +58,7 @@
 #include "dirty.h"
 #include "datetime.h"
 
-/* If your build already injects the header, you may omit this include.
-   Otherwise, prefer the canonical libfastjson path: */
-// #include <json.h>
-#include <libfastjson/json.h>
-#include <libfastjson/json_tokener.h>
+#include <json.h>
 
 MODULE_TYPE_INPUT;
 MODULE_TYPE_NOKEEP;
@@ -77,6 +73,8 @@ MODULE_CNFNAME("imkafka")
  * - JSON splitting (splitJsonRecords) operates on a per-message basis with
  *   no shared mutable state. Each split record is submitted independently
  *   to the rsyslog core, which handles its own queuing and threading.
+ * - A module-local atomic stop flag lets runInput() ask already-started
+ *   workers to exit during partial startup teardown before joining them.
  * - No additional locking required beyond existing instance-level processing
  *   and librdkafka's internal thread-safety guarantees.
  * ============================================================================= */
@@ -133,7 +131,8 @@ struct kafka_params {
 
 /* Module static data */
 static struct configSettings_s {
-    uchar *topic;
+    uchar **topics;
+    int nTopics;
     uchar *consumergroup;
     char *brokers;
     uchar *pszBindRuleset;
@@ -142,7 +141,8 @@ static struct configSettings_s {
 } cs;
 
 typedef struct instanceConf_s {
-    uchar *topic;
+    uchar **topics; /* Array of topic names to consume from */
+    int nTopics; /* Number of topics in the topics array */
     uchar *consumergroup;
     char *brokers;
     int64_t offset;
@@ -170,9 +170,14 @@ typedef struct instanceConf_s {
     STATSCOUNTER_DEF(ctrMaxLag, mutCtrMaxLag);
 } instanceConf_t;
 
+/* Hard fan-out ceiling for split.json.records to avoid queue amplification
+ * from a single broker message. */
+#define IMKAFKA_MAX_JSON_SPLIT_RECORDS 10000
+
 typedef struct modConfData_s {
     rsconf_t *pConf; /* our overall config object */
-    uchar *topic;
+    uchar **topics; /* Array of topic names (module default) */
+    int nTopics; /* Number of default topics */
     uchar *consumergroup;
     char *brokers;
     instanceConf_t *root, *tail;
@@ -183,6 +188,8 @@ typedef struct modConfData_s {
 /* global data */
 pthread_attr_t wrkrThrdAttr; /* Attribute for worker threads ; read only after startup */
 static int activeKafkaworkers = 0;
+static int stopKafkaWorkers = 0;
+DEF_ATOMIC_HELPER_MUT(mutStopImkafkaWorkers);
 /* The following structure controls the worker threads. Global data is
  * needed for their access.
  */
@@ -205,8 +212,8 @@ static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / si
 
 /* input instance parameters */
 static struct cnfparamdescr inppdescr[] = {
-    {"topic", eCmdHdlrString, CNFPARAM_REQUIRED}, {"broker", eCmdHdlrArray, 0},   {"confparam", eCmdHdlrArray, 0},
-    {"consumergroup", eCmdHdlrString, 0},         {"ruleset", eCmdHdlrString, 0}, {"parsehostname", eCmdHdlrBinary, 0},
+    {"topic", eCmdHdlrArray, CNFPARAM_REQUIRED}, {"broker", eCmdHdlrArray, 0},   {"confparam", eCmdHdlrArray, 0},
+    {"consumergroup", eCmdHdlrString, 0},        {"ruleset", eCmdHdlrString, 0}, {"parsehostname", eCmdHdlrBinary, 0},
     {"split.json.records", eCmdHdlrBinary, 0},
 };
 static struct cnfparamblk inppblk = {CNFPARAMBLK_VERSION, sizeof(inppdescr) / sizeof(struct cnfparamdescr), inppdescr};
@@ -495,6 +502,13 @@ static rsRetVal splitJsonRecords(instanceConf_t *const __restrict__ inst,
         ABORT_FINALIZE(RS_RET_ERR);
     }
 
+    if (record_count > IMKAFKA_MAX_JSON_SPLIT_RECORDS) {
+        LogMsg(0, NO_ERRCODE, LOG_WARNING,
+               "imkafka: splitJsonRecords: records array has %d elements, limit is %d; forwarding batch as-is",
+               record_count, IMKAFKA_MAX_JSON_SPLIT_RECORDS);
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+
     /* Process each record */
     for (i = 0; i < record_count; i++) {
         struct fjson_object *record = fjson_object_array_get_idx(records_array, i);
@@ -596,7 +610,7 @@ static void msgConsume(instanceConf_t *inst) {
     do { /* Consume messages */
         rkmessage = rd_kafka_consumer_poll(inst->rk, 1000); /* Block for 1000 ms max */
         if (rkmessage == NULL) {
-            DBGPRINTF("imkafka: msgConsume EMPTY Loop on %s/%s/%s\n", inst->topic, inst->consumergroup, inst->brokers);
+            DBGPRINTF("imkafka: msgConsume EMPTY Loop on group %s/%s\n", inst->consumergroup, inst->brokers);
             /* poll returned nothing */
             STATSCOUNTER_INC(ctrPollEmpty, mutCtrPollEmpty);
             INST_STATSCOUNTER_INC(inst, inst->ctrPollEmpty, inst->mutCtrPollEmpty);
@@ -629,8 +643,8 @@ static void msgConsume(instanceConf_t *inst) {
         }
 
         DBGPRINTF("imkafka: msgConsume Loop on %s/%s/%s: [%" PRId32 "], offset %" PRId64 ", %zd bytes):\n",
-                  rd_kafka_topic_name(rkmessage->rkt) /*inst->topic*/, inst->consumergroup, inst->brokers,
-                  rkmessage->partition, rkmessage->offset, rkmessage->len);
+                  rd_kafka_topic_name(rkmessage->rkt), inst->consumergroup, inst->brokers, rkmessage->partition,
+                  rkmessage->offset, rkmessage->len);
 
         /* message received */
         STATSCOUNTER_INC(ctrReceived, mutCtrReceived);
@@ -679,7 +693,8 @@ static rsRetVal createInstance(instanceConf_t **pinst) {
     CHKmalloc(inst = malloc(sizeof(instanceConf_t)));
     inst->next = NULL;
     inst->brokers = NULL;
-    inst->topic = NULL;
+    inst->topics = NULL;
+    inst->nTopics = 0;
     inst->consumergroup = NULL;
     inst->pszBindRuleset = NULL;
     inst->nConfParams = 0;
@@ -846,18 +861,29 @@ static inline void std_checkRuleset_genErrMsg(__attribute__((unused)) modConfDat
 static rsRetVal ATTR_NONNULL(2) addConsumer(modConfData_t __attribute__((unused)) * modConf, instanceConf_t *inst) {
     DEFiRet;
     rd_kafka_resp_err_t err;
+    int i;
     assert(inst != NULL);
+    assert(inst->nTopics > 0);
 
     rd_kafka_topic_partition_list_t *topics = NULL;
 
-    DBGPRINTF("imkafka: creating kafka consumer on %s/%s/%s\n", inst->topic, inst->consumergroup, inst->brokers);
+    if (inst->nTopics == 1) {
+        DBGPRINTF("imkafka: creating kafka consumer on %s/%s/%s\n", inst->topics[0], inst->consumergroup,
+                  inst->brokers);
+    } else {
+        DBGPRINTF("imkafka: creating kafka consumer for %d topics on %s/%s\n", inst->nTopics, inst->consumergroup,
+                  inst->brokers);
+    }
 
     /* Redirect rd_kafka_poll() to consumer_poll() */
     rd_kafka_poll_set_consumer(inst->rk);
 
-    topics = rd_kafka_topic_partition_list_new(1);
-    rd_kafka_topic_partition_list_add(topics, (const char *)inst->topic, inst->partition);
-    DBGPRINTF("imkafka: Created topics(%d) for %s)\n", topics->cnt, inst->topic);
+    topics = rd_kafka_topic_partition_list_new(inst->nTopics);
+    for (i = 0; i < inst->nTopics; i++) {
+        rd_kafka_topic_partition_list_add(topics, (const char *)inst->topics[i], inst->partition);
+        DBGPRINTF("imkafka: Added topic %d: %s\n", i, inst->topics[i]);
+    }
+    DBGPRINTF("imkafka: Created topics list with %d entries\n", topics->cnt);
 
     if ((err = rd_kafka_subscribe(inst->rk, topics))) {
         /* Subscription failed */
@@ -865,7 +891,13 @@ static rsRetVal ATTR_NONNULL(2) addConsumer(modConfData_t __attribute__((unused)
         LogError(0, RS_RET_KAFKA_ERROR, "imkafka: Failed to start consuming topics: %s\n", rd_kafka_err2str(err));
         ABORT_FINALIZE(RS_RET_KAFKA_ERROR);
     } else {
-        DBGPRINTF("imkafka: Successfully subscribed to %s/%s/%s\n", inst->topic, inst->consumergroup, inst->brokers);
+        if (inst->nTopics == 1) {
+            DBGPRINTF("imkafka: Successfully subscribed to %s/%s/%s\n", inst->topics[0], inst->consumergroup,
+                      inst->brokers);
+        } else {
+            DBGPRINTF("imkafka: Successfully subscribed to %d topics in consumer group %s on %s\n", inst->nTopics,
+                      inst->consumergroup, inst->brokers);
+        }
         /* Subscription is working */
         inst->bIsSubscribed = 1;
     }
@@ -873,6 +905,39 @@ static rsRetVal ATTR_NONNULL(2) addConsumer(modConfData_t __attribute__((unused)
 finalize_it:
     if (topics != NULL) rd_kafka_topic_partition_list_destroy(topics);
     RETiRet;
+}
+
+static void buildStatsName(const instanceConf_t *const inst, char *const namebuf, const size_t namebufLen) {
+    size_t off;
+    int ret;
+
+    if (namebufLen == 0) {
+        return;
+    }
+
+    ret = snprintf(namebuf, namebufLen, "imkafka[");
+    if (ret < 0 || (size_t)ret >= namebufLen) {
+        strncpy(namebuf, "imkafka", namebufLen);
+        namebuf[namebufLen - 1] = '\0';
+        return;
+    }
+    off = (size_t)ret;
+
+    for (int i = 0; i < inst->nTopics; i++) {
+        ret = snprintf(namebuf + off, namebufLen - off, "%s%s", i == 0 ? "" : ",",
+                       inst->topics[i] ? (char *)inst->topics[i] : "topic?");
+        if (ret < 0 || (size_t)ret >= namebufLen - off) {
+            namebuf[namebufLen - 1] = '\0';
+            return;
+        }
+        off += (size_t)ret;
+    }
+
+    ret =
+        snprintf(namebuf + off, namebufLen - off, "_%s]", inst->consumergroup ? (char *)inst->consumergroup : "group?");
+    if (ret < 0 || (size_t)ret >= namebufLen - off) {
+        namebuf[namebufLen - 1] = '\0';
+    }
 }
 
 static rsRetVal ATTR_NONNULL()
@@ -936,7 +1001,16 @@ BEGINnewInpInst
                 free(cstr);
             }
         } else if (!strcmp(inppblk.descr[i].name, "topic")) {
-            CHKmalloc(inst->topic = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+            inst->nTopics = pvals[i].val.d.ar->nmemb;
+            if (inst->nTopics <= 0) {
+                LogError(0, RS_RET_MISSING_CNFPARAMS, "imkafka: no topics specified");
+                ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+            }
+            CHKmalloc(inst->topics = calloc(inst->nTopics, sizeof(uchar *)));
+            for (int j = 0; j < inst->nTopics; j++) {
+                CHKmalloc(inst->topics[j] = (uchar *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL));
+                DBGPRINTF("imkafka: parsed topic %d: %s\n", j, inst->topics[j]);
+            }
         } else if (!strcmp(inppblk.descr[i].name, "consumergroup")) {
             CHKmalloc(inst->consumergroup = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "ruleset")) {
@@ -959,7 +1033,11 @@ BEGINnewInpInst
                "imkafka: \"broker\" parameter not specified using default of localhost:9092 -- this may not be what "
                "you want!");
     }
-    DBGPRINTF("imkafka: newInpIns brokers=%s, topic=%s, consumergroup=%s\n", inst->brokers, inst->topic,
+    if (inst->nTopics == 0) {
+        LogError(0, RS_RET_MISSING_CNFPARAMS, "imkafka: no topics specified");
+        ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+    }
+    DBGPRINTF("imkafka: newInpIns brokers=%s, topics=%d, consumergroup=%s\n", inst->brokers, inst->nTopics,
               inst->consumergroup);
 finalize_it:
     CODE_STD_FINALIZERnewInpInst cnfparamvalsDestruct(pvals, &inppblk);
@@ -1037,8 +1115,7 @@ BEGINactivateCnf
         if (iRet == RS_RET_OK && inst->stats == NULL) {
             char namebuf[256];
             (void)statsobj.Construct(&inst->stats);
-            snprintf(namebuf, sizeof(namebuf), "imkafka[%s_%s]", inst->topic ? (char *)inst->topic : "topic?",
-                     inst->consumergroup ? (char *)inst->consumergroup : "group?");
+            buildStatsName(inst, namebuf, sizeof(namebuf));
             (void)statsobj.SetName(inst->stats, (uchar *)namebuf);
             (void)statsobj.SetOrigin(inst->stats, (uchar *)"imkafka");
             /* init and register per-instance counters */
@@ -1070,7 +1147,12 @@ BEGINfreeCnf
         if (inst->stats) {
             statsobj.Destruct(&inst->stats);
         }
-        free(inst->topic);
+        if (inst->topics != NULL) {
+            for (int i = 0; i < inst->nTopics; i++) {
+                free(inst->topics[i]);
+            }
+            free(inst->topics);
+        }
         free(inst->consumergroup);
         free(inst->brokers);
         free(inst->pszBindRuleset);
@@ -1092,6 +1174,7 @@ static void shutdownKafkaWorkers(void) {
     instanceConf_t *inst;
 
     assert(kafkaWrkrInfo != NULL);
+    ATOMIC_STORE_32BIT(&stopKafkaWorkers, &mutStopImkafkaWorkers, 1);
     DBGPRINTF("imkafka: waiting on imkafka workerthread termination\n");
     for (i = 0; i < activeKafkaworkers; ++i) {
         pthread_join(kafkaWrkrInfo[i].tid, NULL);
@@ -1104,13 +1187,22 @@ static void shutdownKafkaWorkers(void) {
         if (inst->rk == NULL) {
             continue;
         }
-        DBGPRINTF("imkafka: stop consuming %s/%s/%s\n", inst->topic, inst->consumergroup, inst->brokers);
+        if (inst->nTopics == 1) {
+            DBGPRINTF("imkafka: stop consuming %s/%s/%s\n", inst->topics[0], inst->consumergroup, inst->brokers);
+        } else {
+            DBGPRINTF("imkafka: stop consuming %d topics/%s/%s\n", inst->nTopics, inst->consumergroup, inst->brokers);
+        }
         rd_kafka_consumer_close(inst->rk); /* Close the consumer, committing final offsets, etc. */
         rd_kafka_destroy(inst->rk); /* Destroy handle object */
         inst->rk = NULL;
         inst->bIsConnected = 0;
         inst->bIsSubscribed = 0;
-        DBGPRINTF("imkafka: stopped consuming %s/%s/%s\n", inst->topic, inst->consumergroup, inst->brokers);
+        if (inst->nTopics == 1) {
+            DBGPRINTF("imkafka: stopped consuming %s/%s/%s\n", inst->topics[0], inst->consumergroup, inst->brokers);
+        } else {
+            DBGPRINTF("imkafka: stopped consuming %d topics/%s/%s\n", inst->nTopics, inst->consumergroup,
+                      inst->brokers);
+        }
 #if RD_KAFKA_VERSION < 0x00090001
         /* Wait for kafka being destroyed in old API */
         if (rd_kafka_wait_destroyed(10000) < 0) {
@@ -1130,6 +1222,7 @@ BEGINrunInput
     CODESTARTrunInput;
     DBGPRINTF("imkafka: runInput loop started ...\n");
     activeKafkaworkers = 0;
+    ATOMIC_STORE_32BIT(&stopKafkaWorkers, &mutStopImkafkaWorkers, 0);
     for (inst = runModConf->root; inst != NULL; inst = inst->next) {
         if (inst->rk != NULL) {
             ++workerSlots;
@@ -1200,6 +1293,7 @@ ENDafterRun
 BEGINmodExit
     CODESTARTmodExit;
     pthread_attr_destroy(&wrkrThrdAttr);
+    DESTROY_ATOMIC_HELPER_MUT(mutStopImkafkaWorkers);
     /* release objects we used */
     if (kafkaStats) {
         statsobj.Destruct(&kafkaStats);
@@ -1241,6 +1335,7 @@ BEGINmodInit()
     /* initialize "read-only" thread attributes */
     pthread_attr_init(&wrkrThrdAttr);
     pthread_attr_setstacksize(&wrkrThrdAttr, 4096 * 1024);
+    INIT_ATOMIC_HELPER_MUT(mutStopImkafkaWorkers);
 
     DBGPRINTF("imkafka %s using librdkafka version %s, 0x%x\n", VERSION, rd_kafka_version_str(), rd_kafka_version());
 
@@ -1297,10 +1392,12 @@ ENDmodInit
  */
 static void *imkafkawrkr(void *myself) {
     struct kafkaWrkrInfo_s *me = (struct kafkaWrkrInfo_s *)myself;
-    DBGPRINTF("imkafka: started kafka consumer workerthread on %s/%s/%s\n", me->inst->topic, me->inst->consumergroup,
-              me->inst->brokers);
+    DBGPRINTF("imkafka: started kafka consumer workerthread on group %s/%s with %d topics\n", me->inst->consumergroup,
+              me->inst->brokers, me->inst->nTopics);
     do {
-        if (glbl.GetGlobalInputTermState() == 1) break; /* terminate input! */
+        if (ATOMIC_LOAD_32BIT(&stopKafkaWorkers, &mutStopImkafkaWorkers) || glbl.GetGlobalInputTermState() == 1) {
+            break; /* terminate input! */
+        }
         if (me->inst->rk == NULL) {
             continue;
         }
@@ -1316,9 +1413,11 @@ static void *imkafkawrkr(void *myself) {
          * of 0 seconds. It doesn't hurt any other valid scenario. So do not remove.
          * rgerhards, 2008-02-14
          */
-        if (glbl.GetGlobalInputTermState() == 0) srSleep(0, 100000);
-    } while (glbl.GetGlobalInputTermState() == 0);
-    DBGPRINTF("imkafka: stopped kafka consumer workerthread on %s/%s/%s\n", me->inst->topic, me->inst->consumergroup,
-              me->inst->brokers);
+        if (glbl.GetGlobalInputTermState() == 0 && !ATOMIC_LOAD_32BIT(&stopKafkaWorkers, &mutStopImkafkaWorkers)) {
+            srSleep(0, 100000);
+        }
+    } while (!ATOMIC_LOAD_32BIT(&stopKafkaWorkers, &mutStopImkafkaWorkers) && glbl.GetGlobalInputTermState() == 0);
+    DBGPRINTF("imkafka: stopped kafka consumer workerthread on group %s/%s with %d topics\n", me->inst->consumergroup,
+              me->inst->brokers, me->inst->nTopics);
     return NULL;
 }

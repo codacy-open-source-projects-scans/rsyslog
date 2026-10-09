@@ -27,46 +27,77 @@
 #include "statsobj.h"
 
 struct hashtable;
-struct ratelimit_ps_state_s;
+struct ratelimit_ps_entry_s;
 struct template;
 typedef struct statsobj_s statsobj_t;
 
+#define RATELIMIT_PERSOURCE_SHARDS 32
+
+typedef struct ratelimit_ps_bucket_s {
+    struct hashtable *ht;
+    struct ratelimit_ps_entry_s *lru_head;
+    struct ratelimit_ps_entry_s *lru_tail;
+    unsigned int active_states;
+    unsigned int max_states;
+    sbool lock_initialized;
+    pthread_mutex_t mut;
+} ratelimit_ps_bucket_t;
+
+enum ratelimit_ps_key_mode {
+    RL_PS_KEY_TPL = 0,
+    RL_PS_KEY_FROMHOST_IP,
+    RL_PS_KEY_FROMHOST,
+    RL_PS_KEY_FROMHOST_PORT,
+    RL_PS_KEY_FROMHOST_IP_PORT,
+    RL_PS_KEY_FROMHOST_NAME_PORT
+};
+
+typedef enum ratelimit_scope_e { RATELIMIT_SCOPE_INPUT = 0, RATELIMIT_SCOPE_OUTPUT } ratelimit_scope_t;
+
+typedef enum ratelimit_output_mode_e {
+    RATELIMIT_OUTPUT_MODE_DROP = 0,
+    RATELIMIT_OUTPUT_MODE_PACE
+} ratelimit_output_mode_t;
+
 typedef struct ratelimit_shared_s {
     char *name;
+    ratelimit_scope_t scope;
+    ratelimit_output_mode_t output_mode;
+    sbool output_pace_forbidden;
     unsigned int interval;
     unsigned int burst;
-    intTiny severity;
+    int severity;
     char *policy_file;
     sbool policy_watch;
     unsigned int policy_watch_debounce_ms;
     rswatch_handle_t *policy_watch_handle;
     rswatch_handle_t *per_source_policy_watch_handle;
+    pthread_mutex_t ref_mut;
+    pthread_cond_t ref_cond;
+    unsigned int refcnt;
+    sbool ref_initialized;
     pthread_mutex_t mut;
-    sbool per_source_enabled;
+    unsigned int per_source_enabled;
+    sbool per_source_policy_from_policy_file;
     char *per_source_policy_file;
     unsigned int per_source_default_max;
     unsigned int per_source_default_window;
     unsigned int per_source_max_states;
     unsigned int per_source_topn;
-    sbool per_source_key_tpl_default;
     char *per_source_key_tpl_name;
+    unsigned int per_source_key_policy_seq;
+    unsigned int per_source_key_policy_bits;
     struct template *per_source_key_tpl;
-    sbool per_source_key_needs_parsing;
-    enum ratelimit_ps_key_mode {
-        RL_PS_KEY_TPL = 0,
-        RL_PS_KEY_FROMHOST_IP,
-        RL_PS_KEY_FROMHOST,
-        RL_PS_KEY_FROMHOST_IP_PORT,
-        RL_PS_KEY_FROMHOST_PORT
-    } per_source_key_mode;
-    struct hashtable *per_source_overrides;
-    struct hashtable *per_source_states;
-    struct ratelimit_ps_state_s *per_source_lru_head;
-    struct ratelimit_ps_state_s *per_source_lru_tail;
-    pthread_mutex_t per_source_mut;
+    pthread_mutex_t per_source_key_policy_mut;
+    pthread_mutex_t per_source_policy_mut;
+    ratelimit_ps_bucket_t per_source_shards[RATELIMIT_PERSOURCE_SHARDS];
+    sbool per_source_shards_initialized;
     statsobj_t *per_source_stats;
     STATSCOUNTER_DEF(ctrPerSourceAllowed, mutCtrPerSourceAllowed);
     STATSCOUNTER_DEF(ctrPerSourceDropped, mutCtrPerSourceDropped);
+    STATSCOUNTER_DEF(ctrPerSourceEvicted, mutCtrPerSourceEvicted);
+    STATSCOUNTER_DEF(ctrPerSourceKeyTplEvals, mutCtrPerSourceKeyTplEvals);
+    STATSCOUNTER_DEF(ctrPerSourceKeyParseEvals, mutCtrPerSourceKeyParseEvals);
     ctr_t **per_source_top_ctrs;
     intctr_t *per_source_top_values;
     char **per_source_top_keys;
@@ -85,12 +116,20 @@ struct ratelimit_s {
     smsg_t *pMsg;
     sbool bThreadSafe; /**< do we need to operate in Thread-Safe mode? */
     sbool bNoTimeCache; /**< if we shall not used cached reception time */
+    sbool bMutInitialized; /**< if mut has been initialized */
     pthread_mutex_t mut; /**< mutex if thread-safe operation desired */
 };
 
-typedef struct ratelimit_cfgs_s {
+#define RATELIMIT_CFG_SHARDS 32
+
+typedef struct ratelimit_cfg_bucket_s {
     struct hashtable *ht;
+    sbool lock_initialized;
     pthread_rwlock_t lock;
+} ratelimit_cfg_bucket_t;
+
+typedef struct ratelimit_cfgs_s {
+    ratelimit_cfg_bucket_t shards[RATELIMIT_CFG_SHARDS];
 } ratelimit_cfgs_t;
 
 /* prototypes */
@@ -98,11 +137,17 @@ typedef struct rsconf_s rsconf_t;
 rsRetVal ratelimitNew(ratelimit_t **ppThis, const char *modname, const char *dynname);
 rsRetVal ratelimitNewFromConfig(
     ratelimit_t **ppThis, rsconf_t *conf, const char *configname, const char *modname, const char *dynname);
+rsRetVal ratelimitNewFromConfigForScope(ratelimit_t **ppThis,
+                                        rsconf_t *conf,
+                                        const char *configname,
+                                        const char *modname,
+                                        const char *dynname,
+                                        ratelimit_scope_t scope);
 rsRetVal ratelimitAddConfig(rsconf_t *conf,
                             const char *name,
                             unsigned int interval,
                             unsigned int burst,
-                            intTiny severity,
+                            int severity,
                             const char *policy_file,
                             sbool policy_watch,
                             const char *policy_watch_debounce,
@@ -110,22 +155,25 @@ rsRetVal ratelimitAddConfig(rsconf_t *conf,
                             const char *per_source_policy_file,
                             const char *per_source_key_tpl_name,
                             unsigned int per_source_max_states,
-                            unsigned int per_source_topn);
-void ratelimit_cfgsInit(ratelimit_cfgs_t *cfgs);
+                            unsigned int per_source_topn,
+                            sbool has_inline_policy_params,
+                            sbool has_legacy_per_source_params);
+rsRetVal ratelimit_cfgsInit(ratelimit_cfgs_t *cfgs);
 void ratelimit_cfgsDestruct(ratelimit_cfgs_t *cfgs);
 void ratelimitSetThreadSafe(ratelimit_t *ratelimit);
 void ratelimitSetLinuxLike(ratelimit_t *ratelimit, unsigned int interval, unsigned int burst);
 void ratelimitSetNoTimeCache(ratelimit_t *ratelimit);
-void ratelimitSetSeverity(ratelimit_t *ratelimit, intTiny severity);
+void ratelimitSetSeverity(ratelimit_t *ratelimit, int severity);
 rsRetVal ratelimitMsgCount(ratelimit_t *ratelimit, time_t tt, const char *const appname);
+rsRetVal ratelimitMsgCountWait(ratelimit_t *ratelimit,
+                               time_t tt,
+                               const char *const appname,
+                               unsigned int *const wait_usec);
+ratelimit_scope_t ratelimitGetScope(const ratelimit_t *ratelimit);
+ratelimit_output_mode_t ratelimitGetOutputMode(const ratelimit_t *ratelimit);
+void ratelimitForbidOutputPace(ratelimit_t *ratelimit);
 rsRetVal ATTR_NONNULL(1, 2, 3) ratelimitMsg(ratelimit_t *ratelimit, smsg_t *pMsg, smsg_t **ppRep);
 rsRetVal ATTR_NONNULL(1, 3) ratelimitAddMsg(ratelimit_t *ratelimit, multi_submit_t *pMultiSub, smsg_t *pMsg);
-rsRetVal ATTR_NONNULL(1, 3) ratelimitAddMsgPerSource(ratelimit_t *ratelimit,
-                                                     multi_submit_t *pMultiSub,
-                                                     smsg_t *pMsg,
-                                                     const char *per_source_key,
-                                                     size_t per_source_key_len,
-                                                     time_t tt);
 void ratelimitDestruct(ratelimit_t *pThis);
 int ratelimitChecked(ratelimit_t *ratelimit);
 rsRetVal ratelimitModInit(void);

@@ -4,6 +4,7 @@ pkglib_LTLIBRARIES =
 pkgconfigdir = $(libdir)/pkgconfig
 
 EXTRA_DIST = \
+	devtools/record-container-validation.py \
 	README.md \
 	platform/README \
 	platform/freebsd/rsyslogd \
@@ -16,7 +17,9 @@ EXTRA_DIST = \
 	COPYING.ASL20 \
 	contrib/gnutls/ca.pem \
 	contrib/gnutls/cert.pem \
-	contrib/gnutls/key.pem
+	contrib/gnutls/key.pem \
+	scripts/generate_distro_component_map.py \
+	devtools/release/validate-rpm-baseline-patches.py
 
 SUBDIRS = doc compat grammar runtime . plugins/immark plugins/imuxsock plugins/imtcp plugins/imudp plugins/omtesting
 # external plugin driver is always enabled (core component)
@@ -48,10 +51,6 @@ endif
 
 if ENABLE_RELP
 SUBDIRS += plugins/omrelp plugins/imrelp
-endif
-
-if ENABLE_OMFILE_HARDENED
-SUBDIRS += contrib/omfile-hardened
 endif
 
 if ENABLE_MYSQL
@@ -182,8 +181,16 @@ if ENABLE_IMFILE
 SUBDIRS += plugins/imfile
 endif
 
+if ENABLE_IMFIFO
+SUBDIRS += plugins/imfifo
+endif
+
 if ENABLE_IMDOCKER
 SUBDIRS += contrib/imdocker
+endif
+
+if ENABLE_IMKUBERNETES
+SUBDIRS += contrib/imkubernetes
 endif
 
 if ENABLE_IMPTCP
@@ -192,6 +199,10 @@ endif
 
 if ENABLE_IMDIAG
 SUBDIRS += plugins/imdiag
+endif
+
+if ENABLE_IMBEATS
+SUBDIRS += plugins/imbeats
 endif
 
 if ENABLE_MAIL
@@ -232,6 +243,14 @@ endif
 
 if ENABLE_OMAZUREDCE
 SUBDIRS += plugins/omazuredce
+endif
+
+if ENABLE_OMAWSLOGSHLC
+SUBDIRS += plugins/omawslogshlc
+endif
+
+if ENABLE_OMKINESIS
+SUBDIRS += plugins/omkinesis
 endif
 
 if ENABLE_IMDTLS
@@ -403,6 +422,11 @@ DISTCHECK_CONFIGURE_FLAGS+= \
 	--enable-imdiag \
 	--enable-testbench \
 	--enable-valgrind
+
+if HAVE_LIBYAML
+else
+DISTCHECK_CONFIGURE_FLAGS+= --disable-libyaml
+endif # HAVE_LIBYAML
 # currently not supported in make distcheck:
 # --enable-pgsql-tests
 # --enable-extended-tests --> should probably never be enabled due to runtime
@@ -588,6 +612,14 @@ if ENABLE_OMAZUREDCE
 DISTCHECK_CONFIGURE_FLAGS+= --enable-omazuredce
 endif
 
+if ENABLE_OMAWSLOGSHLC
+DISTCHECK_CONFIGURE_FLAGS+= --enable-omawslogshlc
+endif
+
+if ENABLE_OMKINESIS
+DISTCHECK_CONFIGURE_FLAGS+= --enable-omkinesis
+endif
+
 if ENABLE_IMDTLS
 DISTCHECK_CONFIGURE_FLAGS+= --enable-imdtls
 endif
@@ -631,6 +663,10 @@ endif
 
 if ENABLE_IMFILE
 DISTCHECK_CONFIGURE_FLAGS+= --enable-imfile
+endif
+
+if ENABLE_IMFIFO
+DISTCHECK_CONFIGURE_FLAGS+= --enable-imfifo
 endif
 
 if ENABLE_IMFILE_TESTS

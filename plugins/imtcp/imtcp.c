@@ -61,6 +61,7 @@
 #include "net.h"
 #include "netstrm.h"
 #include "errmsg.h"
+#include "glbl.h"
 #include "tcpsrv.h"
 #include "ruleset.h"
 #include "rainerscript.h"
@@ -103,6 +104,7 @@ static struct configSettings_s {
     int iTCPLstnMax;
     int bSuppOctetFram;
     int iStrmDrvrMode;
+    sbool bStrmDrvrModeSet; /* stream driver mode was explicitly configured */
     int bKeepAlive;
     int iKeepAliveIntvl;
     int iKeepAliveProbes;
@@ -122,6 +124,12 @@ static struct configSettings_s {
     uchar *pszBindRuleset;
     uchar *lstnIP; /* which IP we should listen on? */
     uchar *lstnPortFile;
+    int compressionMode;
+    int compressionDriver;
+    uint64_t compressionMaxExpansionRatio;
+    uint64_t compressionMaxDecompressedBytesPerReceive;
+    uint64_t compressionMaxTotalZstdWindowBytes;
+    sbool compressionMaxTotalZstdWindowBytesSet;
 } cs;
 
 struct instanceConf_s {
@@ -148,6 +156,7 @@ struct instanceConf_s {
     char *pszNetworkNamespace; /**< optional network name to use */
     uchar *pszStrmDrvrName; /* stream driver to use */
     int iStrmDrvrMode;
+    sbool bStrmDrvrModeSet; /* stream driver mode was explicitly configured */
     uchar *pszStrmDrvrAuthMode;
     uchar *pszStrmDrvrPermitExpiredCerts;
     uchar *pszStrmDrvrCAFile;
@@ -155,6 +164,9 @@ struct instanceConf_s {
     uchar *pszStrmDrvrKeyFile;
     uchar *pszStrmDrvrCertFile;
     permittedPeers_t *pPermPeersRoot;
+    struct AllowedSenders *pAllowedSendersRoot;
+    struct AllowedSenders *pAllowedSendersLast;
+    sbool bAllowedSendersSet;
     uchar *gnutlsPriorityString;
     int iStrmDrvrExtendedCertCheck;
     int iStrmDrvrSANPreference;
@@ -165,6 +177,12 @@ struct instanceConf_s {
     int iKeepAliveProbes;
     int iKeepAliveTime;
     unsigned starvationMaxReads;
+    int compressionMode;
+    int compressionDriver;
+    uint64_t compressionMaxExpansionRatio;
+    uint64_t compressionMaxDecompressedBytesPerReceive;
+    uint64_t compressionMaxTotalZstdWindowBytes;
+    sbool compressionMaxTotalZstdWindowBytesSet;
     struct instanceConf_s *next;
 };
 
@@ -176,6 +194,7 @@ struct modConfData_s {
     int iTCPLstnMax; /* max number of sessions */
     unsigned numWrkr;
     int iStrmDrvrMode; /* mode for stream driver, driver-dependent (0 mostly means plain tcp) */
+    sbool bStrmDrvrModeSet; /* stream driver mode was explicitly configured */
     int iStrmDrvrExtendedCertCheck; /* verify also purpose OID in certificate extended field */
     int iStrmDrvrSANPreference; /* ignore CN when any SAN set */
     int iStrmTlsVerifyDepth; /**< Verify Depth for certificate chains */
@@ -186,6 +205,7 @@ struct modConfData_s {
     sbool bDisableLFDelim; /* disable standard LF delimiter */
     sbool discardTruncatedMsg;
     sbool bUseFlowControl; /* use flow control, what means indicate ourselfs a "light delayable" */
+    sbool bFailOnBindError;
     sbool bKeepAlive;
     int iKeepAliveIntvl;
     int iKeepAliveProbes;
@@ -202,9 +222,18 @@ struct modConfData_s {
     uchar *pszStrmDrvrKeyFile;
     uchar *pszStrmDrvrCertFile;
     permittedPeers_t *pPermPeersRoot;
+    struct AllowedSenders *pAllowedSendersRoot;
+    struct AllowedSenders *pAllowedSendersLast;
+    sbool bAllowedSendersSet;
     sbool configSetViaV2Method;
     sbool bPreserveCase; /* preserve case of fromhost; true by default */
     unsigned starvationMaxReads;
+    int compressionMode;
+    int compressionDriver;
+    uint64_t compressionMaxExpansionRatio;
+    uint64_t compressionMaxDecompressedBytesPerReceive;
+    uint64_t compressionMaxTotalZstdWindowBytes;
+    sbool compressionMaxTotalZstdWindowBytesSet;
 };
 
 static modConfData_t *loadModConf = NULL; /* modConf ptr to use for the current load process */
@@ -212,6 +241,7 @@ static modConfData_t *runModConf = NULL; /* modConf ptr to use for the current l
 
 /* module-global parameters */
 static struct cnfparamdescr modpdescr[] = {{"flowcontrol", eCmdHdlrBinary, 0},
+                                           {"failonbinderror", eCmdHdlrBinary, 0},
                                            {"disablelfdelimiter", eCmdHdlrBinary, 0},
                                            {"discardtruncatedmsg", eCmdHdlrBinary, 0},
                                            {"octetcountedframing", eCmdHdlrBinary, 0},
@@ -236,6 +266,7 @@ static struct cnfparamdescr modpdescr[] = {{"flowcontrol", eCmdHdlrBinary, 0},
                                            {"streamdriver.crlfile", eCmdHdlrString, 0},
                                            {"streamdriver.keyfile", eCmdHdlrString, 0},
                                            {"streamdriver.certfile", eCmdHdlrString, 0},
+                                           {"allowedsender", eCmdHdlrArray, 0},
                                            {"permittedpeer", eCmdHdlrArray, 0},
                                            {"keepalive", eCmdHdlrBinary, 0},
                                            {"keepalive.probes", eCmdHdlrNonNegInt, 0},
@@ -243,6 +274,11 @@ static struct cnfparamdescr modpdescr[] = {{"flowcontrol", eCmdHdlrBinary, 0},
                                            {"keepalive.interval", eCmdHdlrNonNegInt, 0},
                                            {"gnutlsprioritystring", eCmdHdlrString, 0},
                                            {"preservecase", eCmdHdlrBinary, 0},
+                                           {"compression.mode", eCmdHdlrString, 0},
+                                           {"compression.driver", eCmdHdlrString, 0},
+                                           {"compression.maxexpansionratio", eCmdHdlrNonNegInt, 0},
+                                           {"compression.maxdecompressedbytesperreceive", eCmdHdlrNonNegInt, 0},
+                                           {"compression.maxtotalzstdwindowbytes", eCmdHdlrNonNegInt, 0},
                                            {"networknamespace", eCmdHdlrString, 0}};
 static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / sizeof(struct cnfparamdescr), modpdescr};
 
@@ -277,6 +313,7 @@ static struct cnfparamdescr inppdescr[] = {{"port", eCmdHdlrString, CNFPARAM_REQ
                                            {"streamdriver.crlfile", eCmdHdlrString, 0},
                                            {"streamdriver.keyfile", eCmdHdlrString, 0},
                                            {"streamdriver.certfile", eCmdHdlrString, 0},
+                                           {"allowedsender", eCmdHdlrArray, 0},
                                            {"permittedpeer", eCmdHdlrArray, 0},
                                            {"gnutlsprioritystring", eCmdHdlrString, 0},
                                            {"keepalive", eCmdHdlrBinary, 0},
@@ -290,6 +327,11 @@ static struct cnfparamdescr inppdescr[] = {{"port", eCmdHdlrString, CNFPARAM_REQ
                                            {"ratelimit.name", eCmdHdlrString, 0},
                                            {"socketbacklog", eCmdHdlrNonNegInt, 0},
                                            {"networknamespace", eCmdHdlrString, 0},
+                                           {"compression.mode", eCmdHdlrString, 0},
+                                           {"compression.driver", eCmdHdlrString, 0},
+                                           {"compression.maxexpansionratio", eCmdHdlrNonNegInt, 0},
+                                           {"compression.maxdecompressedbytesperreceive", eCmdHdlrNonNegInt, 0},
+                                           {"compression.maxtotalzstdwindowbytes", eCmdHdlrNonNegInt, 0},
                                            {"multiline", eCmdHdlrBinary, 0},
                                            {"framing.delimiter.regex", eCmdHdlrString, 0}};
 static struct cnfparamblk inppblk = {CNFPARAMBLK_VERSION, sizeof(inppdescr) / sizeof(struct cnfparamdescr), inppdescr};
@@ -329,12 +371,186 @@ static rsRetVal validateLegacySessionLimits(void) {
     return RS_RET_OK;
 }
 
+static rsRetVal parseCompressionModeStr(const char *const str, int *const mode) {
+    DEFiRet;
+
+    if (strcasecmp(str, "none") == 0) {
+        *mode = TCPSRV_COMPRESS_NEVER;
+    } else if (strcasecmp(str, "stream:always") == 0) {
+        *mode = TCPSRV_COMPRESS_STREAM_ALWAYS;
+    } else {
+        parser_errmsg("imtcp: invalid compression.mode '%s', supported values are 'none' and 'stream:always'", str);
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal parseCompressionMode(es_str_t *const val, int *const mode) {
+    DEFiRet;
+    char *const str = es_str2cstr(val, NULL);
+    CHKmalloc(str);
+    CHKiRet(parseCompressionModeStr(str, mode));
+finalize_it:
+    free(str);
+    RETiRet;
+}
+
+static rsRetVal parseCompressionDriverStr(const char *const str, int *const driver) {
+    DEFiRet;
+
+    if (strcasecmp(str, "zlib") == 0) {
+        *driver = TCPSRV_COMPRESS_DRIVER_ZLIB;
+    } else if (strcasecmp(str, "zstd") == 0) {
+#ifdef ENABLE_LIBZSTD
+        *driver = TCPSRV_COMPRESS_DRIVER_ZSTD;
+#else
+        parser_errmsg("imtcp: compression.driver='zstd' requires rsyslog to be built with libzstd support");
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+#endif
+    } else {
+        parser_errmsg("imtcp: invalid compression.driver '%s', supported values are 'zlib' and 'zstd'", str);
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal parseCompressionDriver(es_str_t *const val, int *const driver) {
+    DEFiRet;
+    char *const str = es_str2cstr(val, NULL);
+    CHKmalloc(str);
+    CHKiRet(parseCompressionDriverStr(str, driver));
+finalize_it:
+    free(str);
+    RETiRet;
+}
+
+static rsRetVal setLegacyCompressionMode(void __attribute__((unused)) * pVal, uchar *pNewVal) {
+    DEFiRet;
+    CHKiRet(parseCompressionModeStr((const char *)pNewVal, &cs.compressionMode));
+finalize_it:
+    free(pNewVal);
+    RETiRet;
+}
+
+static rsRetVal setLegacyCompressionDriver(void __attribute__((unused)) * pVal, uchar *pNewVal) {
+    DEFiRet;
+    CHKiRet(parseCompressionDriverStr((const char *)pNewVal, &cs.compressionDriver));
+finalize_it:
+    free(pNewVal);
+    RETiRet;
+}
+
+/** Warn in secure warn mode when imtcp listener transport/auth settings reduce security. */
+static void warnIfInsecureListenerConfigured(const int streamDriverMode,
+                                             const uchar *const effectiveStreamDriverName,
+                                             const uchar *const authMode) {
+    if (streamDriverMode == 0) {
+        const int tlsHintsConfigured = (authMode != NULL) || glblIsTlsCapableNetstrmDrvr(effectiveStreamDriverName);
+        if (tlsHintsConfigured) {
+            glblWarnIfInsecureDefault(loadConf,
+                                      "imtcp has TLS-related settings but streamdriver.mode=\"0\"; mode 0 uses plain "
+                                      "TCP so TLS is not active "
+                                      "(see https://docs.rsyslog.com/doc/faq/tls_mode0_disables_tls.html)");
+        } else {
+            glblWarnIfInsecureDefault(loadConf,
+                                      "imtcp input uses streamdriver.mode=\"0\" (plain TCP without TLS); "
+                                      "see https://docs.rsyslog.com/doc/faq/tls_mode0_disables_tls.html");
+        }
+    }
+
+    if (streamDriverMode != 0 && authMode != NULL && strcasecmp((const char *)authMode, "anon") == 0) {
+        glblWarnIfInsecureDefault(
+            loadConf,
+            "imtcp uses streamdriver.authmode=\"anon\"; server identity is not authenticated, so MITM is possible "
+            "(see https://docs.rsyslog.com/doc/faq/tls_anon_auth_mitm.html)");
+    }
+}
+
+static rsRetVal applySecureDefaultsToStreamDriver(rsconf_t *const cnf,
+                                                  int *const streamDriverMode,
+                                                  const sbool streamDriverModeSet,
+                                                  const uchar *const effectiveStreamDriverName,
+                                                  const char *const context) {
+    if (glblIsTlsCapableNetstrmDrvr(effectiveStreamDriverName) && *streamDriverMode == 0 &&
+        cnf->globals.compatDefaultsSecure == COMPAT_DEFAULTS_SECURE_STRICT) {
+        if (streamDriverModeSet) {
+            LogError(0, RS_RET_PARAM_ERROR,
+                     "%s: compatibility.defaults.secure=\"strict\" rejects explicit streamdriver.mode=\"0\" "
+                     "with TLS-capable stream driver \"%s\"; use streamdriver.mode=\"1\" to enable TLS or "
+                     "select ptcp/plain TCP intentionally",
+                     context, (const char *)effectiveStreamDriverName);
+            return RS_RET_PARAM_ERROR;
+        }
+        *streamDriverMode = 1;
+    }
+    return RS_RET_OK;
+}
+
+static const uchar *getEffectiveModuleStreamDriver(const modConfData_t *const modConf) {
+    return glblGetEffectiveNetstrmDrvr(modConf->pConf, modConf->pszStrmDrvrName);
+}
+
+static const uchar *getEffectiveInstanceStreamDriver(const instanceConf_t *const inst,
+                                                     const modConfData_t *const modConf) {
+    const uchar *const localOrModuleDrvr =
+        inst->pszStrmDrvrName == NULL ? modConf->pszStrmDrvrName : inst->pszStrmDrvrName;
+    return glblGetEffectiveNetstrmDrvr(modConf->pConf, localOrModuleDrvr);
+}
+
+static const uchar *getEffectiveInstanceAuthMode(const instanceConf_t *const inst, const modConfData_t *const modConf) {
+    return inst->pszStrmDrvrAuthMode == NULL ? modConf->pszStrmDrvrAuthMode : inst->pszStrmDrvrAuthMode;
+}
+
+static rsRetVal applySecureDefaultsToModuleConfig(modConfData_t *const modConf) {
+    return applySecureDefaultsToStreamDriver(modConf->pConf, &modConf->iStrmDrvrMode, modConf->bStrmDrvrModeSet,
+                                             getEffectiveModuleStreamDriver(modConf), "imtcp module");
+}
+
+static rsRetVal applySecureDefaultsToInstanceConfig(instanceConf_t *const inst, modConfData_t *const modConf) {
+    return applySecureDefaultsToStreamDriver(modConf->pConf, &inst->iStrmDrvrMode, inst->bStrmDrvrModeSet,
+                                             getEffectiveInstanceStreamDriver(inst, modConf), "imtcp input");
+}
+
+static rsRetVal applySecureDefaultsToZstdWindow(instanceConf_t *const inst, const modConfData_t *const modConf) {
+    const int secure_policy = modConf->pConf->globals.compatDefaultsSecure;
+
+    if (inst->compressionMode != TCPSRV_COMPRESS_STREAM_ALWAYS ||
+        inst->compressionDriver != TCPSRV_COMPRESS_DRIVER_ZSTD) {
+        return RS_RET_OK;
+    }
+
+    if (secure_policy == COMPAT_DEFAULTS_SECURE_STRICT &&
+        (!inst->compressionMaxTotalZstdWindowBytesSet || inst->compressionMaxTotalZstdWindowBytes == 0)) {
+        LogError(0, RS_RET_PARAM_ERROR,
+                 "imtcp input: compatibility.defaults.secure=\"strict\" requires an explicit positive "
+                 "compression.maxTotalZstdWindowBytes value for zstd stream decompression");
+        return RS_RET_PARAM_ERROR;
+    }
+
+    return RS_RET_OK;
+}
+
+static rsRetVal setLegacyStrmDrvrMode(void __attribute__((unused)) * pVal, int mode) {
+    cs.iStrmDrvrMode = mode;
+    cs.bStrmDrvrModeSet = 1;
+    return RS_RET_OK;
+}
+
 /* callbacks */
 /* this shall go into a specific ACL module! */
 static int isPermittedHost(struct sockaddr *addr,
                            char *fromHostFQDN,
-                           void __attribute__((unused)) * pUsrSrv,
+                           void *pUsrSrv,
                            void __attribute__((unused)) * pUsrSess) {
+    const tcpLstnParams_t *const cnf_params = pUsrSrv;
+
+    if (cnf_params != NULL && !cnf_params->bUseLegacyAllowedSender) {
+        return net.isAllowedSenderList(cnf_params->pAllowedSenderRoot, addr, fromHostFQDN, 1);
+    }
     return net.isAllowedSender2(UCHAR_CONSTANT("TCP"), addr, fromHostFQDN, 1);
 }
 
@@ -342,6 +558,7 @@ static int isPermittedHost(struct sockaddr *addr,
 static rsRetVal doOpenLstnSocks(tcpsrv_t *pSrv) {
     ISOBJ_TYPE_assert(pSrv, tcpsrv);
     dbgprintf("in imtcp doOpenLstnSocks\n");
+    pSrv->failOnBindError = runModConf->bFailOnBindError;
     return tcpsrv.create_tcp_socket(pSrv);
 }
 
@@ -356,12 +573,14 @@ static rsRetVal doRcvData(
 
 static rsRetVal onRegularClose(tcps_sess_t *pSess) {
     DEFiRet;
+    rsRetVal closeRet;
     assert(pSess != NULL);
 
     /* process any incomplete frames left over */
-    tcps_sess.PrepareClose(pSess);
+    iRet = tcps_sess.PrepareClose(pSess);
     /* Session closed */
-    tcps_sess.Close(pSess);
+    closeRet = tcps_sess.Close(pSess);
+    if (iRet == RS_RET_OK) iRet = closeRet;
     RETiRet;
 }
 
@@ -417,6 +636,7 @@ static rsRetVal createInstance(instanceConf_t **pinst) {
     inst->pPermPeersRoot = NULL;
     inst->gnutlsPriorityString = NULL;
     inst->iStrmDrvrMode = loadModConf->iStrmDrvrMode;
+    inst->bStrmDrvrModeSet = loadModConf->bStrmDrvrModeSet;
     inst->iStrmDrvrExtendedCertCheck = loadModConf->iStrmDrvrExtendedCertCheck;
     inst->iStrmDrvrSANPreference = loadModConf->iStrmDrvrSANPreference;
     inst->iStrmTlsVerifyDepth = loadModConf->iStrmTlsVerifyDepth;
@@ -438,6 +658,15 @@ static rsRetVal createInstance(instanceConf_t **pinst) {
     inst->iTCPSessMax = loadModConf->iTCPSessMax;
     inst->numWrkr = loadModConf->numWrkr;
     inst->starvationMaxReads = loadModConf->starvationMaxReads;
+    inst->compressionMode = loadModConf->compressionMode;
+    inst->compressionDriver = loadModConf->compressionDriver;
+    inst->compressionMaxExpansionRatio = loadModConf->compressionMaxExpansionRatio;
+    inst->compressionMaxDecompressedBytesPerReceive = loadModConf->compressionMaxDecompressedBytesPerReceive;
+    inst->compressionMaxTotalZstdWindowBytes = loadModConf->compressionMaxTotalZstdWindowBytes;
+    inst->compressionMaxTotalZstdWindowBytesSet = loadModConf->compressionMaxTotalZstdWindowBytesSet;
+    inst->pAllowedSendersRoot = NULL;
+    inst->pAllowedSendersLast = NULL;
+    inst->bAllowedSendersSet = 0;
 
     inst->cnf_params->pszLstnPortFileName = NULL;
     inst->cnf_params->bMultiLine = 0;
@@ -496,6 +725,7 @@ static rsRetVal addInstance(void __attribute__((unused)) * pVal, uchar *pNewVal)
     }
     inst->cnf_params->bSuppOctetFram = cs.bSuppOctetFram;
     inst->iStrmDrvrMode = cs.iStrmDrvrMode;
+    inst->bStrmDrvrModeSet = cs.bStrmDrvrModeSet;
     inst->bKeepAlive = cs.bKeepAlive;
     inst->bUseFlowControl = cs.bUseFlowControl;
     inst->bDisableLFDelim = cs.bDisableLFDelim;
@@ -509,6 +739,16 @@ static rsRetVal addInstance(void __attribute__((unused)) * pVal, uchar *pNewVal)
     inst->iTCPSessMax = cs.iTCPSessMax;
     inst->numWrkr = DEFAULT_NUMWRKR;
     inst->starvationMaxReads = DEFAULT_STARVATIONMAXREADS;
+    inst->compressionMode = cs.compressionMode;
+    inst->compressionDriver = cs.compressionDriver;
+    inst->compressionMaxExpansionRatio = cs.compressionMaxExpansionRatio;
+    inst->compressionMaxDecompressedBytesPerReceive = cs.compressionMaxDecompressedBytesPerReceive;
+    inst->compressionMaxTotalZstdWindowBytes = cs.compressionMaxTotalZstdWindowBytes;
+    inst->compressionMaxTotalZstdWindowBytesSet = cs.compressionMaxTotalZstdWindowBytesSet;
+    CHKiRet(applySecureDefaultsToInstanceConfig(inst, loadModConf));
+    CHKiRet(applySecureDefaultsToZstdWindow(inst, loadModConf));
+    warnIfInsecureListenerConfigured(inst->iStrmDrvrMode, getEffectiveInstanceStreamDriver(inst, loadModConf),
+                                     getEffectiveInstanceAuthMode(inst, loadModConf));
 
 finalize_it:
     free(pNewVal);
@@ -522,7 +762,7 @@ static rsRetVal addListner(modConfData_t *modConf, instanceConf_t *inst) {
     char *ns; /**< network namespace */
     permittedPeers_t *peers;
 
-    tcpsrv_t *pOurTcpsrv;
+    tcpsrv_t *pOurTcpsrv = NULL;
     CHKiRet(tcpsrv.Construct(&pOurTcpsrv));
     /* callbacks */
     CHKiRet(tcpsrv.SetCBIsPermittedHost(pOurTcpsrv, isPermittedHost));
@@ -547,6 +787,12 @@ static rsRetVal addListner(modConfData_t *modConf, instanceConf_t *inst) {
     CHKiRet(tcpsrv.SetUseFlowControl(pOurTcpsrv, inst->bUseFlowControl));
     CHKiRet(tcpsrv.SetAddtlFrameDelim(pOurTcpsrv, inst->iAddtlFrameDelim));
     CHKiRet(tcpsrv.SetMaxFrameSize(pOurTcpsrv, inst->maxFrameSize));
+    CHKiRet(tcpsrv.SetCompressionMode(pOurTcpsrv, inst->compressionMode));
+    CHKiRet(tcpsrv.SetCompressionDriver(pOurTcpsrv, inst->compressionDriver));
+    CHKiRet(tcpsrv.SetCompressionMaxExpansionRatio(pOurTcpsrv, inst->compressionMaxExpansionRatio));
+    CHKiRet(tcpsrv.SetCompressionMaxDecompressedBytesPerReceive(pOurTcpsrv,
+                                                                inst->compressionMaxDecompressedBytesPerReceive));
+    CHKiRet(tcpsrv.SetCompressionMaxTotalZstdWindowBytes(pOurTcpsrv, inst->compressionMaxTotalZstdWindowBytes));
     CHKiRet(tcpsrv.SetbDisableLFDelim(pOurTcpsrv, inst->bDisableLFDelim));
     CHKiRet(tcpsrv.SetDiscardTruncatedMsg(pOurTcpsrv, inst->discardTruncatedMsg));
     CHKiRet(tcpsrv.SetNotificationOnRemoteClose(pOurTcpsrv, inst->bEmitMsgOnClose));
@@ -610,8 +856,20 @@ static rsRetVal addListner(modConfData_t *modConf, instanceConf_t *inst) {
         free((void *)inst->cnf_params->pszPort);
         inst->cnf_params->pszPort = newPort;
     }
-    tcpsrv.configureTCPListen(pOurTcpsrv, inst->cnf_params);
-    inst->cnf_params = NULL; /* ownership transferred to tcpsrv */
+    if (inst->bAllowedSendersSet) {
+        inst->cnf_params->pAllowedSenderRoot = inst->pAllowedSendersRoot;
+        inst->cnf_params->bUseLegacyAllowedSender = 0;
+    } else if (modConf->bAllowedSendersSet) {
+        inst->cnf_params->pAllowedSenderRoot = modConf->pAllowedSendersRoot;
+        inst->cnf_params->bUseLegacyAllowedSender = 0;
+    } else {
+        inst->cnf_params->pAllowedSenderRoot = NULL;
+        inst->cnf_params->bUseLegacyAllowedSender = 1;
+    }
+    CHKiRet(tcpsrv.SetUsrP(pOurTcpsrv, inst->cnf_params));
+    iRet = tcpsrv.configureTCPListen(pOurTcpsrv, inst->cnf_params);
+    inst->cnf_params = NULL; /* ownership transferred to tcpsrv, including setup failure cleanup */
+    CHKiRet(iRet);
 
     tcpsrv_etry_t *etry;
     CHKmalloc(etry = (tcpsrv_etry_t *)calloc(1, sizeof(tcpsrv_etry_t)));
@@ -623,6 +881,10 @@ static rsRetVal addListner(modConfData_t *modConf, instanceConf_t *inst) {
 finalize_it:
     if (iRet != RS_RET_OK) {
         LogError(0, NO_ERRCODE, "imtcp: error %d trying to add listener", iRet);
+        if (pOurTcpsrv != NULL) {
+            tcpsrv.SetUsrP(pOurTcpsrv, NULL);
+            tcpsrv.Destruct(&pOurTcpsrv);
+        }
     }
     RETiRet;
 }
@@ -651,21 +913,22 @@ BEGINnewInpInst
     for (i = 0; i < inppblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(inppblk.descr[i].name, "port")) {
-            inst->cnf_params->pszPort = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->cnf_params->pszPort = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "networknamespace")) {
-            inst->pszNetworkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszNetworkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "address")) {
-            inst->cnf_params->pszAddr = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->cnf_params->pszAddr = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "name")) {
-            inst->pszInputName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszInputName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "defaulttz")) {
-            inst->dfltTZ = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->dfltTZ = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "framingfix.cisco.asa")) {
             inst->bSPFramingFix = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "ruleset")) {
-            inst->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszBindRuleset = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.mode")) {
             inst->iStrmDrvrMode = (int)pvals[i].val.d.n;
+            inst->bStrmDrvrModeSet = 1;
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.CheckExtendedKeyPurpose")) {
             inst->iStrmDrvrExtendedCertCheck = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.PrioritizeSAN")) {
@@ -679,28 +942,42 @@ BEGINnewInpInst
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.TlsRevocationCheck")) {
             inst->iStrmTlsRevocationCheck = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.authmode")) {
-            inst->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.permitexpiredcerts")) {
-            inst->pszStrmDrvrPermitExpiredCerts = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrPermitExpiredCerts = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.cafile")) {
-            inst->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.crlfile")) {
-            inst->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.keyfile")) {
-            inst->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.certfile")) {
-            inst->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "streamdriver.name")) {
-            inst->pszStrmDrvrName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszStrmDrvrName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "starvationprotection.maxreads")) {
             inst->starvationMaxReads = (unsigned)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "gnutlsprioritystring")) {
-            inst->gnutlsPriorityString = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->gnutlsPriorityString = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "permittedpeer")) {
             for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
                 uchar *const peer = (uchar *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
                 CHKiRet(net.AddPermittedPeer(&inst->pPermPeersRoot, peer));
                 free(peer);
+            }
+        } else if (!strcmp(inppblk.descr[i].name, "allowedsender")) {
+            if (pvals[i].val.d.ar == NULL || pvals[i].val.d.ar->nmemb == 0) {
+                LogError(0, RS_RET_INVALID_PARAMS, "imtcp: allowedSender array must not be empty");
+                ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
+            }
+            inst->bAllowedSendersSet = 1;
+            for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
+                uchar *sender = (uchar *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+                CHKmalloc(sender);
+                const rsRetVal entryRet =
+                    net.addAllowedSenderEntry(&inst->pAllowedSendersRoot, &inst->pAllowedSendersLast, sender);
+                free(sender);
+                CHKiRet(entryRet);
             }
         } else if (!strcmp(inppblk.descr[i].name, "flowcontrol")) {
             inst->bUseFlowControl = (int)pvals[i].val.d.n;
@@ -739,17 +1016,28 @@ BEGINnewInpInst
         } else if (!strcmp(inppblk.descr[i].name, "ratelimit.interval")) {
             inst->ratelimitInterval = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "ratelimit.name")) {
-            inst->cnf_params->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->cnf_params->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(inppblk.descr[i].name, "preservecase")) {
             inst->bPreserveCase = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "socketbacklog")) {
             inst->iSynBacklog = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "listenportfilename")) {
-            inst->cnf_params->pszLstnPortFileName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->cnf_params->pszLstnPortFileName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(inppblk.descr[i].name, "compression.mode")) {
+            CHKiRet(parseCompressionMode(pvals[i].val.d.estr, &inst->compressionMode));
+        } else if (!strcmp(inppblk.descr[i].name, "compression.driver")) {
+            CHKiRet(parseCompressionDriver(pvals[i].val.d.estr, &inst->compressionDriver));
+        } else if (!strcmp(inppblk.descr[i].name, "compression.maxexpansionratio")) {
+            inst->compressionMaxExpansionRatio = (uint64_t)pvals[i].val.d.n;
+        } else if (!strcmp(inppblk.descr[i].name, "compression.maxdecompressedbytesperreceive")) {
+            inst->compressionMaxDecompressedBytesPerReceive = (uint64_t)pvals[i].val.d.n;
+        } else if (!strcmp(inppblk.descr[i].name, "compression.maxtotalzstdwindowbytes")) {
+            inst->compressionMaxTotalZstdWindowBytes = (uint64_t)pvals[i].val.d.n;
+            inst->compressionMaxTotalZstdWindowBytesSet = RSTRUE;
         } else if (!strcmp(inppblk.descr[i].name, "multiline")) {
             inst->cnf_params->bMultiLine = (int)pvals[i].val.d.n;
         } else if (!strcmp(inppblk.descr[i].name, "framing.delimiter.regex")) {
-            inst->cnf_params->pszStartRegex = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->cnf_params->pszStartRegex = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             dbgprintf(
                 "imtcp: program error, non-handled "
@@ -773,6 +1061,10 @@ BEGINnewInpInst
             inst->ratelimitBurst = 10000;
         }
     }
+    CHKiRet(applySecureDefaultsToInstanceConfig(inst, loadModConf));
+    CHKiRet(applySecureDefaultsToZstdWindow(inst, loadModConf));
+    warnIfInsecureListenerConfigured(inst->iStrmDrvrMode, getEffectiveInstanceStreamDriver(inst, loadModConf),
+                                     getEffectiveInstanceAuthMode(inst, loadModConf));
 
 finalize_it:
     CODE_STD_FINALIZERnewInpInst cnfparamvalsDestruct(pvals, &inppblk);
@@ -790,6 +1082,7 @@ BEGINbeginCnfLoad
     loadModConf->starvationMaxReads = DEFAULT_STARVATIONMAXREADS;
     loadModConf->bSuppOctetFram = 1;
     loadModConf->iStrmDrvrMode = 0;
+    loadModConf->bStrmDrvrModeSet = 0;
     loadModConf->iStrmDrvrExtendedCertCheck = 0;
     loadModConf->iStrmDrvrSANPreference = 0;
     loadModConf->iStrmTlsVerifyDepth = 0;
@@ -815,8 +1108,17 @@ BEGINbeginCnfLoad
     loadModConf->pszStrmDrvrKeyFile = NULL;
     loadModConf->pszStrmDrvrCertFile = NULL;
     loadModConf->pPermPeersRoot = NULL;
+    loadModConf->pAllowedSendersRoot = NULL;
+    loadModConf->pAllowedSendersLast = NULL;
+    loadModConf->bAllowedSendersSet = 0;
     loadModConf->configSetViaV2Method = 0;
     loadModConf->bPreserveCase = 1; /* default to true */
+    loadModConf->compressionMode = TCPSRV_COMPRESS_NEVER;
+    loadModConf->compressionDriver = TCPSRV_COMPRESS_DRIVER_ZLIB;
+    loadModConf->compressionMaxExpansionRatio = TCPSRV_COMPRESS_MAX_EXPANSION_RATIO_DEFAULT;
+    loadModConf->compressionMaxDecompressedBytesPerReceive = TCPSRV_COMPRESS_MAX_DECOMPRESSED_BYTES_PER_RECEIVE_DEFAULT;
+    loadModConf->compressionMaxTotalZstdWindowBytes = TCPSRV_COMPRESS_MAX_TOTAL_ZSTD_WINDOW_BYTES_DEFAULT;
+    loadModConf->compressionMaxTotalZstdWindowBytesSet = RSFALSE;
     bLegacyCnfModGlobalsPermitted = 1;
     /* init legacy config variables */
     resetConfigVariables(NULL, NULL); /* dummy parameters just to fulfill interface def */
@@ -844,6 +1146,8 @@ BEGINsetModCnf
         if (!pvals[i].bUsed) continue;
         if (!strcmp(modpblk.descr[i].name, "flowcontrol")) {
             loadModConf->bUseFlowControl = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "failonbinderror")) {
+            loadModConf->bFailOnBindError = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "disablelfdelimiter")) {
             loadModConf->bDisableLFDelim = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "discardtruncatedmsg")) {
@@ -878,11 +1182,12 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "keepalive.interval")) {
             loadModConf->iKeepAliveIntvl = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "gnutlsprioritystring")) {
-            loadModConf->gnutlsPriorityString = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->gnutlsPriorityString = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "networknamespace")) {
-            loadModConf->pszNetworkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszNetworkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.mode")) {
             loadModConf->iStrmDrvrMode = (int)pvals[i].val.d.n;
+            loadModConf->bStrmDrvrModeSet = 1;
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.CheckExtendedKeyPurpose")) {
             loadModConf->iStrmDrvrExtendedCertCheck = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.PrioritizeSAN")) {
@@ -896,27 +1201,52 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.TlsRevocationCheck")) {
             loadModConf->iStrmTlsRevocationCheck = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.authmode")) {
-            loadModConf->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.permitexpiredcerts")) {
-            loadModConf->pszStrmDrvrPermitExpiredCerts = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrPermitExpiredCerts = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.cafile")) {
-            loadModConf->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrCAFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.crlfile")) {
-            loadModConf->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrCRLFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.keyfile")) {
-            loadModConf->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrKeyFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.certfile")) {
-            loadModConf->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrCertFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "streamdriver.name")) {
-            loadModConf->pszStrmDrvrName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->pszStrmDrvrName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "permittedpeer")) {
             for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
                 uchar *const peer = (uchar *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
                 CHKiRet(net.AddPermittedPeer(&loadModConf->pPermPeersRoot, peer));
                 free(peer);
             }
+        } else if (!strcmp(modpblk.descr[i].name, "allowedsender")) {
+            if (pvals[i].val.d.ar == NULL || pvals[i].val.d.ar->nmemb == 0) {
+                LogError(0, RS_RET_INVALID_PARAMS, "imtcp: allowedSender array must not be empty");
+                ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
+            }
+            loadModConf->bAllowedSendersSet = 1;
+            for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
+                uchar *sender = (uchar *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+                CHKmalloc(sender);
+                const rsRetVal entryRet = net.addAllowedSenderEntry(&loadModConf->pAllowedSendersRoot,
+                                                                    &loadModConf->pAllowedSendersLast, sender);
+                free(sender);
+                CHKiRet(entryRet);
+            }
         } else if (!strcmp(modpblk.descr[i].name, "preservecase")) {
             loadModConf->bPreserveCase = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "compression.mode")) {
+            CHKiRet(parseCompressionMode(pvals[i].val.d.estr, &loadModConf->compressionMode));
+        } else if (!strcmp(modpblk.descr[i].name, "compression.driver")) {
+            CHKiRet(parseCompressionDriver(pvals[i].val.d.estr, &loadModConf->compressionDriver));
+        } else if (!strcmp(modpblk.descr[i].name, "compression.maxexpansionratio")) {
+            loadModConf->compressionMaxExpansionRatio = (uint64_t)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "compression.maxdecompressedbytesperreceive")) {
+            loadModConf->compressionMaxDecompressedBytesPerReceive = (uint64_t)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "compression.maxtotalzstdwindowbytes")) {
+            loadModConf->compressionMaxTotalZstdWindowBytes = (uint64_t)pvals[i].val.d.n;
+            loadModConf->compressionMaxTotalZstdWindowBytesSet = RSTRUE;
         } else {
             dbgprintf(
                 "imtcp: program error, non-handled "
@@ -930,6 +1260,9 @@ BEGINsetModCnf
      */
     bLegacyCnfModGlobalsPermitted = 0;
     loadModConf->configSetViaV2Method = 1;
+    CHKiRet(applySecureDefaultsToModuleConfig(loadModConf));
+    warnIfInsecureListenerConfigured(loadModConf->iStrmDrvrMode, getEffectiveModuleStreamDriver(loadModConf),
+                                     loadModConf->pszStrmDrvrAuthMode);
 
 finalize_it:
     if (pvals != NULL) cnfparamvalsDestruct(pvals, &modpblk);
@@ -950,6 +1283,7 @@ BEGINendCnfLoad
         pModConf->iTCPSessMax = cs.iTCPSessMax;
         pModConf->iTCPLstnMax = cs.iTCPLstnMax;
         pModConf->iStrmDrvrMode = cs.iStrmDrvrMode;
+        pModConf->bStrmDrvrModeSet = cs.bStrmDrvrModeSet;
         pModConf->bEmitMsgOnClose = cs.bEmitMsgOnClose;
         pModConf->bSuppOctetFram = cs.bSuppOctetFram;
         pModConf->iAddtlFrameDelim = cs.iAddtlFrameDelim;
@@ -960,6 +1294,10 @@ BEGINendCnfLoad
         pModConf->iKeepAliveProbes = cs.iKeepAliveProbes;
         pModConf->iKeepAliveIntvl = cs.iKeepAliveIntvl;
         pModConf->iKeepAliveTime = cs.iKeepAliveTime;
+        pModConf->compressionMode = cs.compressionMode;
+        pModConf->compressionDriver = cs.compressionDriver;
+        pModConf->compressionMaxTotalZstdWindowBytes = cs.compressionMaxTotalZstdWindowBytes;
+        pModConf->compressionMaxTotalZstdWindowBytesSet = cs.compressionMaxTotalZstdWindowBytesSet;
         if (pPermPeersRoot != NULL) {
             assert(pModConf->pPermPeersRoot == NULL);
             pModConf->pPermPeersRoot = pPermPeersRoot;
@@ -972,6 +1310,15 @@ BEGINendCnfLoad
             cs.pszStrmDrvrAuthMode = NULL;
         }
         pModConf->bPreserveCase = cs.bPreserveCase;
+        iRet = applySecureDefaultsToModuleConfig(pModConf);
+        if (iRet != RS_RET_OK) {
+            free(cs.pszStrmDrvrAuthMode);
+            cs.pszStrmDrvrAuthMode = NULL;
+            loadModConf = NULL;
+            return iRet;
+        }
+        warnIfInsecureListenerConfigured(pModConf->iStrmDrvrMode, getEffectiveModuleStreamDriver(pModConf),
+                                         pModConf->pszStrmDrvrAuthMode);
     }
     free(cs.pszStrmDrvrAuthMode);
     cs.pszStrmDrvrAuthMode = NULL;
@@ -1043,6 +1390,9 @@ BEGINfreeCnf
     if (pModConf->pPermPeersRoot != NULL) {
         net.DestructPermittedPeers(&pModConf->pPermPeersRoot);
     }
+    if (pModConf->pAllowedSendersRoot != NULL) {
+        net.DestructAllowedSenders(&pModConf->pAllowedSendersRoot);
+    }
 
     for (inst = pModConf->root; inst != NULL;) {
         free((void *)inst->pszBindRuleset);
@@ -1072,6 +1422,9 @@ BEGINfreeCnf
         free((void *)inst->dfltTZ);
         if (inst->pPermPeersRoot != NULL) {
             net.DestructPermittedPeers(&inst->pPermPeersRoot);
+        }
+        if (inst->pAllowedSendersRoot != NULL) {
+            net.DestructAllowedSenders(&inst->pAllowedSendersRoot);
         }
         del = inst;
         inst = inst->next;
@@ -1201,6 +1554,7 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
     cs.iTCPLstnMax = 20;
     cs.bSuppOctetFram = 1;
     cs.iStrmDrvrMode = 0;
+    cs.bStrmDrvrModeSet = 0;
     cs.bUseFlowControl = 1;
     cs.bKeepAlive = 0;
     cs.iKeepAliveProbes = 0;
@@ -1211,10 +1565,18 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
     cs.maxFrameSize = 200000;
     cs.bDisableLFDelim = 0;
     cs.bPreserveCase = 1;
+    cs.compressionMode = TCPSRV_COMPRESS_NEVER;
+    cs.compressionDriver = TCPSRV_COMPRESS_DRIVER_ZLIB;
+    cs.compressionMaxExpansionRatio = TCPSRV_COMPRESS_MAX_EXPANSION_RATIO_DEFAULT;
+    cs.compressionMaxDecompressedBytesPerReceive = TCPSRV_COMPRESS_MAX_DECOMPRESSED_BYTES_PER_RECEIVE_DEFAULT;
+    cs.compressionMaxTotalZstdWindowBytes = TCPSRV_COMPRESS_MAX_TOTAL_ZSTD_WINDOW_BYTES_DEFAULT;
+    cs.compressionMaxTotalZstdWindowBytesSet = RSFALSE;
     free(cs.pszStrmDrvrAuthMode);
     cs.pszStrmDrvrAuthMode = NULL;
     free(cs.pszInputName);
     cs.pszInputName = NULL;
+    free(cs.pszBindRuleset);
+    cs.pszBindRuleset = NULL;
     free(cs.lstnPortFile);
     cs.lstnPortFile = NULL;
     return RS_RET_OK;
@@ -1280,12 +1642,17 @@ BEGINmodInit()
                               STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
     CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpservernotifyonconnectionclose"), 0, eCmdHdlrBinary, NULL,
                               &cs.bEmitMsgOnClose, STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
-    CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpserverstreamdrivermode"), 0, eCmdHdlrInt, NULL, &cs.iStrmDrvrMode,
-                              STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
+    CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpserverstreamdrivermode"), 0, eCmdHdlrInt, setLegacyStrmDrvrMode,
+                              NULL, STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
     CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpserverpreservecase"), 1, eCmdHdlrBinary, NULL, &cs.bPreserveCase,
                               STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
     CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpserverlistenportfile"), 1, eCmdHdlrGetWord, NULL,
                               &cs.lstnPortFile, STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
+    CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpservercompressionmode"), 0, eCmdHdlrGetWord,
+                              setLegacyCompressionMode, NULL, STD_LOADABLE_MODULE_ID, &bLegacyCnfModGlobalsPermitted));
+    CHKiRet(regCfSysLineHdlr2(UCHAR_CONSTANT("inputtcpservercompressiondriver"), 0, eCmdHdlrGetWord,
+                              setLegacyCompressionDriver, NULL, STD_LOADABLE_MODULE_ID,
+                              &bLegacyCnfModGlobalsPermitted));
     CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("resetconfigvariables"), 1, eCmdHdlrCustomHandler, resetConfigVariables,
                                NULL, STD_LOADABLE_MODULE_ID));
 ENDmodInit

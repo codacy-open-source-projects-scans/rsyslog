@@ -34,8 +34,12 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#if defined(__GLIBC__)
+    #include <time.h>
+#endif
 
 #include "rsyslog.h"
 #include "syslogd-types.h"
@@ -46,6 +50,7 @@
 #include "errmsg.h"
 #include "net.h"
 #include "net_ossl.h"
+#include "net_ossl_store.h"
 #include "nsd_ptcp.h"
 #include "rsconf.h"
 
@@ -64,7 +69,7 @@ void net_ossl_set_ssl_verify_callback(SSL *pSsl, int flags);
 void net_ossl_set_ctx_verify_callback(SSL_CTX *pCtx, int flags);
 void net_ossl_set_bio_callback(BIO *conn);
 int net_ossl_verify_callback(int status, X509_STORE_CTX *store);
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)) || defined(ENABLE_WOLFSSL)
 rsRetVal net_ossl_apply_tlscgfcmd(net_ossl_t *pThis, uchar *tlscfgcmd);
 #endif  // OPENSSL_VERSION_NUMBER >= 0x10002000L
 rsRetVal net_ossl_chkpeercertvalidity(net_ossl_t *pThis, SSL *ssl, uchar *fromHostIP);
@@ -75,9 +80,143 @@ void ocsp_cache_cleanup(void);
 #endif
 rsRetVal net_ossl_chkpeername(net_ossl_t *pThis, X509 *certpeer, uchar *fromHostIP);
 
+#ifdef ENABLE_WOLFSSL
+static rsRetVal net_ossl_wolfssl_enable_leaf_crl(SSL_CTX *ctx, const char *crlFile) {
+    WOLFSSL_CERT_MANAGER *cm;
+    DEFiRet;
+
+    cm = wolfSSL_CTX_GetCertManager(ctx);
+    if (cm == NULL) {
+        LogError(0, RS_RET_CRL_INVALID, "wolfSSL: CertManager unavailable after loading CRL '%s'", crlFile);
+        ABORT_FINALIZE(RS_RET_CRL_INVALID);
+    }
+
+    /* wolfSSL_X509_STORE_add_crl enables chain-wide CRL checks, while the
+     * DER loader does not enable CRL checks at all. Normalize both paths to
+     * OpenSSL's X509_V_FLAG_CRL_CHECK behavior: verify the leaf certificate. */
+    if (wolfSSL_CertManagerDisableCRL(cm) != WOLFSSL_SUCCESS) {
+        LogError(0, RS_RET_CRL_INVALID, "wolfSSL: CRL checking could not be reset for CRL '%s'", crlFile);
+        ABORT_FINALIZE(RS_RET_CRL_INVALID);
+    }
+    if (wolfSSL_CertManagerEnableCRL(cm, WOLFSSL_CRL_CHECK) != WOLFSSL_SUCCESS) {
+        LogError(0, RS_RET_CRL_INVALID, "wolfSSL: CRL checking could not be enabled for CRL '%s'", crlFile);
+        ABORT_FINALIZE(RS_RET_CRL_INVALID);
+    }
+
+finalize_it:
+    RETiRet;
+}
+#endif
+
 
 /*--------------------------------------MT OpenSSL helpers ------------------------------------------*/
 #ifndef ENABLE_WOLFSSL
+    #if defined(__GLIBC__)
+typedef struct ocsp_gai_req_s {
+    struct gaicb request;
+    struct addrinfo hints;
+    char *host;
+    char *port;
+} ocsp_gai_req_t;
+
+static void ocsp_gai_req_free(ocsp_gai_req_t *req) {
+    if (req == NULL) return;
+    if (req->request.ar_result != NULL) freeaddrinfo(req->request.ar_result);
+    free(req->host);
+    free(req->port);
+    free(req);
+}
+
+static void *ocsp_gai_cleanup_thread(void *arg) {
+    ocsp_gai_req_t *req = (ocsp_gai_req_t *)arg;
+    const struct gaicb *requests[1];
+
+    requests[0] = &req->request;
+    (void)gai_suspend(requests, 1, NULL);
+    (void)gai_error(&req->request);
+    ocsp_gai_req_free(req);
+    return NULL;
+}
+
+static int ocsp_gai_cleanup_async(ocsp_gai_req_t *req) {
+    pthread_t tid;
+
+    if (pthread_create(&tid, NULL, ocsp_gai_cleanup_thread, req) != 0) {
+        const struct gaicb *requests[1];
+
+        requests[0] = &req->request;
+        (void)gai_suspend(requests, 1, NULL);
+        (void)gai_error(&req->request);
+        ocsp_gai_req_free(req);
+    } else {
+        pthread_detach(tid);
+    }
+    return EAI_AGAIN;
+}
+    #endif
+
+static int ocsp_getaddrinfo(const char *host, const char *port, const struct addrinfo *hints, struct addrinfo **res) {
+    #if defined(__GLIBC__)
+    ocsp_gai_req_t *req;
+    struct gaicb *requests[1];
+    struct timespec timeout;
+    int ret;
+
+    req = calloc(1, sizeof(*req));
+    if (req == NULL) return EAI_MEMORY;
+    req->host = strdup(host);
+    req->port = strdup(port);
+    if (req->host == NULL || req->port == NULL) {
+        ocsp_gai_req_free(req);
+        return EAI_MEMORY;
+    }
+    req->hints = *hints;
+    req->request.ar_name = req->host;
+    req->request.ar_service = req->port;
+    req->request.ar_request = &req->hints;
+    requests[0] = &req->request;
+
+    ret = getaddrinfo_a(GAI_NOWAIT, requests, 1, NULL);
+    if (ret != 0) {
+        ocsp_gai_req_free(req);
+        return ret;
+    }
+
+    timeout.tv_sec = OCSP_TIMEOUT;
+    timeout.tv_nsec = 0;
+    ret = gai_suspend((const struct gaicb *const *)requests, 1, &timeout);
+    if (ret == EAI_AGAIN) {
+        ret = gai_cancel(&req->request);
+        if (ret == EAI_CANCELED) {
+            ocsp_gai_req_free(req);
+            return EAI_AGAIN;
+        }
+        if (ret == EAI_NOTCANCELED) {
+            return ocsp_gai_cleanup_async(req);
+        }
+        if (ret == EAI_ALLDONE) {
+            ret = 0;
+        }
+    }
+    if (ret != 0) {
+        ocsp_gai_req_free(req);
+        return ret;
+    }
+
+    ret = gai_error(&req->request);
+    if (ret == 0) {
+        *res = req->request.ar_result;
+        req->request.ar_result = NULL;
+    } else {
+        (void)gai_cancel(&req->request);
+    }
+    ocsp_gai_req_free(req);
+    return ret;
+    #else
+    return getaddrinfo(host, port, hints, res);
+    #endif
+}
+
 static MUTEX_TYPE *mutex_buf = NULL;
 static sbool openssl_initialized = 0;  // Avoid multiple initialization / deinitialization
 
@@ -282,10 +421,18 @@ void osslGlblExit(void) {
 }
 
 
-/* initialize openssl context; called on
- * - listener creation
- * - outbound connection creation
- * Once created, the ctx object is used by-subobjects (accepted inbound connections)
+/**
+ * @brief Create and configure the OpenSSL SSL_CTX for a listener or outbound
+ * connection.
+ *
+ * The context is populated from the effective netstream driver configuration,
+ * including CA certificates, certificate chains, and private keys. Those TLS
+ * objects may come from ordinary PEM files or, on supported OpenSSL 3 builds,
+ * from strict pkcs11: URIs handled through the URI-aware lmnsd_ossl helpers.
+ *
+ * @param pThis OpenSSL netstream instance being initialized.
+ * @param method SSL/TLS method used to create the context.
+ * @return RS_RET_OK on success, or an rsyslog TLS-related error code.
  */
 static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method) {
     DEFiRet;
@@ -295,21 +442,25 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
     int bHaveKey;
     int bHaveExtraCAFiles;
     const char *caFile, *crlFile, *certFile, *keyFile;
-    char *extraCaFiles, *extraCaFile;
+    char *caFileSanitized, *crlFileSanitized, *certFileSanitized, *keyFileSanitized, *extraCaFilesSanitized;
+    char *extraCaFiles, *extraCaFilesCopy, *extraCaFile;
+
+    caFileSanitized = crlFileSanitized = certFileSanitized = keyFileSanitized = extraCaFilesSanitized = NULL;
+    extraCaFilesCopy = NULL;
     /* Setup certificates */
     caFile = (char *)((pThis->pszCAFile == NULL) ? glbl.GetDfltNetstrmDrvrCAF(runConf) : pThis->pszCAFile);
     if (caFile == NULL) {
         LogMsg(0, RS_RET_CA_CERT_MISSING, LOG_WARNING, "Warning: CA certificate is not set");
         bHaveCA = 0;
     } else {
-        dbgprintf("osslCtxInit: OSSL CA file: '%s'\n", caFile);
+        dbgprintf("osslCtxInit: OSSL CA file: '%s'\n", net_ossl_sanitize_log_value(caFile, &caFileSanitized));
         bHaveCA = 1;
     }
     crlFile = (char *)((pThis->pszCRLFile == NULL) ? glbl.GetDfltNetstrmDrvrCRLF(runConf) : pThis->pszCRLFile);
     if (crlFile == NULL) {
         bHaveCRL = 0;
     } else {
-        dbgprintf("osslCtxInit: OSSL CRL file: '%s'\n", crlFile);
+        dbgprintf("osslCtxInit: OSSL CRL file: '%s'\n", net_ossl_sanitize_log_value(crlFile, &crlFileSanitized));
         bHaveCRL = 1;
     }
     certFile = (char *)((pThis->pszCertFile == NULL) ? glbl.GetDfltNetstrmDrvrCertFile(runConf) : pThis->pszCertFile);
@@ -317,7 +468,7 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
         LogMsg(0, RS_RET_CERT_MISSING, LOG_WARNING, "Warning: Certificate file is not set");
         bHaveCert = 0;
     } else {
-        dbgprintf("osslCtxInit: OSSL CERT file: '%s'\n", certFile);
+        dbgprintf("osslCtxInit: OSSL CERT file: '%s'\n", net_ossl_sanitize_log_value(certFile, &certFileSanitized));
         bHaveCert = 1;
     }
     keyFile = (char *)((pThis->pszKeyFile == NULL) ? glbl.GetDfltNetstrmDrvrKeyFile(runConf) : pThis->pszKeyFile);
@@ -325,7 +476,7 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
         LogMsg(0, RS_RET_CERTKEY_MISSING, LOG_WARNING, "Warning: Key file is not set");
         bHaveKey = 0;
     } else {
-        dbgprintf("osslCtxInit: OSSL KEY file: '%s'\n", keyFile);
+        dbgprintf("osslCtxInit: OSSL KEY file: '%s'\n", net_ossl_sanitize_log_value(keyFile, &keyFileSanitized));
         bHaveKey = 1;
     }
     extraCaFiles =
@@ -333,7 +484,8 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
     if (extraCaFiles == NULL) {
         bHaveExtraCAFiles = 0;
     } else {
-        dbgprintf("osslCtxInit: OSSL EXTRA CA files: '%s'\n", extraCaFiles);
+        dbgprintf("osslCtxInit: OSSL EXTRA CA files: '%s'\n",
+                  net_ossl_sanitize_log_value(extraCaFiles, &extraCaFilesSanitized));
         bHaveExtraCAFiles = 1;
     }
 
@@ -345,29 +497,89 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
     pThis->ctx = SSL_CTX_new(method);
 
     if (bHaveExtraCAFiles == 1) {
+        CHKmalloc(extraCaFilesCopy = strdup(extraCaFiles));
+        extraCaFiles = extraCaFilesCopy;
         while ((extraCaFile = strsep(&extraCaFiles, ","))) {
-            if (SSL_CTX_load_verify_locations(pThis->ctx, extraCaFile, NULL) != 1) {
-                LogError(0, RS_RET_TLS_CERT_ERR,
-                         "Error: Extra Certificate file could not be accessed. "
+            iRet = net_ossl_load_ca_file(pThis->ctx, extraCaFile);
+            if (iRet != RS_RET_OK) {
+                char *extraCaFileSanitized = NULL;
+                const char *logExtraCaFile = net_ossl_sanitize_log_value(extraCaFile, &extraCaFileSanitized);
+                LogError(0, iRet,
+                         "Error: Extra Certificate file '%s' could not be accessed. "
                          "Check at least: 1) file path is correct, 2) file exist, "
                          "3) permissions are correct, 4) file content is correct. "
-                         "OpenSSL error info may follow in next messages");
-                net_ossl_lastOpenSSLErrorMsg(NULL, 0, NULL, LOG_ERR, "osslCtxInit", "SSL_CTX_load_verify_locations");
-                ABORT_FINALIZE(RS_RET_TLS_CERT_ERR);
+                         "OpenSSL error info may follow in next messages",
+                         logExtraCaFile);
+                net_ossl_free_sanitized_log_value(&extraCaFileSanitized);
+                ABORT_FINALIZE(iRet);
             }
         }
     }
-    if (bHaveCA == 1 && SSL_CTX_load_verify_locations(pThis->ctx, caFile, NULL) != 1) {
-        LogError(0, RS_RET_TLS_CERT_ERR,
-                 "Error: CA certificate could not be accessed. "
-                 "Check at least: 1) file path is correct, 2) file exist, "
-                 "3) permissions are correct, 4) file content is correct. "
-                 "OpenSSL error info may follow in next messages");
-        net_ossl_lastOpenSSLErrorMsg(NULL, 0, NULL, LOG_ERR, "osslCtxInit", "SSL_CTX_load_verify_locations");
-        ABORT_FINALIZE(RS_RET_TLS_CERT_ERR);
+    if (bHaveCA == 1) {
+        iRet = net_ossl_load_ca_file(pThis->ctx, caFile);
+        if (iRet != RS_RET_OK) {
+            char *caFileLoadSanitized = NULL;
+            const char *logCaFile = net_ossl_sanitize_log_value(caFile, &caFileLoadSanitized);
+            LogError(0, iRet,
+                     "Error: CA certificate '%s' could not be accessed. "
+                     "Check at least: 1) file path is correct, 2) file exist, "
+                     "3) permissions are correct, 4) file content is correct. "
+                     "OpenSSL error info may follow in next messages",
+                     logCaFile);
+            net_ossl_free_sanitized_log_value(&caFileLoadSanitized);
+            ABORT_FINALIZE(iRet);
+        }
     }
     if (bHaveCRL == 1) {
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+#if defined(ENABLE_WOLFSSL)
+        /* wolfSSL_CTX_LoadCRLFile / LoadCRLBuffer drop every PEM block after
+         * the first; wolfSSL_PEM_X509_INFO_read_bio iterates correctly. */
+        WOLFSSL_BIO *crlBio = NULL;
+        WOLF_STACK_OF(WOLFSSL_X509_INFO) *crlStack = NULL;
+        WOLFSSL_X509_STORE *crlStore = NULL;
+        int loaded = 0;
+        int crlIdx;
+
+        crlBio = wolfSSL_BIO_new_file(crlFile, "rb");
+        if (crlBio == NULL) {
+            LogError(errno, RS_RET_CRL_MISSING, "Error: CRL '%s' could not be opened", crlFile);
+            ABORT_FINALIZE(RS_RET_CRL_MISSING);
+        }
+
+        crlStore = wolfSSL_CTX_get_cert_store(pThis->ctx);
+        crlStack = wolfSSL_PEM_X509_INFO_read_bio(crlBio, NULL, NULL, NULL);
+        if (crlStack != NULL) {
+            if (crlStore != NULL) {
+                for (crlIdx = 0; crlIdx < wolfSSL_sk_X509_INFO_num(crlStack); crlIdx++) {
+                    WOLFSSL_X509_INFO *info = wolfSSL_sk_X509_INFO_value(crlStack, crlIdx);
+                    if (info == NULL || info->crl == NULL) continue;
+                    if (wolfSSL_X509_STORE_add_crl(crlStore, info->crl) == WOLFSSL_SUCCESS) {
+                        loaded++;
+                    } else {
+                        LogMsg(0, RS_RET_CRL_INVALID, LOG_WARNING,
+                               "wolfSSL: CRL block #%d in '%s' failed to add to store, skipping", crlIdx + 1, crlFile);
+                    }
+                }
+            }
+            wolfSSL_sk_pop_free(crlStack, NULL);
+        }
+        wolfSSL_BIO_free(crlBio);
+
+        if (loaded == 0) {
+            /* No PEM CRL blocks parsed - try the raw file as DER (single CRL) */
+            if (wolfSSL_CTX_LoadCRLFile(pThis->ctx, crlFile, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+                LogError(0, RS_RET_CRL_INVALID,
+                         "Error: CRL '%s' could not be loaded (tried PEM bundle and DER). "
+                         "Check at least: 1) file path is correct, 2) file exists, "
+                         "3) permissions are correct, 4) file content is correct.",
+                         crlFile);
+                ABORT_FINALIZE(RS_RET_CRL_INVALID);
+            }
+            loaded = 1;
+        }
+        CHKiRet(net_ossl_wolfssl_enable_leaf_crl(pThis->ctx, crlFile));
+        dbgprintf("osslCtxInit: loaded %d CRL(s) from '%s' into wolfSSL CertManager\n", loaded, crlFile);
+#elif OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
         // Get X509_STORE reference
         X509_STORE *store = SSL_CTX_get_cert_store(pThis->ctx);
         if (!X509_STORE_load_file(store, crlFile)) {
@@ -428,22 +640,45 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
     #endif
 #endif
     }
-    if (bHaveCert == 1 && SSL_CTX_use_certificate_chain_file(pThis->ctx, certFile) != 1) {
-        LogError(0, RS_RET_TLS_CERT_ERR,
-                 "Error: Certificate file could not be accessed. "
-                 "Check at least: 1) file path is correct, 2) file exist, "
-                 "3) permissions are correct, 4) file content is correct. "
-                 "OpenSSL error info may follow in next messages");
-        net_ossl_lastOpenSSLErrorMsg(NULL, 0, NULL, LOG_ERR, "osslCtxInit", "SSL_CTX_use_certificate_chain_file");
-        ABORT_FINALIZE(RS_RET_TLS_CERT_ERR);
+#ifdef ENABLE_WOLFSSL
+    if (pThis->bTlsRevocationCheck) {
+        WOLFSSL_CERT_MANAGER *cm = wolfSSL_CTX_GetCertManager(pThis->ctx);
+        if (cm == NULL || wolfSSL_CertManagerEnableOCSP(cm, WOLFSSL_OCSP_CHECKALL) != WOLFSSL_SUCCESS) {
+            LogError(0, RS_RET_SYS_ERR,
+                     "Error: unable to enable OCSP revocation checking in wolfSSL "
+                     "(was wolfSSL built with --enable-ocsp?)");
+            ABORT_FINALIZE(RS_RET_SYS_ERR);
+        }
+        dbgprintf("osslCtxInit: wolfSSL OCSP revocation checking enabled\n");
     }
-    if (bHaveKey == 1 && SSL_CTX_use_PrivateKey_file(pThis->ctx, keyFile, SSL_FILETYPE_PEM) != 1) {
+#endif
+    if (bHaveKey == 1) {
+        iRet = net_ossl_load_key_file(pThis->ctx, keyFile);
+        if (iRet != RS_RET_OK) {
+            LogError(0, iRet,
+                     "Error: Key could not be accessed. "
+                     "Check at least: 1) file path is correct, 2) file exist, "
+                     "3) permissions are correct, 4) file content is correct. "
+                     "OpenSSL error info may follow in next messages");
+            ABORT_FINALIZE(iRet);
+        }
+    }
+    if (bHaveCert == 1) {
+        iRet = net_ossl_load_cert_file(pThis->ctx, certFile);
+        if (iRet != RS_RET_OK) {
+            LogError(0, iRet,
+                     "Error: Certificate file could not be accessed. "
+                     "Check at least: 1) file path is correct, 2) file exist, "
+                     "3) permissions are correct, 4) file content is correct. "
+                     "OpenSSL error info may follow in next messages");
+            ABORT_FINALIZE(iRet);
+        }
+    }
+    if (bHaveCert == 1 && bHaveKey == 1 && SSL_CTX_check_private_key(pThis->ctx) != 1) {
         LogError(0, RS_RET_TLS_KEY_ERR,
-                 "Error: Key could not be accessed. "
-                 "Check at least: 1) file path is correct, 2) file exist, "
-                 "3) permissions are correct, 4) file content is correct. "
+                 "Error: Certificate and key are not usable together. "
                  "OpenSSL error info may follow in next messages");
-        net_ossl_lastOpenSSLErrorMsg(NULL, 0, NULL, LOG_ERR, "osslCtxInit", "SSL_CTX_use_PrivateKey_file");
+        net_ossl_lastOpenSSLErrorMsg(NULL, 0, NULL, LOG_ERR, "osslCtxInit", "SSL_CTX_check_private_key");
         ABORT_FINALIZE(RS_RET_TLS_KEY_ERR);
     }
 
@@ -489,6 +724,12 @@ static rsRetVal net_ossl_osslCtxInit(net_ossl_t *pThis, const SSL_METHOD *method
     #endif
 #endif
 finalize_it:
+    net_ossl_free_sanitized_log_value(&caFileSanitized);
+    net_ossl_free_sanitized_log_value(&crlFileSanitized);
+    net_ossl_free_sanitized_log_value(&certFileSanitized);
+    net_ossl_free_sanitized_log_value(&keyFileSanitized);
+    net_ossl_free_sanitized_log_value(&extraCaFilesSanitized);
+    free(extraCaFilesCopy);
     RETiRet;
 }
 
@@ -525,7 +766,7 @@ void net_ossl_lastOpenSSLErrorMsg(
     }
 }
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)) || defined(ENABLE_WOLFSSL)
 /* initialize tls config commands in openssl context
  */
 rsRetVal net_ossl_apply_tlscgfcmd(net_ossl_t *pThis, uchar *tlscfgcmd) {
@@ -644,20 +885,89 @@ finalize_it:
 }
 
 
-/* Perform a match on ONE peer name obtained from the certificate. This name
- * is checked against the set of configured credentials. *pbFoundPositiveMatch is
- * set to 1 if the ID matches. *pbFoundPositiveMatch must have been initialized
- * to 0 by the caller (this is a performance enhancement as we expect to be
- * called multiple times).
- * TODO: implemet wildcards?
- * rgerhards, 2008-05-26
- */
-static rsRetVal net_ossl_chkonepeername(net_ossl_t *pThis,
-                                        X509 *certpeer,
-                                        uchar *pszPeerID,
-                                        int *pbFoundPositiveMatch) {
+static const unsigned char *ossl_asn1_string_data(const ASN1_STRING *const str) {
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(ENABLE_WOLFSSL)
+    return ASN1_STRING_get0_data(str);
+#else
+    return ASN1_STRING_data((ASN1_STRING *)str);
+#endif
+}
+
+static rsRetVal ossl_asn1_string_to_cstr(const ASN1_STRING *const str, uchar **const ppszOut) {
+    uchar *pszOut = NULL;
+    int len;
+    const unsigned char *data = NULL;
+#ifndef ENABLE_WOLFSSL
+    unsigned char *utf8 = NULL;
+#endif
+    DEFiRet;
+
+    *ppszOut = NULL;
+    if (str == NULL) {
+        FINALIZE;
+    }
+
+#ifndef ENABLE_WOLFSSL
+    /* OpenSSL 1.0.2 declared this input mutable; newer versions do not. */
+    #if OPENSSL_VERSION_NUMBER < 0x10100000L
+    len = ASN1_STRING_to_UTF8(&utf8, (ASN1_STRING *)str);
+    #else
+    len = ASN1_STRING_to_UTF8(&utf8, str);
+    #endif
+    if (len < 0 || utf8 == NULL) {
+        FINALIZE;
+    }
+    data = utf8;
+#else
+    /* wolfSSL and OpenSSL before 1.1.0 declare this read-only accessor's
+     * argument mutable. Keep the conversion helper const-correct. */
+    #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(ENABLE_WOLFSSL)
+    len = ASN1_STRING_length((ASN1_STRING *)str);
+    #else
+    len = ASN1_STRING_length(str);
+    #endif
+    data = ossl_asn1_string_data(str);
+#endif
+    if (len < 0 || data == NULL) {
+        FINALIZE;
+    }
+    if (memchr(data, '\0', (size_t)len) != NULL) {
+        FINALIZE;
+    }
+    CHKmalloc(pszOut = malloc((size_t)len + 1));
+    memcpy(pszOut, data, (size_t)len);
+    pszOut[len] = '\0';
+    *ppszOut = pszOut;
+    pszOut = NULL;
+
+finalize_it:
+    free(pszOut);
+#ifndef ENABLE_WOLFSSL
+    if (utf8 != NULL) {
+        OPENSSL_free(utf8);
+    }
+#endif
+    RETiRet;
+}
+
+static rsRetVal ossl_append_identity(cstr_t *const pStr, const char *const prefix, const uchar *const identity) {
+    DEFiRet;
+
+    CHKiRet(rsCStrAppendStrWithLen(pStr, (const uchar *)prefix, strlen(prefix)));
+    CHKiRet(rsCStrAppendStrWithLen(pStr, identity, strlen((const char *)identity)));
+    CHKiRet(rsCStrAppendStrWithLen(pStr, (const uchar *)"; ", 2));
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal net_ossl_matchpeeridentity(net_ossl_t *pThis,
+                                           X509 *certpeer,
+                                           const uchar *pszPeerID,
+                                           int *pbFoundPositiveMatch,
+                                           const sbool allowX509CheckHost) {
     permittedPeers_t *pPeer;
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L || defined(ENABLE_WOLFSSL)
     int osslRet;
     unsigned int x509flags = 0;
 #endif
@@ -672,42 +982,50 @@ static rsRetVal net_ossl_chkonepeername(net_ossl_t *pThis,
     assert(pszPeerID != NULL);
     assert(pbFoundPositiveMatch != NULL);
 
-    /* Obtain Namex509 name from subject */
-    x509name = X509_NAME_oneline(RSYSLOG_X509_NAME_oneline(certpeer), NULL, 0);
-
     if (pThis->pPermPeers) { /* do we have configured peer IDs? */
-        pPeer = pThis->pPermPeers;
-        while (pPeer != NULL) {
+        for (pPeer = pThis->pPermPeers; pPeer != NULL; pPeer = pPeer->pNext) {
             CHKiRet(net.PermittedPeerWildcardMatch(pPeer, pszPeerID, pbFoundPositiveMatch));
             if (*pbFoundPositiveMatch) break;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L || defined(ENABLE_WOLFSSL)
             /* if we did not succeed so far, try ossl X509_check_host
              * ( Includes check against SubjectAlternativeName )
              * if prioritizeSAN set, only check against SAN
              */
-            if (pThis->bSANpriority == 1) {
-    #if OPENSSL_VERSION_NUMBER >= 0x10100004L && !defined(LIBRESSL_VERSION_NUMBER)
+            if (!allowX509CheckHost || pPeer->etryType == PERM_PEER_TYPE_WILDCARD) {
+                continue;
+            } else if (pThis->bSANpriority == 1) {
+    #if OPENSSL_VERSION_NUMBER >= 0x10100004L && !defined(LIBRESSL_VERSION_NUMBER) && \
+        defined(X509_CHECK_FLAG_NEVER_CHECK_SUBJECT)
                 x509flags = X509_CHECK_FLAG_NEVER_CHECK_SUBJECT;
     #else
-                dbgprintf("net_ossl_chkonepeername: PrioritizeSAN not supported before OpenSSL 1.1.0\n");
+                /* Security hard-stop: with older OpenSSL-compatible APIs (notably wolfSSL
+                 * compatibility mode), we cannot request SAN-only matching. Calling
+                 * X509_check_host() with default flags may fall back to CN, which would
+                 * violate PrioritizeSAN semantics and RFC 6125 behavior.
+                 */
+                dbgprintf("net_ossl_matchpeeridentity: PrioritizeSAN not supported by this OpenSSL-compatible API\n");
+                continue;
     #endif  // OPENSSL_VERSION_NUMBER >= 0x10100004L
+            }
+
+            /* Obtain Namex509 name from subject */
+            if (x509name == NULL) {
+                x509name = X509_NAME_oneline(RSYSLOG_X509_NAME_oneline(certpeer), NULL, 0);
             }
             osslRet = X509_check_host(certpeer, (const char *)pPeer->pszID, strlen((const char *)pPeer->pszID),
                                       x509flags, NULL);
             if (osslRet == 1) {
                 /* Found Peer cert in allowed Peerslist */
-                dbgprintf("net_ossl_chkonepeername: Client ('%s') is allowed (X509_check_host)\n", x509name);
+                dbgprintf("net_ossl_matchpeeridentity: Client ('%s') is allowed (X509_check_host)\n", x509name);
                 *pbFoundPositiveMatch = 1;
                 break;
             } else if (osslRet < 0) {
-                net_ossl_lastOpenSSLErrorMsg(NULL, osslRet, NULL, LOG_ERR, "net_ossl_chkonepeername",
+                net_ossl_lastOpenSSLErrorMsg(NULL, osslRet, NULL, LOG_ERR, "net_ossl_matchpeeridentity",
                                              "X509_check_host");
                 ABORT_FINALIZE(RS_RET_NO_ERRCODE);
             }
 #endif
-            /* Check next peer */
-            pPeer = pPeer->pNext;
         }
     } else {
         LogMsg(0, RS_RET_TLS_NO_CERT, LOG_WARNING,
@@ -722,6 +1040,143 @@ finalize_it:
     RETiRet;
 }
 
+static rsRetVal net_ossl_chkonepeername(net_ossl_t *pThis,
+                                        X509 *certpeer,
+                                        const uchar *pszPeerID,
+                                        int *pbFoundPositiveMatch) {
+    DEFiRet;
+
+    CHKiRet(net_ossl_matchpeeridentity(pThis, certpeer, pszPeerID, pbFoundPositiveMatch, 1));
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal net_ossl_match_sans(
+    net_ossl_t *pThis, X509 *certpeer, cstr_t *pStr, int *bHaveSAN, int *bFoundPositiveMatch) {
+    DEFiRet;
+
+    GENERAL_NAMES *names = NULL;
+    GENERAL_NAME *name;
+    ASN1_STRING *dns;
+    ASN1_OCTET_STRING *ip;
+    uchar *dnsName = NULL;
+    const unsigned char *ipData;
+    const char *addr;
+    char ipAddress[INET6_ADDRSTRLEN];
+    int count;
+    int i;
+
+    if (*bFoundPositiveMatch) {
+        FINALIZE;
+    }
+
+    names = X509_get_ext_d2i(certpeer, NID_subject_alt_name, NULL, NULL);
+    if (names == NULL) {
+        FINALIZE;
+    }
+
+    count = sk_GENERAL_NAME_num(names);
+    /* PrioritizeSAN suppresses CN fallback when any SAN exists, even if it is
+     * not a DNS/IP identity usable by x509/name matching. */
+    if (count > 0) {
+        *bHaveSAN = 1;
+    }
+    for (i = 0; i < count && !*bFoundPositiveMatch; ++i) {
+        name = sk_GENERAL_NAME_value(names, i);
+        if (name == NULL) {
+            continue;
+        }
+        if (name->type == GEN_DNS) {
+            dns = name->d.dNSName;
+            CHKiRet(ossl_asn1_string_to_cstr(dns, &dnsName));
+            if (dnsName == NULL) {
+                continue;
+            }
+            dbgprintf("net_ossl_match_sans: subject alt dnsName: '%s'\n", dnsName);
+            CHKiRet(ossl_append_identity(pStr, "DNSname: ", dnsName));
+            CHKiRet(net_ossl_matchpeeridentity(pThis, certpeer, dnsName, bFoundPositiveMatch, 0));
+            free(dnsName);
+            dnsName = NULL;
+        } else if (name->type == GEN_IPADD) {
+            ip = name->d.iPAddress;
+            ipData = ossl_asn1_string_data(ip);
+            if (ipData == NULL) {
+                continue;
+            }
+            if (ASN1_STRING_length(ip) == 4) {
+                addr = inet_ntop(AF_INET, ipData, ipAddress, sizeof(ipAddress));
+            } else if (ASN1_STRING_length(ip) == 16) {
+                addr = inet_ntop(AF_INET6, ipData, ipAddress, sizeof(ipAddress));
+            } else {
+                continue;
+            }
+            if (addr == NULL) {
+                continue;
+            }
+            dbgprintf("net_ossl_match_sans: subject alt ipAddr: '%s'\n", ipAddress);
+            CHKiRet(ossl_append_identity(pStr, "IPaddress: ", (const uchar *)ipAddress));
+            CHKiRet(net_ossl_matchpeeridentity(pThis, certpeer, (const uchar *)ipAddress, bFoundPositiveMatch, 0));
+        }
+    }
+
+finalize_it:
+    free(dnsName);
+    if (names != NULL) {
+        GENERAL_NAMES_free(names);
+    }
+    RETiRet;
+}
+
+static rsRetVal net_ossl_match_cn(net_ossl_t *pThis, X509 *certpeer, cstr_t *pStr, int *bFoundPositiveMatch) {
+    const X509_NAME *subject;
+    const X509_NAME_ENTRY *entry;
+    const ASN1_STRING *cn;
+    uchar *cnName = NULL;
+    int idx;
+    DEFiRet;
+
+    subject = RSYSLOG_X509_NAME_oneline(certpeer);
+    if (subject == NULL) {
+        FINALIZE;
+    }
+#if OPENSSL_VERSION_NUMBER < 0x30000000L || defined(ENABLE_WOLFSSL)
+    idx = X509_NAME_get_index_by_NID((X509_NAME *)subject, NID_commonName, -1);
+#else
+    idx = X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+#endif
+    if (idx < 0) {
+        FINALIZE;
+    }
+    /* OpenSSL before 1.1.0 and wolfSSL expose these read-only accessors
+     * without const-qualified arguments. Keep the local API const-correct,
+     * and cast only at the compatibility boundary. */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(ENABLE_WOLFSSL)
+    entry = X509_NAME_get_entry((X509_NAME *)subject, idx);
+#else
+    entry = X509_NAME_get_entry(subject, idx);
+#endif
+    if (entry == NULL) {
+        FINALIZE;
+    }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(ENABLE_WOLFSSL)
+    cn = X509_NAME_ENTRY_get_data((X509_NAME_ENTRY *)entry);
+#else
+    cn = X509_NAME_ENTRY_get_data(entry);
+#endif
+    CHKiRet(ossl_asn1_string_to_cstr(cn, &cnName));
+    if (cnName == NULL) {
+        FINALIZE;
+    }
+
+    dbgprintf("net_ossl_match_cn: now checking auth for CN '%s'\n", cnName);
+    CHKiRet(ossl_append_identity(pStr, "CN: ", cnName));
+    CHKiRet(net_ossl_matchpeeridentity(pThis, certpeer, cnName, bFoundPositiveMatch, 0));
+
+finalize_it:
+    free(cnName);
+    RETiRet;
+}
 
 /* Check the peer's ID in fingerprint auth mode.
  * rgerhards, 2008-05-22
@@ -804,23 +1259,31 @@ finalize_it:
  */
 rsRetVal net_ossl_chkpeername(net_ossl_t *pThis, X509 *certpeer, uchar *fromHostIP) {
     DEFiRet;
-    uchar lnBuf[256];
     int bFoundPositiveMatch;
+    int bHaveSAN;
     cstr_t *pStr = NULL;
     char *x509name = NULL;
 
     ISOBJ_TYPE_assert(pThis, net_ossl);
 
     bFoundPositiveMatch = 0;
+    bHaveSAN = 0;
     CHKiRet(rsCStrConstruct(&pStr));
 
     /* Obtain Namex509 name from subject */
     x509name = X509_NAME_oneline(RSYSLOG_X509_NAME_oneline(certpeer), NULL, 0);
+    if (x509name == NULL) {
+        LogMsg(0, RS_RET_CERT_INVALID_DN, LOG_WARNING, "net_ossl_chkpeername: could not obtain X.509 subject name");
+        ABORT_FINALIZE(RS_RET_CERT_INVALID_DN);
+    }
 
     dbgprintf("net_ossl_chkpeername: checking - peername '%s' on server '%s'\n", x509name, fromHostIP);
-    snprintf((char *)lnBuf, sizeof(lnBuf), "name: %s; ", x509name);
-    CHKiRet(rsCStrAppendStr(pStr, lnBuf));
+    CHKiRet(ossl_append_identity(pStr, "name: ", (const uchar *)x509name));
     CHKiRet(net_ossl_chkonepeername(pThis, certpeer, (uchar *)x509name, &bFoundPositiveMatch));
+    CHKiRet(net_ossl_match_sans(pThis, certpeer, pStr, &bHaveSAN, &bFoundPositiveMatch));
+    if (!bFoundPositiveMatch && (!pThis->bSANpriority || !bHaveSAN)) {
+        CHKiRet(net_ossl_match_cn(pThis, certpeer, pStr, &bFoundPositiveMatch));
+    }
 
     if (!bFoundPositiveMatch) {
         dbgprintf("net_ossl_chkpeername: invalid peername, not permitted to talk to it\n");
@@ -980,7 +1443,7 @@ static char *ocsp_make_cache_key(X509 *cert, X509 *issuer) {
     if (!serial || !issuer) ABORT_FINALIZE(RS_RET_ERR);
 
     /* Hash issuer name for compact key */
-    X509_NAME *issuer_name = X509_get_subject_name(issuer);
+    const X509_NAME *issuer_name = X509_get_subject_name(issuer);
     if (!X509_NAME_digest(issuer_name, EVP_sha256(), md, &md_len)) {
         ABORT_FINALIZE(RS_RET_ERR);
     }
@@ -1216,17 +1679,33 @@ static int crl_check(X509 *current_cert, int *is_revoked) {
  * The resulting issuer certificate might be an untrusted certificate,
  * which should be used to generate OCSP requests.
  */
-static X509 *ocsp_find_issuer(X509 *target_cert,
-                              const char *cert_name,
-                              SSL_CTX *ctx,
-                              STACK_OF(X509) * untrusted_peer_certs) {
+static X509 *ocsp_find_issuer(
+    X509 *target_cert, const char *cert_name, SSL_CTX *ctx, STACK_OF(X509) * untrusted_peer_certs, int *issuer_owned) {
     X509 *issuer = NULL;
     X509_STORE *store = SSL_CTX_get_cert_store(ctx);
     STACK_OF(X509_OBJECT) * objs;
 
+    *issuer_owned = 0;
+
     /* find issuer among local trusted issuers */
     if (store != NULL) {
-    #if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    #if OPENSSL_VERSION_NUMBER >= 0x30300000L && !defined(LIBRESSL_VERSION_NUMBER)
+        /* OpenSSL 3.3+ provides an owned snapshot; get0_objects() is deprecated
+         * in OpenSSL 4 and is unsafe when the store is shared between threads.
+         */
+        objs = X509_STORE_get1_objects(store);
+        for (int i = 0; objs != NULL && i < sk_X509_OBJECT_num(objs); i++) {
+            X509 *cert = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(objs, i));
+            if (cert && X509_check_issued(cert, target_cert) == X509_V_OK) {
+                if (X509_up_ref(cert) == 1) {
+                    issuer = cert;
+                    *issuer_owned = 1;
+                }
+                break;
+            }
+        }
+        sk_X509_OBJECT_pop_free(objs, X509_OBJECT_free);
+    #elif OPENSSL_VERSION_NUMBER >= 0x10100000L
         objs = X509_STORE_get0_objects(store);
         for (int i = 0; i < sk_X509_OBJECT_num(objs); i++) {
             X509 *cert = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(objs, i));
@@ -1367,6 +1846,7 @@ static int ocsp_check_validate_response_and_cert(OCSP_RESPONSE *rsp,
     /* Store result in cache */
     char *cache_key = ocsp_make_cache_key(cert, issuer);
     if (cache_key) {
+        int should_cache = 1;
         time_t cache_ttl = OCSP_CACHE_DEFAULT_TTL;
         /* Use nextUpdate if available for more accurate cache expiry */
         if (nextupd) {
@@ -1377,12 +1857,19 @@ static int ocsp_check_validate_response_and_cert(OCSP_RESPONSE *rsp,
                 time_t seconds_until_expiry = (pday * 86400) + psec;
                 if (seconds_until_expiry > 0) {
                     cache_ttl = seconds_until_expiry;
+                } else {
+                    /* avoid caching stale responses accepted only via OCSP leeway */
+                    should_cache = 0;
                 }
             } else {
                 dbgprintf("OCSP: ASN1_TIME_diff() failed, using default TTL\n");
             }
         }
-        ocsp_cache_store(cache_key, status, cache_ttl);
+        if (should_cache) {
+            ocsp_cache_store(cache_key, status, cache_ttl);
+        } else {
+            dbgprintf("OCSP: nextUpdate is not in the future, skipping cache store\n");
+        }
         free(cache_key);
     }
 
@@ -1403,12 +1890,7 @@ static BIO *ocsp_connect(const char *host, const char *port, const char *device)
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    /* TODO: DNS resolution is blocking with no timeout. A malicious certificate
-     * with OCSP responder URLs pointing to slow/unresponsive DNS names can cause
-     * the TLS handshake to block indefinitely. This is called from the TLS verify
-     * callback. Consider using async DNS resolution or making OCSP optional.
-     */
-    s = getaddrinfo(host, port, &hints, &res);
+    s = ocsp_getaddrinfo(host, port, &hints, &res);
     if (s != 0) {
         LogError(0, RS_RET_NO_ERRCODE, "OCSP: getaddrinfo failed for %s:%s: %s\n", host, port, gai_strerror(s));
         goto err;
@@ -1506,6 +1988,7 @@ err:
 static OCSP_RESPONSE *ocsp_send_and_receive(BIO *bio, const char *host, const char *path, OCSP_REQUEST *req) {
     OCSP_RESPONSE *rsp = NULL;
     char *req_data = NULL;
+    unsigned char *rsp_data = NULL;
     int req_len;
     int rv;
 
@@ -1546,6 +2029,9 @@ static OCSP_RESPONSE *ocsp_send_and_receive(BIO *bio, const char *host, const ch
     int in_headers = 1;
     long content_length = -1;
     const long MAX_OCSP_RESPONSE_SIZE = 1024 * 1024; /* 1MB limit */
+    size_t rsp_len = 0;
+    const size_t rsp_limit = (size_t)MAX_OCSP_RESPONSE_SIZE;
+    const size_t read_limit = rsp_limit + 1;
 
     while (in_headers) {
         rv = BIO_gets(bio, buf, sizeof(buf));
@@ -1556,7 +2042,13 @@ static OCSP_RESPONSE *ocsp_send_and_receive(BIO *bio, const char *host, const ch
 
         /* Parse Content-Length header */
         if (strncasecmp(buf, "Content-Length:", 15) == 0) {
-            content_length = atol(buf + 15);
+            char *endptr;
+            errno = 0;
+            content_length = strtol(buf + 15, &endptr, 10);
+            if (errno != 0 || endptr == buf + 15 || content_length < 0) {
+                LogError(0, RS_RET_NO_ERRCODE, "OCSP: Invalid Content-Length header\n");
+                goto err;
+            }
             if (content_length > MAX_OCSP_RESPONSE_SIZE) {
                 LogError(0, RS_RET_NO_ERRCODE,
                          "OCSP: Response Content-Length (%ld) exceeds maximum allowed size (%ld)\n", content_length,
@@ -1571,17 +2063,50 @@ static OCSP_RESPONSE *ocsp_send_and_receive(BIO *bio, const char *host, const ch
         }
     }
 
-    /* Read OCSP response with size limit */
-    if (content_length > 0 && content_length <= MAX_OCSP_RESPONSE_SIZE) {
-        /* Size is within limits, proceed with reading */
-        rsp = d2i_OCSP_RESPONSE_bio(bio, NULL);
-    } else if (content_length == -1) {
-        /* No Content-Length header - read with caution */
-        LogMsg(0, RS_RET_NO_ERRCODE, LOG_WARNING,
-               "OCSP: No Content-Length header in response, reading without size validation\n");
-        rsp = d2i_OCSP_RESPONSE_bio(bio, NULL);
+    rsp_data = malloc(read_limit);
+    if (rsp_data == NULL) {
+        LogError(0, RS_RET_OUT_OF_MEMORY, "OCSP: Failed to allocate response buffer\n");
+        goto err;
     }
 
+    while (rsp_len < read_limit) {
+        size_t wanted = read_limit - rsp_len;
+        if (content_length >= 0) {
+            size_t remaining = (size_t)content_length - rsp_len;
+            if (remaining == 0) {
+                break;
+            }
+            if (wanted > remaining) {
+                wanted = remaining;
+            }
+        }
+
+        rv = BIO_read(bio, rsp_data + rsp_len, (int)wanted);
+        if (rv < 0) {
+            LogError(0, RS_RET_NO_ERRCODE, "OCSP: Failed to read HTTP response body\n");
+            goto err;
+        }
+        if (rv == 0) {
+            break;
+        }
+        rsp_len += (size_t)rv;
+    }
+
+    if (rsp_len > rsp_limit) {
+        LogError(0, RS_RET_NO_ERRCODE, "OCSP: Response exceeds maximum allowed size (%ld)\n", MAX_OCSP_RESPONSE_SIZE);
+        goto err;
+    }
+    if (content_length > 0 && rsp_len != (size_t)content_length) {
+        LogError(0, RS_RET_NO_ERRCODE, "OCSP: Incomplete response body\n");
+        goto err;
+    }
+    if (rsp_len == 0) {
+        LogError(0, RS_RET_NO_ERRCODE, "OCSP: Empty response body\n");
+        goto err;
+    }
+
+    const unsigned char *p = rsp_data;
+    rsp = d2i_OCSP_RESPONSE(NULL, &p, (long)rsp_len);
     if (!rsp) {
         LogError(0, RS_RET_NO_ERRCODE, "OCSP: Failed to parse OCSP response\n");
         goto err;
@@ -1589,6 +2114,7 @@ static OCSP_RESPONSE *ocsp_send_and_receive(BIO *bio, const char *host, const ch
 
 err:
     if (req_data) OPENSSL_free(req_data);
+    free(rsp_data);
 
     return rsp;
 }
@@ -1695,6 +2221,7 @@ static int ocsp_check(
     int at_least_one_responder = 0;
     char *cache_key = NULL;
     int cached_status;
+    int issuer_owned;
 
     X509_NAME_oneline(X509_get_subject_name(current_cert), cert_name, sizeof(cert_name));
 
@@ -1704,7 +2231,7 @@ static int ocsp_check(
     /*
      * 1. Lookup the issuer cert of the current certificate, required to marshal a OCSP request.
      */
-    if (!(issuer = ocsp_find_issuer(current_cert, cert_name, ctx, untrusted_peer_certs))) goto err;
+    if (!(issuer = ocsp_find_issuer(current_cert, cert_name, ctx, untrusted_peer_certs, &issuer_owned))) goto err;
 
     /*
      * 2. Check cache first to avoid network I/O
@@ -1778,6 +2305,7 @@ static int ocsp_check(
 err:
     if (ocsp_responders) X509_email_free(ocsp_responders);
     if (cache_key) free(cache_key);
+    if (issuer_owned) X509_free(issuer);
 
     return ret;
 }
@@ -2230,7 +2758,7 @@ BEGINobjQueryInterface(net_ossl)
     pIf->osslPeerfingerprint = net_ossl_peerfingerprint;
     pIf->osslGetpeercert = net_ossl_getpeercert;
     pIf->osslChkpeercertvalidity = net_ossl_chkpeercertvalidity;
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)) || defined(ENABLE_WOLFSSL)
     pIf->osslApplyTlscgfcmd = net_ossl_apply_tlscgfcmd;
 #endif  // OPENSSL_VERSION_NUMBER >= 0x10002000L
     pIf->osslSetBioCallback = net_ossl_set_bio_callback;

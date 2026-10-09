@@ -27,6 +27,19 @@
  * A copy of the GPL can be found in the file "COPYING" in this distribution.
  * A copy of the LGPL can be found in the file "COPYING.LESSER" in this distribution.
  */
+
+/* Concurrency & Locking
+ *
+ * A message's mut mutex protects its mutable JSON trees and turbo snapshot
+ * slots.  MsgDup() holds the source mutex while it takes a coherent copy of
+ * JSON state and establishes shared snapshot ownership.  Lazy snapshot
+ * materialization also runs under that mutex.
+ *
+ * Turbo snapshots are immutable after publication.  Separate MsgDup() copies
+ * may therefore read one snapshot concurrently; turbo_result_refs tracks
+ * their shared ownership with atomic increments and decrements.  Each message
+ * releases its reference exactly once through MsgReleaseTurboResult().
+ */
 #include "config.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -35,6 +48,8 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
+#include <limits.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #ifdef HAVE_SYSINFO_UPTIME
@@ -61,7 +76,9 @@
 #include "atomic.h"
 #include "unicode-helper.h"
 #include "ruleset.h"
+#include "rainerscript.h"
 #include "prop.h"
+#include "msg_replace_helper.h"
 #include "net.h"
 #include "var.h"
 #include "rsconf.h"
@@ -75,6 +92,10 @@
  */
 static pthread_mutex_t glblVars_lock;
 struct json_object *global_var_root = NULL;
+
+#ifdef HAVE_LOGNORM_TURBO
+static int msgMaterializeTurboJSON(smsg_t *pMsg);
+#endif
 
 /* static data */
 DEFobjStaticHelpers;
@@ -286,7 +307,7 @@ static void MsgSetRcvFromWithoutAddRef(smsg_t *pThis, prop_t *new) {
  * pRuleset pointer inside msg is updated. If ruleset cannot be found,
  * no update is done and an error message emitted.
  */
-static void ATTR_NONNULL() MsgSetRulesetByName(smsg_t *const pMsg, cstr_t *const rulesetName) {
+rsRetVal ATTR_NONNULL() MsgSetRulesetByName(smsg_t *const pMsg, cstr_t *const rulesetName) {
     uchar *const rs_name = rsCStrGetSzStrNoNULL(rulesetName);
     const rsRetVal localRet = rulesetGetRuleset(runConf, &(pMsg->pRuleset), rs_name);
 
@@ -298,6 +319,7 @@ static void ATTR_NONNULL() MsgSetRulesetByName(smsg_t *const pMsg, cstr_t *const
                  "wanted to let you know.",
                  rs_name);
     }
+    return localRet;
 }
 
 /* do a DNS reverse resolution, if not already done, reflect status
@@ -306,11 +328,12 @@ static void ATTR_NONNULL() MsgSetRulesetByName(smsg_t *const pMsg, cstr_t *const
 static rsRetVal resolveDNS(smsg_t *const pMsg) {
     rsRetVal localRet;
     prop_t *propFromHost = NULL;
-    prop_t *ip;
-    prop_t *localName;
+    prop_t *ip = NULL;
+    prop_t *localName = NULL;
     prop_t *port = NULL;
     char portbuf[8];
     uint16_t pnum;
+    const struct sockaddr_storage *pfrominet;
     DEFiRet;
 
     MsgLock(pMsg);
@@ -322,15 +345,12 @@ static rsRetVal resolveDNS(smsg_t *const pMsg) {
             localRet = net.cvthname(pMsg->rcvFrom.pfrominet, &localName, NULL, &ip);
         }
         if (localRet == RS_RET_OK) {
-            /* we pass down the props, so no need for AddRef */
-            MsgSetRcvFromWithoutAddRef(pMsg, localName);
-            MsgSetRcvFromIPWithoutAddRef(pMsg, ip);
-
+            pfrominet = pMsg->rcvFrom.pfrominet;
             if (pMsg->pRcvFromPort == NULL) {
-                if (pMsg->rcvFrom.pfrominet->ss_family == AF_INET)
-                    pnum = ntohs(((struct sockaddr_in *)pMsg->rcvFrom.pfrominet)->sin_port);
-                else if (pMsg->rcvFrom.pfrominet->ss_family == AF_INET6)
-                    pnum = ntohs(((struct sockaddr_in6 *)pMsg->rcvFrom.pfrominet)->sin6_port);
+                if (pfrominet != NULL && pfrominet->ss_family == AF_INET)
+                    pnum = ntohs(((const struct sockaddr_in *)pfrominet)->sin_port);
+                else if (pfrominet != NULL && pfrominet->ss_family == AF_INET6)
+                    pnum = ntohs(((const struct sockaddr_in6 *)pfrominet)->sin6_port);
                 else
                     pnum = 0;
                 snprintf(portbuf, sizeof(portbuf), "%u", pnum);
@@ -338,6 +358,11 @@ static rsRetVal resolveDNS(smsg_t *const pMsg) {
                 MsgSetRcvFromPortWithoutAddRef(pMsg, port);
                 port = NULL;
             }
+            /* we pass down the props, so no need for AddRef */
+            MsgSetRcvFromWithoutAddRef(pMsg, localName);
+            localName = NULL;
+            MsgSetRcvFromIPWithoutAddRef(pMsg, ip);
+            ip = NULL;
         }
     }
 finalize_it:
@@ -348,6 +373,8 @@ finalize_it:
     }
     MsgUnlock(pMsg);
     if (propFromHost != NULL) prop.Destruct(&propFromHost);
+    if (localName != NULL) prop.Destruct(&localName);
+    if (ip != NULL) prop.Destruct(&ip);
     if (port != NULL) prop.Destruct(&port);
     RETiRet;
 }
@@ -363,7 +390,7 @@ void getInputName(const smsg_t *const pM, uchar **ppsz, int *const plen) {
 }
 
 
-static uchar *getRcvFromIP(smsg_t *const pM) {
+uchar *getRcvFromIP(smsg_t *const pM) {
     uchar *psz;
     int len;
     if (pM == NULL) {
@@ -378,7 +405,7 @@ static uchar *getRcvFromIP(smsg_t *const pM) {
     return psz;
 }
 
-static uchar *getRcvFromPort(smsg_t *const pM) {
+uchar *getRcvFromPort(smsg_t *const pM) {
     uchar *psz;
     int len;
     if (pM == NULL) {
@@ -434,7 +461,7 @@ rsRetVal propNameToID(const uchar *const pName, propid_t *const pPropID) {
         *pPropID = PROP_SYSLOGSEVERITY;
     } else if (!strcasecmp((char *)pName, "syslogseverity-text") || !strcasecmp((char *)pName, "syslogpriority-text")) {
         *pPropID = PROP_SYSLOGSEVERITY_TEXT;
-    } else if (!strcasecmp((char *)pName, "timegenerated")) {
+    } else if (!strcasecmp((char *)pName, "timegenerated") || !strcasecmp((char *)pName, "timereceived")) {
         *pPropID = PROP_TIMEGENERATED;
     } else if (!strcasecmp((char *)pName, "programname")) {
         *pPropID = PROP_PROGRAMNAME;
@@ -704,6 +731,13 @@ static rsRetVal msgBaseConstruct(smsg_t **ppThis) {
     pM->pRuleset = NULL;
     pM->json = NULL;
     pM->localvars = NULL;
+#ifdef HAVE_LOGNORM_TURBO
+    pM->turbo_result = NULL;
+    pM->turbo_result_free = NULL;
+    pM->turbo_result_to_json = NULL;
+    pM->turbo_result_get_str = NULL;
+    pM->turbo_result_refs = NULL;
+#endif
     pM->dfltTZ[0] = '\0';
     memset(&pM->tRcvdAt, 0, sizeof(pM->tRcvdAt));
     memset(&pM->tTIMESTAMP, 0, sizeof(pM->tTIMESTAMP));
@@ -796,6 +830,28 @@ static inline void freeHOSTNAME(smsg_t *pThis) {
 }
 
 
+#ifdef HAVE_LOGNORM_TURBO
+/* Release one reference on the turbo parse snapshot and clear this message's
+ * slot.  refs == NULL means sole ownership (the message was never duplicated):
+ * free directly, no atomics.  Otherwise the counter is shared across MsgDup()
+ * copies and the last owner out frees both the snapshot and the counter. */
+void MsgReleaseTurboResult(smsg_t *const pMsg) {
+    if (pMsg->turbo_result != NULL && pMsg->turbo_result_free != NULL) {
+        if (pMsg->turbo_result_refs == NULL) {
+            pMsg->turbo_result_free(pMsg->turbo_result);
+        } else if (__atomic_sub_fetch(pMsg->turbo_result_refs, 1, __ATOMIC_ACQ_REL) == 0) {
+            pMsg->turbo_result_free(pMsg->turbo_result);
+            free(pMsg->turbo_result_refs);
+        }
+    }
+    pMsg->turbo_result = NULL;
+    pMsg->turbo_result_free = NULL;
+    pMsg->turbo_result_to_json = NULL;
+    pMsg->turbo_result_get_str = NULL;
+    pMsg->turbo_result_refs = NULL;
+}
+#endif
+
 rsRetVal msgDestruct(smsg_t **ppThis) {
     DEFiRet;
     smsg_t *pThis;
@@ -844,6 +900,9 @@ rsRetVal msgDestruct(smsg_t **ppThis) {
         if (pThis->pCSMSGID != NULL) rsCStrDestruct(&pThis->pCSMSGID);
         if (pThis->json != NULL) json_object_put(pThis->json);
         if (pThis->localvars != NULL) json_object_put(pThis->localvars);
+#ifdef HAVE_LOGNORM_TURBO
+        MsgReleaseTurboResult(pThis);
+#endif
         if (pThis->pszUUID != NULL) free(pThis->pszUUID);
 #ifndef HAVE_ATOMIC_BUILTINS
         MsgUnlock(pThis);
@@ -904,12 +963,9 @@ ENDobjDestruct
     }
 
     /* Constructs a message object by duplicating another one.
-     * Returns NULL if duplication failed. We do not need to lock the
-     * message object here, because a fully-created msg object is never
-     * allowed to be manipulated. For this, MsgDup() must be used, so MsgDup()
-     * can never run into a situation where the message object is being
-     * modified while its content is copied - it's forbidden by definition.
-     * rgerhards, 2007-07-10
+     * Returns NULL if duplication failed. Most message fields are immutable
+     * after construction. The JSON and turbo snapshot fields are mutable, so
+     * they are copied coherently under the source message lock below.
      */
     smsg_t *MsgDup(smsg_t *pOld) {
     smsg_t *pNew;
@@ -998,8 +1054,45 @@ ENDobjDestruct
     tmpCOPYCSTR(PROCID);
     tmpCOPYCSTR(MSGID);
 
+    MsgLock(pOld);
+
+#ifdef HAVE_LOGNORM_TURBO
+    /* Share the turbo parse snapshot with the duplicate.  The snapshot is
+     * immutable after parsing, so copies may read it concurrently; ownership
+     * is tracked by a lazily-allocated shared counter (see msg.h).  The source
+     * message lock serializes first-counter publication and makes the JSON and
+     * lazy-callback snapshot coherent.  On counter allocation failure,
+     * materialize the source while locked so the duplicate still receives the
+     * normalized fields through its deep-copied $! tree. */
+    if (pOld->turbo_result != NULL) {
+        if (pOld->turbo_result_refs == NULL) {
+            unsigned *refs = malloc(sizeof(*refs));
+            if (refs != NULL) {
+                *refs = 2; /* pOld + pNew */
+                pOld->turbo_result_refs = refs;
+            } else if (!msgMaterializeTurboJSON(pOld)) {
+                /* A second allocation failure means neither shared snapshot
+                 * ownership nor a complete JSON copy can be established. */
+                MsgUnlock(pOld);
+                msgDestruct(&pNew);
+                return NULL;
+            }
+        } else {
+            __atomic_add_fetch(pOld->turbo_result_refs, 1, __ATOMIC_RELAXED);
+        }
+        if (pOld->turbo_result_refs != NULL) {
+            pNew->turbo_result = pOld->turbo_result;
+            pNew->turbo_result_free = pOld->turbo_result_free;
+            pNew->turbo_result_to_json = pOld->turbo_result_to_json;
+            pNew->turbo_result_get_str = pOld->turbo_result_get_str;
+            pNew->turbo_result_refs = pOld->turbo_result_refs;
+        }
+    }
+#endif
+
     if (pOld->json != NULL) pNew->json = jsonDeepCopy(pOld->json);
     if (pOld->localvars != NULL) pNew->localvars = jsonDeepCopy(pOld->localvars);
+    MsgUnlock(pOld);
 
     /* we do not copy all other cache properties, as we do not even know
      * if they are needed once again. So we let them re-create if needed.
@@ -1055,6 +1148,14 @@ static rsRetVal MsgSerialize(smsg_t *pThis, strm_t *pStrm) {
 
     assert(pThis != NULL);
     assert(pStrm != NULL);
+
+#ifdef HAVE_LOGNORM_TURBO
+    /* Disk queues persist JSON, not the opaque module-owned snapshot. */
+    MsgLock(pThis);
+    const int materialized = msgMaterializeTurboJSON(pThis);
+    MsgUnlock(pThis);
+    if (!materialized) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+#endif
 
     /* then serialize elements */
     CHKiRet(obj.BeginSerialize(pStrm, (obj_t *)pThis));
@@ -2000,6 +2101,16 @@ rsRetVal MsgSetFlowControlType(smsg_t *const pMsg, flowControl_t eFlowCtl) {
  */
 rsRetVal MsgSetAfterPRIOffs(smsg_t *const pMsg, int offs) {
     assert(pMsg != NULL);
+    assert(offs >= 0 && offs <= pMsg->iLenRawMsg);
+    if (offs < 0 || offs > pMsg->iLenRawMsg) {
+        pMsg->offAfterPRI = 0;
+        return RS_RET_ERR;
+    }
+    if (offs > 0) {
+        assert(pMsg->pszRawMsg != NULL);
+        assert(pMsg->pszRawMsg[0] == '<');
+        assert(pMsg->pszRawMsg[offs - 1] == '>');
+    }
     pMsg->offAfterPRI = offs;
     return RS_RET_OK;
 }
@@ -2243,6 +2354,11 @@ void MsgSetTAG(smsg_t *__restrict__ const pMsg, const uchar *pszBuf, const size_
     assert(pMsg != NULL);
 
     freeTAG(pMsg);
+    if (pMsg->iLenPROGNAME >= CONF_PROGNAME_BUFSIZE) {
+        free(pMsg->PROGNAME.ptr);
+        pMsg->PROGNAME.ptr = NULL;
+    }
+    pMsg->iLenPROGNAME = -1;
 
     pMsg->iLenTAG = lenBuf;
     if (pMsg->iLenTAG < CONF_TAG_BUFSIZE) {
@@ -2286,10 +2402,18 @@ static void ATTR_NONNULL(1) tryEmulateTAG(smsg_t *const pM, const sbool bLockMut
             /* no process ID, use APP-NAME only */
             MsgSetTAG(pM, (uchar *)getAPPNAME(pM, MUTEX_ALREADY_LOCKED), getAPPNAMELen(pM, MUTEX_ALREADY_LOCKED));
         } else {
+            int snRet;
             /* now we can try to emulate */
-            lenTAG = snprintf((char *)bufTAG, CONF_TAG_MAXSIZE, "%s[%s]", getAPPNAME(pM, MUTEX_ALREADY_LOCKED),
-                              getPROCID(pM, MUTEX_ALREADY_LOCKED));
+            snRet = snprintf((char *)bufTAG, CONF_TAG_MAXSIZE, "%s[%s]", getAPPNAME(pM, MUTEX_ALREADY_LOCKED),
+                             getPROCID(pM, MUTEX_ALREADY_LOCKED));
             bufTAG[sizeof(bufTAG) - 1] = '\0'; /* just to make sure... */
+            if (snRet < 0) {
+                lenTAG = 0;
+            } else if ((size_t)snRet >= sizeof(bufTAG)) {
+                lenTAG = sizeof(bufTAG) - 1;
+            } else {
+                lenTAG = snRet;
+            }
             MsgSetTAG(pM, bufTAG, lenTAG);
         }
         /* Signal change in TAG for acquireProgramName */
@@ -2367,6 +2491,39 @@ uchar *getRcvFrom(smsg_t *const pM) {
             prop.GetString(pM->rcvFrom.pRcvFrom, &psz, &len);
     }
     return psz;
+}
+
+
+void MsgGetRcvFromProp(smsg_t *const pM, const propid_t propid, uchar **const ppsz, int *const plen) {
+    prop_t *pProp = NULL;
+
+    assert(pM != NULL);
+    assert(ppsz != NULL);
+    assert(plen != NULL);
+
+    if (pM->msgFlags & NEEDS_DNSRESOL) {
+        (void)resolveDNS(pM);
+    }
+    switch (propid) {
+        case PROP_FROMHOST:
+            pProp = pM->rcvFrom.pRcvFrom;
+            break;
+        case PROP_FROMHOST_IP:
+            pProp = pM->pRcvFromIP;
+            break;
+        case PROP_FROMHOST_PORT:
+            pProp = pM->pRcvFromPort;
+            break;
+        default:
+            assert(0);
+            break;
+    }
+    if (pProp == NULL) {
+        *ppsz = UCHAR_CONSTANT("");
+        *plen = 0;
+    } else {
+        prop.GetString(pProp, ppsz, plen);
+    }
 }
 
 
@@ -2474,6 +2631,52 @@ void MsgSetInputName(smsg_t *pThis, prop_t *inputName) {
     pThis->pInputName = inputName;
 }
 
+rsRetVal MsgSetInputNameStr(smsg_t *const pMsg, const uchar *const text, const int len) {
+    prop_t *pProp = NULL;
+    DEFiRet;
+
+    CHKiRet(prop.Construct(&pProp));
+    CHKiRet(prop.SetString(pProp, text, len));
+    CHKiRet(prop.ConstructFinalize(pProp));
+    /* MsgSetInputName() retains an AddRef; release our constructor-owned
+     * reference in finalize_it on both success and failure. */
+    MsgSetInputName(pMsg, pProp);
+
+finalize_it:
+    if (pProp != NULL) prop.Destruct(&pProp);
+    RETiRet;
+}
+
+rsRetVal MsgSetRcvFromText(smsg_t *const pMsg, const uchar *const text, const int len) {
+    prop_t *pProp = NULL;
+    DEFiRet;
+
+    CHKiRet(prop.Construct(&pProp));
+    CHKiRet(prop.SetString(pProp, text, len));
+    CHKiRet(prop.ConstructFinalize(pProp));
+    /* MsgSetRcvFrom() retains an AddRef; release our constructor-owned
+     * reference in finalize_it on both success and failure. */
+    MsgSetRcvFrom(pMsg, pProp);
+
+finalize_it:
+    if (pProp != NULL) prop.Destruct(&pProp);
+    RETiRet;
+}
+
+rsRetVal MsgSetRcvFromIPText(smsg_t *const pMsg, const uchar *const text, const int len) {
+    prop_t *pProp = NULL;
+    const rsRetVal r = MsgSetRcvFromIPStr(pMsg, text, len, &pProp);
+    if (pProp != NULL) prop.Destruct(&pProp);
+    return r;
+}
+
+rsRetVal MsgSetRcvFromPortText(smsg_t *const pMsg, const uchar *const text, const int len) {
+    prop_t *pProp = NULL;
+    const rsRetVal r = MsgSetRcvFromPortStr(pMsg, text, len, &pProp);
+    if (pProp != NULL) prop.Destruct(&pProp);
+    return r;
+}
+
 /* Set default TZ. Note that at most 7 chars are set, as we would
  * otherwise overrun our buffer!
  */
@@ -2491,15 +2694,24 @@ void MsgSetDfltTZ(smsg_t *pThis, char *tz) {
  * this is always the case and without extra effort required.
  * rgerhards, 2009-11-17
  */
-rsRetVal msgSetFromSockinfo(smsg_t *pThis, struct sockaddr_storage *sa) {
+rsRetVal msgSetFromSockinfoLen(smsg_t *pThis, const struct sockaddr_storage *sa, const size_t salen) {
     DEFiRet;
+    const size_t copyLen =
+        (sa == NULL) ? 0 : ((salen < sizeof(struct sockaddr_storage)) ? salen : sizeof(struct sockaddr_storage));
     assert(pThis->rcvFrom.pRcvFrom == NULL);
 
     CHKmalloc(pThis->rcvFrom.pfrominet = malloc(sizeof(struct sockaddr_storage)));
-    memcpy(pThis->rcvFrom.pfrominet, sa, sizeof(struct sockaddr_storage));
+    memset(pThis->rcvFrom.pfrominet, 0, sizeof(struct sockaddr_storage));
+    if (copyLen > 0) {
+        memcpy(pThis->rcvFrom.pfrominet, sa, copyLen);
+    }
 
 finalize_it:
     RETiRet;
+}
+
+rsRetVal msgSetFromSockinfo(smsg_t *pThis, struct sockaddr_storage *sa) {
+    return msgSetFromSockinfoLen(pThis, sa, sizeof(struct sockaddr_storage));
 }
 
 /* rgerhards 2008-09-10: set RcvFrom name in msg object. This calls AddRef()
@@ -2643,24 +2855,23 @@ void MsgSetMSGoffs(smsg_t *const pMsg, int offs) {
  * rgerhards, 2009-06-23
  */
 rsRetVal MsgReplaceMSG(smsg_t *pThis, const uchar *pszMSG, int lenMSG) {
-    int lenNew;
-    uchar *bufNew;
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, msg);
     assert(pszMSG != NULL);
 
-    lenNew = pThis->iLenRawMsg + lenMSG - pThis->iLenMSG;
-    if (lenMSG > pThis->iLenMSG && lenNew >= CONF_RAWMSG_BUFSIZE) {
-        /*  we have lost our "bet" and need to alloc a new buffer ;) */
-        CHKmalloc(bufNew = malloc(lenNew + 1));
-        memcpy(bufNew, pThis->pszRawMsg, pThis->offMSG);
-        if (pThis->pszRawMsg != pThis->szRawMsg) free(pThis->pszRawMsg);
-        pThis->pszRawMsg = bufNew;
+    if (pThis->pszRawMsg == NULL) {
+        pThis->pszRawMsg = pThis->szRawMsg;
+        pThis->szRawMsg[0] = '\0';
     }
 
-    if (lenMSG > 0) memcpy(pThis->pszRawMsg + pThis->offMSG, pszMSG, lenMSG);
-    pThis->pszRawMsg[lenNew] = '\0'; /* this also works with truncation! */
-    pThis->iLenRawMsg = lenNew;
+    if (pThis->offMSG < 0 || pThis->offMSG > pThis->iLenRawMsg) {
+        pThis->offMSG = pThis->iLenRawMsg;
+        pThis->iLenMSG = 0;
+    } else if (pThis->iLenMSG < 0 || pThis->iLenMSG > pThis->iLenRawMsg - pThis->offMSG) {
+        pThis->iLenMSG = pThis->iLenRawMsg - pThis->offMSG;
+    }
+    CHKiRet(msgReplaceRawMsgSegment(&pThis->pszRawMsg, pThis->szRawMsg, CONF_RAWMSG_BUFSIZE, pThis->offMSG,
+                                    pThis->iLenMSG, &pThis->iLenRawMsg, pszMSG, lenMSG));
     pThis->iLenMSG = lenMSG;
 
 finalize_it:
@@ -2832,6 +3043,49 @@ static uchar *getNOW(eNOWType eNow, struct syslogTime *t, const int inUTC) {
 #undef tmpBUFSIZE /* clean up */
 
 
+#ifdef HAVE_LOGNORM_TURBO
+/* Lazy materialization of turbo result into json_object* tree.
+ * Called when template/property access needs pMsg->json but mmnormalize
+ * stored a turbo snapshot instead.  One-shot: turbo_result_to_json is
+ * NULLed after successful materialization so we never double-materialize,
+ * while turbo_result stays valid for the get_str fast-path.
+ * When pMsg->json is already non-NULL (imfile metadata, enrichment, ...),
+ * snapshot fields are merged in using msgAddJSON() semantics: later
+ * normalization fields replace colliding top-level keys.
+ * Must be called with pMsg->mut held.
+ */
+static int msgMaterializeTurboJSON(smsg_t *pMsg) {
+    struct json_object *snap_json = NULL;
+
+    if (pMsg->turbo_result == NULL || pMsg->turbo_result_to_json == NULL) return 1;
+
+    pMsg->turbo_result_to_json(pMsg->turbo_result, &snap_json);
+
+    /* Keep the callback live after allocation failure so a later access may
+     * retry instead of permanently losing the normalized fields. */
+    if (snap_json == NULL) return 0;
+
+    pMsg->turbo_result_to_json = NULL; /* materialized successfully */
+
+    if (pMsg->json == NULL) {
+        pMsg->json = snap_json;
+    } else {
+        /* Keep msgAddJSON() full-tree merge semantics: the normalization
+         * result is the later write and therefore replaces matching keys. */
+        struct json_object_iterator it = json_object_iter_begin(snap_json);
+        struct json_object_iterator itEnd = json_object_iter_end(snap_json);
+        while (!json_object_iter_equal(&it, &itEnd)) {
+            const char *key = json_object_iter_peek_name(&it);
+            json_object_object_add(pMsg->json, key, json_object_get(json_object_iter_peek_value(&it)));
+            json_object_iter_next(&it);
+        }
+        json_object_put(snap_json);
+    }
+    return 1;
+}
+#endif
+
+
 /* helper function to obtain correct JSON root and mutex depending on
  * property type (essentially based on the property id. If a non-json
  * property id is given the function errors out.
@@ -2919,8 +3173,54 @@ rsRetVal getJSONPropVal(
     DEFiRet;
 
     *pRes = NULL;
+
+#ifdef HAVE_LOGNORM_TURBO
+    /* Turbo fast-path: serve parse-origin fields directly from snapshot.
+     * Avoids json-c tree materialization + navigation + strdup entirely.
+     *
+     * Guarded on pMsg->json == NULL: once anything has written to the
+     * json-c tree (imfile metadata, msgMaterializeTurboJSON, `set`
+     * statements, downstream enrichment), the turbo snapshot is no
+     * longer authoritative — the slow path below honours the
+     * later-writer-wins merge semantics of msgMaterializeTurboJSON.
+     * Returning snapshot values in that state would bypass a more
+     * recent write.  The fast path is therefore only valid while the
+     * message has no json tree yet, which is the common case for
+     * pure-normalize pipelines with no post-parse mutation.
+     *
+     * Lock-free by design: pMsg->json, turbo_result and
+     * turbo_result_get_str are all pointer-sized atomic reads.
+     * Parser writes happen-before queue enqueue (full barrier); later
+     * mutations to pMsg->json go through pMsg->mut.  A reader racing
+     * a concurrent json creation can observe the pre-write NULL
+     * exactly once — an existing minor exposure, dramatically
+     * narrower than the always-fires-even-after-mutation bug this
+     * guard closes.  Taking pMsg->mut here would defeat the very
+     * reason this fast-path exists (scaling property access without
+     * lock contention).
+     */
+    if (pProp->id == PROP_CEE && pMsg->json == NULL && pMsg->turbo_result != NULL &&
+        pMsg->turbo_result_get_str != NULL) {
+        const uchar *val;
+        rs_size_t vlen;
+        if (pMsg->turbo_result_get_str(pMsg->turbo_result, pProp->name, pProp->nameLen, &val, &vlen) == 0) {
+            *pRes = (uchar *)malloc(vlen + 1);
+            if (*pRes != NULL) {
+                memcpy(*pRes, val, vlen);
+                (*pRes)[vlen] = '\0';
+                *buflen = vlen;
+                *pbMustBeFreed = 1;
+                return RS_RET_OK;
+            }
+        }
+    }
+#endif
+
     CHKiRet(getJSONRootAndMutex(pMsg, pProp->id, &jroot, &mut));
     pthread_mutex_lock(mut);
+#ifdef HAVE_LOGNORM_TURBO
+    msgMaterializeTurboJSON(pMsg);
+#endif
 
     if (*jroot == NULL) FINALIZE;
 
@@ -2971,8 +3271,33 @@ rsRetVal msgGetJSONPropJSONorString(smsg_t *const pMsg,
 
     *pjson = NULL, *pcstr = NULL;
 
+#ifdef HAVE_LOGNORM_TURBO
+    /* Turbo fast-path: serve parse-origin strings directly from snapshot.
+     * See getJSONPropVal() above for the full rationale — guarded on
+     * pMsg->json == NULL so post-parse mutations (set, enrichment,
+     * materialize) fall through to the merge-aware slow path.
+     */
+    if (pProp->id == PROP_CEE && pMsg->json == NULL && pMsg->turbo_result != NULL &&
+        pMsg->turbo_result_get_str != NULL) {
+        const uchar *val;
+        rs_size_t vlen;
+        if (pMsg->turbo_result_get_str(pMsg->turbo_result, pProp->name, pProp->nameLen, &val, &vlen) == 0) {
+            *pcstr = (uchar *)malloc(vlen + 1);
+            if (*pcstr != NULL) {
+                memcpy(*pcstr, val, vlen);
+                (*pcstr)[vlen] = '\0';
+                *pjson = NULL;
+                return RS_RET_OK;
+            }
+        }
+    }
+#endif
+
     CHKiRet(getJSONRootAndMutex(pMsg, pProp->id, &jroot, &mut));
     pthread_mutex_lock(mut);
+#ifdef HAVE_LOGNORM_TURBO
+    msgMaterializeTurboJSON(pMsg);
+#endif
     if (!strcmp((char *)pProp->name, "!")) {
         *pjson = *jroot;
         FINALIZE;
@@ -3003,6 +3328,86 @@ finalize_it:
 }
 
 
+/* Get a JSON-based variable as an expression value.
+ *
+ * JSON strings are copied directly into an es_str_t while the selected root
+ * lock is held. This avoids the temporary strdup() result used by
+ * msgGetJSONPropJSONorString(). The C-string getter historically truncates
+ * JSON strings at their first embedded NUL, so retain that behavior here.
+ * Non-string values remain deep-copied JSON objects because message mutation
+ * may otherwise invalidate them after the lock is released.
+ */
+rsRetVal msgGetJSONPropSVar(smsg_t *const pMsg, msgPropDescr_t *pProp, struct svar *out) {
+    struct json_object **jroot;
+    uchar *leaf;
+    struct json_object *parent;
+    pthread_mutex_t *mut = NULL;
+    DEFiRet;
+
+    out->datatype = 'S';
+    out->d.estr = NULL;
+
+#ifdef HAVE_LOGNORM_TURBO
+    /* Keep the existing snapshot precedence guard: once $! was mutated, the
+     * merge-aware path below must materialize and read the message JSON. */
+    if (pProp->id == PROP_CEE && pMsg->json == NULL && pMsg->turbo_result != NULL &&
+        pMsg->turbo_result_get_str != NULL) {
+        const uchar *val;
+        rs_size_t vlen;
+        if (pMsg->turbo_result_get_str(pMsg->turbo_result, pProp->name, pProp->nameLen, &val, &vlen) == 0) {
+            const size_t len = strnlen((const char *)val, vlen);
+            out->d.estr = es_newStrFromCStr((const char *)val, len);
+            if (out->d.estr != NULL) {
+                return RS_RET_OK;
+            }
+        }
+    }
+#endif
+
+    CHKiRet(getJSONRootAndMutex(pMsg, pProp->id, &jroot, &mut));
+    pthread_mutex_lock(mut);
+#ifdef HAVE_LOGNORM_TURBO
+    msgMaterializeTurboJSON(pMsg);
+#endif
+    if (!strcmp((char *)pProp->name, "!")) {
+        out->d.json = *jroot;
+        if (out->d.json != NULL) {
+            out->datatype = 'J';
+        }
+        FINALIZE;
+    }
+    if (*jroot == NULL) {
+        ABORT_FINALIZE(RS_RET_NOT_FOUND);
+    }
+    leaf = jsonPathGetLeaf(pProp->name, pProp->nameLen);
+    CHKiRet(jsonPathFindParent(*jroot, pProp->name, leaf, &parent, 0));
+    if (jsonVarExtract(parent, (char *)leaf, &out->d.json) == FALSE) {
+        ABORT_FINALIZE(RS_RET_NOT_FOUND);
+    }
+    if (out->d.json == NULL) {
+        /* A JSON null is represented as an empty expression string. */
+        out->d.estr = es_newStrFromCStr("", 0);
+    } else if (json_object_get_type(out->d.json) == json_type_string) {
+        const char *const str = json_object_get_string(out->d.json);
+        const size_t len = strnlen(str, json_object_get_string_len(out->d.json));
+        out->d.estr = es_newStrFromCStr(str, len);
+    } else {
+        out->datatype = 'J';
+    }
+
+finalize_it:
+    if (out->datatype == 'J') {
+        out->d.json = jsonDeepCopy(out->d.json);
+        if (out->d.json == NULL) {
+            out->datatype = 'S';
+            out->d.estr = NULL;
+        }
+    }
+    if (mut != NULL) pthread_mutex_unlock(mut);
+    RETiRet;
+}
+
+
 /* Get a JSON-based-variable as native json object */
 rsRetVal msgGetJSONPropJSON(smsg_t *const pMsg, msgPropDescr_t *pProp, struct json_object **pjson) {
     struct json_object **jroot;
@@ -3015,6 +3420,9 @@ rsRetVal msgGetJSONPropJSON(smsg_t *const pMsg, msgPropDescr_t *pProp, struct js
 
     CHKiRet(getJSONRootAndMutex(pMsg, pProp->id, &jroot, &mut));
     pthread_mutex_lock(mut);
+#ifdef HAVE_LOGNORM_TURBO
+    msgMaterializeTurboJSON(pMsg);
+#endif
 
     if (!strcmp((char *)pProp->name, "!")) {
         *pjson = *jroot;
@@ -3053,15 +3461,21 @@ static rsRetVal ATTR_NONNULL(1, 4) jsonAddVal_escaped(uchar *const pSrc,
     uchar wrkbuf[100000];
     size_t dst_realloc_size;
     size_t dst_size;
-    uchar *dst_base;
+    uchar *dst_base = NULL;
     uchar *dst_w;
     uchar *newbuf;
     DEFiRet;
 
     assert(len_none_escaped_head <= buflen);
     /* first copy over unescaped head string */
-    if (len_none_escaped_head + 10 > sizeof(wrkbuf)) {
-        dst_size = 2 * len_none_escaped_head;
+    if ((size_t)len_none_escaped_head > sizeof(wrkbuf) - 10) {
+        /* The following condition is not expected to occur in normal operation. */
+#if UINT_MAX > SIZE_MAX / 2
+        if ((size_t)len_none_escaped_head > SIZE_MAX / 2) {
+            ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+        }
+#endif
+        dst_size = (size_t)len_none_escaped_head * 2;
         CHKmalloc(dst_base = malloc(dst_size));
     } else {
         dst_size = sizeof(wrkbuf);
@@ -3076,6 +3490,9 @@ static rsRetVal ATTR_NONNULL(1, 4) jsonAddVal_escaped(uchar *const pSrc,
     for (i = len_none_escaped_head; i < buflen; ++i) {
         const size_t dst_offset = dst_w - dst_base;
         if (dst_offset >= dst_realloc_size) {
+            if (dst_size > SIZE_MAX / 2) {
+                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+            }
             const size_t new_size = 2 * dst_size;
             if (dst_base == wrkbuf) {
                 CHKmalloc(newbuf = malloc(new_size));
@@ -3115,7 +3532,7 @@ static rsRetVal ATTR_NONNULL(1, 4) jsonAddVal_escaped(uchar *const pSrc,
                 case '\\':
                     if (escapeAll == RSFALSE) {
                         ni = i + 1;
-                        if (ni <= buflen) {
+                        if (ni < buflen) {
                             nc = pSrc[ni];
 
                             /* Attempt to not double encode */
@@ -3173,7 +3590,7 @@ static rsRetVal ATTR_NONNULL(1, 4) jsonAddVal_escaped(uchar *const pSrc,
         es_addBuf(dst, (const char *)dst_base, dst_w - dst_base);
     }
 finalize_it:
-    if (dst_base != wrkbuf) {
+    if (dst_base != NULL && dst_base != wrkbuf) {
         free(dst_base);
     }
     RETiRet;
@@ -3281,7 +3698,11 @@ static rsRetVal ATTR_NONNULL() jsonField(const struct templateEntry *const pTpe,
         }
     }
     /* we hope we have only few escapes... */
-    dst = es_newStr(buflen + pTpe->lenFieldName + 15);
+    if (pTpe->lenFieldName < 0 || (size_t)pTpe->lenFieldName > (size_t)INT_MAX - 15 ||
+        buflen > (size_t)INT_MAX - (size_t)pTpe->lenFieldName - 15) {
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+    CHKmalloc(dst = es_newStr(buflen + pTpe->lenFieldName + 15));
     es_addChar(&dst, '"');
     es_addBuf(&dst, (char *)pTpe->fieldName, pTpe->lenFieldName);
     es_addBufConstcstr(&dst, "\":");
@@ -3399,6 +3820,9 @@ static rsRetVal msgPropStrGen(
     uchar *pBuf = NULL;
     DEFiRet;
 
+    if (len > (size_t)INT_MAX || len == SIZE_MAX) {
+        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
     CHKmalloc(pBuf = malloc(len + 1));
 
     memcpy(pBuf, pSrc, len);
@@ -3436,8 +3860,8 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
 
 #ifdef FEATURE_REGEXP
     /* Variables necessary for regular expression matching */
-    size_t nmatch = 10;
-    regmatch_t pmatch[10];
+    size_t nmatch = TPL_REGEX_MAX_MATCHES;
+    regmatch_t pmatch[TPL_REGEX_MAX_MATCHES];
 #endif
 
     *pbMustBeFreed = 0;
@@ -3478,13 +3902,13 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
             getInputName(pMsg, &pRes, &bufLen);
             break;
         case PROP_FROMHOST:
-            pRes = getRcvFrom(pMsg);
+            MsgGetRcvFromProp(pMsg, PROP_FROMHOST, &pRes, &bufLen);
             break;
         case PROP_FROMHOST_IP:
-            pRes = getRcvFromIP(pMsg);
+            MsgGetRcvFromProp(pMsg, PROP_FROMHOST_IP, &pRes, &bufLen);
             break;
         case PROP_FROMHOST_PORT:
-            pRes = getRcvFromPort(pMsg);
+            MsgGetRcvFromProp(pMsg, PROP_FROMHOST_PORT, &pRes, &bufLen);
             break;
         case PROP_PRI:
             pRes = (uchar *)getPRI(pMsg);
@@ -3713,13 +4137,17 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
             break;
         case PROP_CEE_ALL_JSON:
         case PROP_CEE_ALL_JSON_PLAIN:
+            MsgLock(pMsg);
+#ifdef HAVE_LOGNORM_TURBO
+            msgMaterializeTurboJSON(pMsg);
+#endif
             if (pMsg->json == NULL) {
+                MsgUnlock(pMsg);
                 pRes = (uchar *)"{}";
                 bufLen = 2;
                 *pbMustBeFreed = 0;
             } else {
                 const char *jstr;
-                MsgLock(pMsg);
                 int jflag = 0;
                 if (pProp->id == PROP_CEE_ALL_JSON) {
                     jflag = JSON_C_TO_STRING_SPACED;
@@ -3727,11 +4155,12 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                     jflag = JSON_C_TO_STRING_PLAIN;
                 }
                 jstr = json_object_to_json_string_ext(pMsg->json, jflag);
-                MsgUnlock(pMsg);
                 if (jstr == NULL) {
+                    MsgUnlock(pMsg);
                     RET_OUT_OF_MEMORY;
                 }
                 pRes = (uchar *)strdup(jstr);
+                MsgUnlock(pMsg);
                 if (pRes == NULL) {
                     RET_OUT_OF_MEMORY;
                 }
@@ -4009,9 +4438,11 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                 --iTo;
             } else if (iTo < 0) {
                 /* note: we ADD negative value, 0-based (-1)! */
-                iTo = bufLen - 1 + iTo;
-                if (iTo < 0) {
+                /* Clamp before adding: bufLen - 1 + INT_MIN can overflow. */
+                if (iTo < 1 - bufLen) {
                     iTo = 0;
+                } else {
+                    iTo = bufLen - 1 + iTo;
                 }
             }
         }
@@ -4032,7 +4463,21 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
             if (iTo >= bufLen) /* iTo is very large, if no to-position is set in the template! */
                 if (pTpe->data.field.options.bFixedWidth == 0) iTo = bufLen - 1;
 
-            iLen = iTo - iFrom + 1; /* the +1 is for an actual char, NOT \0! */
+            if (iTo < iFrom) {
+                /* A negative position.to may push iTo in front of iFrom, e.g.
+                 * position.from="5" position.to="-2" on a 5-character value.
+                 * The requested substring is empty in that case. Without this
+                 * guard iLen stays negative, malloc(0) succeeds and the copy
+                 * loop below never terminates.
+                 */
+                DBGPRINTF(
+                    "msgGetProp: iTo %d is in front of iFrom %d, "
+                    "returning empty string\n",
+                    iTo, iFrom);
+                iLen = 0;
+            } else {
+                iLen = iTo - iFrom + 1; /* the +1 is for an actual char, NOT \0! */
+            }
             pBufStart = pBuf = malloc(iLen + 1);
             if (pBuf == NULL) {
                 if (*pbMustBeFreed == 1) free(pRes);
@@ -4176,7 +4621,7 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                 pRes = pDstStart;
                 *pbMustBeFreed = 1;
             }
-        } else if (pTpe->data.field.options.bEscapeCC) {
+        } else if (pTpe->data.field.options.bEscapeCC || pTpe->data.field.options.bEscapeCCOctal) {
             /* we must first count how many control charactes are
              * present, because we need this to compute the new string
              * buffer length. While doing so, we also compute the string
@@ -4206,7 +4651,17 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                 }
                 for (pSrc = pRes; *pSrc; pSrc++) {
                     if (iscntrl((int)*pSrc)) {
-                        snprintf((char *)szCCEsc, sizeof(szCCEsc), "#%3.3d", *pSrc);
+                        const unsigned cc = (unsigned char)*pSrc;
+                        szCCEsc[0] = '#';
+                        if (pTpe->data.field.options.bEscapeCCOctal) {
+                            szCCEsc[1] = (uchar)('0' + ((cc >> 6) & 7));
+                            szCCEsc[2] = (uchar)('0' + ((cc >> 3) & 7));
+                            szCCEsc[3] = (uchar)('0' + (cc & 7));
+                        } else {
+                            szCCEsc[1] = (uchar)('0' + (cc / 100));
+                            szCCEsc[2] = (uchar)('0' + ((cc / 10) % 10));
+                            szCCEsc[3] = (uchar)('0' + (cc % 10));
+                        }
                         for (i = 0; i < 4; ++i) *pB++ = szCCEsc[i];
                     } else {
                         *pB++ = *pSrc;
@@ -4266,7 +4721,7 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                  * enhancement.
                  */
                 for (pDst = pRes; *pDst; pDst++) {
-                    if (*pDst == '/') *pDst++ = '_';
+                    if (*pDst == '/') *pDst = '_';
                 }
             } else {
                 if (bufLen == -1) bufLen = ustrlen(pRes);
@@ -4457,6 +4912,13 @@ static rsRetVal msgSetPropViaJSON(smsg_t *__restrict__ const pMsg,
      *       string. So we MUST NOT free it!
      */
     dbgprintf("DDDD: msgSetPropViaJSON key: '%s'\n", name);
+    if (json == NULL) {
+        /* Ignore a JSON null value: a core property can be neither null nor
+         * unset, and the setters below would otherwise crash on
+         * strlen(jsonToString(NULL)). */
+        DBGPRINTF("msgSetPropViaJSON: null value for property '%s' ignored\n", name);
+        return RS_RET_OK;
+    }
     if (!strcmp(name, "rawmsg")) {
         psz = jsonToString(json);
         MsgSetRawMsg(pMsg, psz, strlen(psz));
@@ -4618,25 +5080,29 @@ static uchar *jsonPathGetLeaf(uchar *name, int lenName) {
 
 static json_bool jsonVarExtract(struct json_object *root, const char *key, struct json_object **value) {
     char namebuf[MAX_VARIABLE_NAME_LEN];
-    int key_len = strlen(key);
-    char *array_idx_start = strstr(key, "[");
-    char *array_idx_end = NULL;
+    const size_t key_len = strlen(key);
+    const char *array_idx_start = strstr(key, "[");
+    const char *array_idx_end = NULL;
     char *array_idx_num_end_discovered = NULL;
     struct json_object *arr = NULL;
     if (array_idx_start != NULL) {
         array_idx_end = strstr(array_idx_start, "]");
     }
-    if (array_idx_end != NULL && (array_idx_end - key + 1) == key_len) {
+    if (array_idx_end != NULL && (size_t)(array_idx_end - key + 1) == key_len) {
         errno = 0;
-        int idx = (int)strtol(array_idx_start + 1, &array_idx_num_end_discovered, 10);
-        if (errno == 0 && array_idx_num_end_discovered == array_idx_end) {
-            memcpy(namebuf, key, array_idx_start - key);
-            namebuf[array_idx_start - key] = '\0';
+        const long idx = strtol(array_idx_start + 1, &array_idx_num_end_discovered, 10);
+        if (errno == 0 && idx >= 0 && array_idx_num_end_discovered == array_idx_end) {
+            const size_t name_len = (size_t)(array_idx_start - key);
+            if (name_len >= sizeof(namebuf)) {
+                return json_object_object_get_ex(root, key, value);
+            }
+            memcpy(namebuf, key, name_len);
+            namebuf[name_len] = '\0';
             json_bool found_obj = json_object_object_get_ex(root, namebuf, &arr);
             if (found_obj && json_object_is_type(arr, json_type_array)) {
-                int len = json_object_array_length(arr);
-                if (len > idx) {
-                    *value = json_object_array_get_idx(arr, idx);
+                const size_t len = json_object_array_length(arr);
+                if (len > (size_t)idx) {
+                    *value = json_object_array_get_idx(arr, (size_t)idx);
                     if (*value != NULL) return TRUE;
                 }
                 return FALSE;
@@ -4656,10 +5122,14 @@ static rsRetVal jsonPathFindNext(
     DEFiRet;
 
     if (*p == '!' || (*name == namestart && (*p == '.' || *p == '/'))) ++p;
-    for (i = 0;
-         *p && !(p == namestart && (*p == '.' || *p == '/')) && *p != '!' && p != leaf && i < sizeof(namebuf) - 1;
-         ++i, ++p)
+    for (i = 0; *p && !(p == namestart && (*p == '.' || *p == '/')) && *p != '!' && p != leaf; ++i, ++p) {
+        if (i >= sizeof(namebuf) - 1) {
+            LogError(0, RS_RET_INVLD_SETOP, "json path component too long in '%s' - refusing truncated lookup",
+                     namestart);
+            ABORT_FINALIZE(RS_RET_INVLD_SETOP);
+        }
         namebuf[i] = *p;
+    }
     if (i > 0) {
         namebuf[i] = '\0';
         if (jsonVarExtract(root, (char *)namebuf, &json) == FALSE) {
@@ -4779,6 +5249,9 @@ rsRetVal msgAddJSON(smsg_t *const pM, uchar *name, struct json_object *json, int
 
     CHKiRet(getJSONRootAndMutexByVarChar(pM, name[0], &jroot, &mut));
     pthread_mutex_lock(mut);
+#ifdef HAVE_LOGNORM_TURBO
+    msgMaterializeTurboJSON(pM);
+#endif
 
     if (name[0] == '/') { /* globl var special handling */
         if (sharedReference) {
@@ -4825,7 +5298,11 @@ rsRetVal msgAddJSON(smsg_t *const pM, uchar *name, struct json_object *json, int
             json_object_object_add(parent, (char *)leaf, json);
         } else {
             if (json_object_get_type(json) == json_type_object) {
-                CHKiRet(jsonMerge(*jroot, json));
+                if (json_object_get_type(leafnode) == json_type_object) {
+                    CHKiRet(jsonMerge(leafnode, json));
+                } else {
+                    json_object_object_add(parent, (char *)leaf, json);
+                }
             } else {
                 /* TODO: improve the code below, however, the current
                  *       state is not really bad */
@@ -4990,11 +5467,19 @@ rsRetVal msgSetJSONFromVar(smsg_t *const pMsg, uchar *varname, struct svar *v, i
     char *cstr;
     DEFiRet;
     switch (v->datatype) {
-        case 'S': /* string */
-            CHKmalloc(cstr = es_str2cstr(v->d.estr, NULL));
-            json = json_object_new_string(cstr);
-            free(cstr);
+        case 'S': { /* string */
+            const es_size_t len = es_strlen(v->d.estr);
+            if (len <= INT_MAX && memchr(es_getBufAddr(v->d.estr), '\0', len) == NULL) {
+                json = json_object_new_string_len((const char *)es_getBufAddr(v->d.estr), (int)len);
+            } else {
+                /* es_str2cstr(..., NULL) drops every embedded NUL. Retain
+                 * that established behavior for values outside the fast path. */
+                CHKmalloc(cstr = es_str2cstr(v->d.estr, NULL));
+                json = json_object_new_string(cstr);
+                free(cstr);
+            }
             break;
+        }
         case 'N': /* number (integer) */
             json = json_object_new_int64(v->d.n);
             break;

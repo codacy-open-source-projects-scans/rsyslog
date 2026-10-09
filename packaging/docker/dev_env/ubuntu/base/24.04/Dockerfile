@@ -61,6 +61,7 @@ RUN 	apt-get update && \
 	libwolfssl-dev \
 	libyaml-dev \
 	libzstd-dev \
+	lcov \
 	logrotate \
 	lsof \
 	make \
@@ -69,6 +70,8 @@ RUN 	apt-get update && \
 	pkg-config \
 	postgresql-client libpq-dev \
 	python3-docutils  \
+	python3-autopep8 \
+	pycodestyle \
 	python3-pip \
 	python3-pysnmp4 \
 	software-properties-common \
@@ -315,7 +318,7 @@ ENV	SCAN_BUILD=scan-build-9 \
 RUN	chmod o+rx /var/run/mysqld && ls -ld /var/run/mysqld
 
 ENV RSYSLOG_CONFIGURE_OPTIONS=" \
-	--enable-compile-warning=error \
+	--enable-compile-warnings=error \
 	--enable-clickhouse \
 	--enable-clickhouse-tests=no \
 	--enable-elasticsearch \
@@ -353,6 +356,7 @@ ENV RSYSLOG_CONFIGURE_OPTIONS=" \
 	--enable-mmdblookup \
 	--enable-mmfields \
 	--enable-mmjsonparse \
+	--enable-imkubernetes \
 	--enable-mmkubernetes \
 	--enable-mmleefparse \
 	--enable-mmnormalize \
@@ -432,7 +436,8 @@ RUN	groupadd -g 1002 rsyslog998 \
 	&& echo "rsyslog998 ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
 	&& echo "rsyslog997 ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
 	&& echo "rsyslog996 ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
-	&& echo "rsyslog995 ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+	&& echo "rsyslog995 ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
+	&& echo "ALL ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 WORKDIR	/rsyslog
 USER	rsyslog

@@ -9,11 +9,11 @@ template(name="outfmt" type="string" string="%$!msgnum%\n")
 
 module(load="../plugins/mmjsonparse/.libs/mmjsonparse")
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 action(type="mmjsonparse" cookie="")
 if $parsesuccess == "OK" then {
-	action(type="omfile" file=`echo $RSYSLOG_OUT_LOG` template="outfmt")
+	action(type="omfile" file="'$RSYSLOG_OUT_LOG'" template="outfmt")
 }
 '
 rm -f $RSYSLOG_OUT_LOG	# do cleanup of previous subtest

@@ -31,7 +31,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/uio.h>
-#include <sys/queue.h>
+#include "compat_queue.h"
 #include <sys/types.h>
 #include <math.h>
 #ifdef HAVE_SYS_STAT_H
@@ -309,7 +309,7 @@ typedef struct wrkrInstanceData {
 static void *pollCallbackThread(void *arg) {
     instanceData *const pData = (instanceData *)arg;
 
-    while (!ATOMIC_FETCH_32BIT(&pData->stopPollThread, &pData->mutStopPollThread)) {
+    while (!ATOMIC_LOAD_32BIT_RELAXED(&pData->stopPollThread, &pData->mutStopPollThread)) {
         if (pthread_mutex_trylock(&pData->mut_doAction) == 0) {
             pthread_rwlock_rdlock(&pData->rkLock);
             if (pData->bIsOpen && pData->rk != NULL) {
@@ -333,7 +333,7 @@ static rsRetVal startPollCallbackThread(instanceData *const pData) {
         FINALIZE;
     }
 
-    ATOMIC_STORE_0_TO_INT(&pData->stopPollThread, &pData->mutStopPollThread);
+    ATOMIC_STORE_32BIT_RELAXED(&pData->stopPollThread, &pData->mutStopPollThread, 0);
     const int r = pthread_create(&pData->pollThread, NULL, pollCallbackThread, pData);
     if (r != 0) {
         LogError(r, RS_RET_ERR, "omkafka: unable to create librdkafka callback poller thread");
@@ -350,7 +350,7 @@ static void stopPollCallbackThread(instanceData *const pData) {
         return;
     }
 
-    ATOMIC_STORE_1_TO_INT(&pData->stopPollThread, &pData->mutStopPollThread);
+    ATOMIC_STORE_32BIT_RELAXED(&pData->stopPollThread, &pData->mutStopPollThread, 1);
     const int r = pthread_join(pData->pollThread, NULL);
     if (r != 0) {
         LogError(r, RS_RET_ERR, "omkafka: unable to join librdkafka callback poller thread");
@@ -1128,32 +1128,37 @@ static void deliveryCallback(rd_kafka_t __attribute__((unused)) * rk,
                              void *opaque) {
     instanceData *const pData = (instanceData *)opaque;
     failedmsg_entry *fmsgEntry;
+    const char *const topicname = (rkmessage->rkt != NULL) ? rd_kafka_topic_name(rkmessage->rkt) : (char *)pData->topic;
+    const char *const logTopic = (topicname != NULL) ? topicname : "[unknown]";
+    const char *const payload = (rkmessage->payload != NULL) ? rkmessage->payload : "";
+    const size_t payloadLen = (rkmessage->payload != NULL) ? rkmessage->len : 0;
+    const int payloadLogLen = (payloadLen > 0 && (payload[payloadLen - 1] == '\n' || payload[payloadLen - 1] == '\0'))
+                                  ? (int)payloadLen - 1
+                                  : (int)payloadLen;
+    const char *const key = (rkmessage->key != NULL) ? rkmessage->key : "";
+    const size_t keyLen = (rkmessage->key != NULL) ? rkmessage->key_len : 0;
     DEFiRet;
 
     if (rkmessage->err) {
         updateKafkaFailureCounts(rkmessage->err);
 
         /* Put into kafka queue, again if configured! */
-        if (pData->bResubmitOnFailure) {
+        if (pData->bResubmitOnFailure && rkmessage->payload != NULL) {
             DBGPRINTF(
                 "omkafka: kafka delivery FAIL on Topic '%s', msg '%.*s', key '%.*s' -"
                 " adding to FAILED MSGs for RETRY!\n",
-                rd_kafka_topic_name(rkmessage->rkt), (int)(rkmessage->len - 1), (char *)rkmessage->payload,
-                (int)(rkmessage->key_len), (char *)rkmessage->key);
-            CHKmalloc(fmsgEntry = failedmsg_entry_construct(rkmessage->key, rkmessage->key_len, rkmessage->payload,
-                                                            rkmessage->len, rd_kafka_topic_name(rkmessage->rkt)));
+                logTopic, payloadLogLen, payload, (int)keyLen, key);
+            CHKmalloc(fmsgEntry = failedmsg_entry_construct(rkmessage->key, keyLen, payload, payloadLen, logTopic));
             SLIST_INSERT_HEAD(&pData->failedmsg_head, fmsgEntry, entries);
         } else {
-            LogError(0, RS_RET_ERR, "omkafka: kafka delivery FAIL on Topic '%s', msg '%.*s', key '%.*s'\n",
-                     rd_kafka_topic_name(rkmessage->rkt), (int)(rkmessage->len - 1), (char *)rkmessage->payload,
-                     (int)(rkmessage->key_len), (char *)rkmessage->key);
-            writeDataError(pData, (char *)rkmessage->payload, rkmessage->len, rkmessage->err);
+            LogError(0, RS_RET_ERR, "omkafka: kafka delivery FAIL on Topic '%s', msg '%.*s', key '%.*s'\n", logTopic,
+                     payloadLogLen, payload, (int)keyLen, key);
+            writeDataError(pData, payload, payloadLen, rkmessage->err);
         }
         STATSCOUNTER_INC(ctrKafkaFail, mutCtrKafkaFail);
         INST_STATSCOUNTER_INC(pData, pData->ctrKafkaFail, pData->mutCtrKafkaFail);
     } else {
-        DBGPRINTF("omkafka: kafka delivery SUCCESS on msg '%.*s'\n", (int)(rkmessage->len - 1),
-                  (char *)rkmessage->payload);
+        DBGPRINTF("omkafka: kafka delivery SUCCESS on msg '%.*s'\n", payloadLogLen, payload);
         STATSCOUNTER_INC(ctrKafkaAck, mutCtrKafkaAck);
         INST_STATSCOUNTER_INC(pData, pData->ctrKafkaAck, pData->mutCtrKafkaAck);
     }
@@ -1322,6 +1327,10 @@ static void do_rd_kafka_destroy(instanceData *const __restrict__ pData) {
         DBGPRINTF("omkafka: onDestroy can't close, handle wasn't open\n");
         goto done;
     }
+    const char *const actName = pData->statsName ? (const char *)pData->statsName : rd_kafka_name(pData->rk);
+    const char *const topicName =
+        pData->dynaTopic ? (const char *)pData->topic
+                         : (pData->pTopic ? rd_kafka_topic_name(pData->pTopic) : (const char *)pData->topic);
     int queuedCount = rd_kafka_outq_len(pData->rk);
     DBGPRINTF("omkafka: onDestroy closing - items left in outqueue: %d\n", queuedCount);
 
@@ -1335,9 +1344,9 @@ static void do_rd_kafka_destroy(instanceData *const __restrict__ pData) {
             const int flushStatus = rd_kafka_flush(pData->rk, pData->closeTimeout);
             if (flushStatus == RD_KAFKA_RESP_ERR_NO_ERROR) {
                 DBGPRINTF(
-                    "omkafka: onDestroyflushed remaining '%d' messages "
+                    "omkafka: onDestroy flushed remaining '%d' messages "
                     "to kafka topic '%s'\n",
-                    queuedCount, (pData->pTopic == NULL ? "NULL" : rd_kafka_topic_name(pData->pTopic)));
+                    queuedCount, topicName);
 
                 /* Trigger callbacks a last time before shutdown */
                 const int callbacksCalled = rd_kafka_poll(pData->rk, 0); /* call callbacks */
@@ -1348,11 +1357,10 @@ static void do_rd_kafka_destroy(instanceData *const __restrict__ pData) {
             } else /* TODO: Handle unsend messages here! */ {
                 /* timeout = RD_KAFKA_RESP_ERR__TIMED_OUT */
                 LogError(0, RS_RET_KAFKA_ERROR,
-                         "omkafka: onDestroy "
-                         "Failed to send remaining '%d' messages to "
-                         "topic '%s' on shutdown with error: '%s'",
-                         queuedCount, (pData->pTopic == NULL ? "NULL" : rd_kafka_topic_name(pData->pTopic)),
-                         rd_kafka_err2str(flushStatus));
+                         "omkafka[%s]: onDestroy "
+                         "failed to flush remaining '%d' messages to "
+                         "topic '%s' on shutdown: %s",
+                         actName, queuedCount, topicName, rd_kafka_err2str(flushStatus));
 #if RD_KAFKA_VERSION >= 0x010001ff
                 rd_kafka_purge(pData->rk, RD_KAFKA_PURGE_F_QUEUE | RD_KAFKA_PURGE_F_INFLIGHT);
                 /* Trigger callbacks a last time before shutdown */
@@ -1369,9 +1377,9 @@ static void do_rd_kafka_destroy(instanceData *const __restrict__ pData) {
     }
     if (queuedCount > 0) {
         LogMsg(0, RS_RET_ERR, LOG_WARNING,
-               "omkafka: queue-drain for close timed-out took too long, "
+               "omkafka[%s]: queue-drain on shutdown timed out for topic '%s', "
                "items left in outqueue: %d -- this may indicate data loss",
-               rd_kafka_outq_len(pData->rk));
+               actName, topicName, rd_kafka_outq_len(pData->rk));
     }
     if (pData->dynaTopic) {
         dynaTopicFreeCacheEntries(pData);
@@ -1414,7 +1422,7 @@ static void errorCallback(rd_kafka_t __attribute__((unused)) * rk,
     /* count kafka transport errors that cause action suspension */
     if (err == RD_KAFKA_RESP_ERR__MSG_TIMED_OUT) {
         STATSCOUNTER_INC(ctrKafkaRespTimedOut, mutCtrKafkaRespTimedOut);
-    } else if (err == RD_KAFKA_RESP_ERR__TRANSPORT) {
+    } else if (err == RD_KAFKA_RESP_ERR__TRANSPORT || err == RD_KAFKA_RESP_ERR__RESOLVE) {
         STATSCOUNTER_INC(ctrKafkaRespTransport, mutCtrKafkaRespTransport);
     } else if (err == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN) {
         STATSCOUNTER_INC(ctrKafkaRespBrokerDown, mutCtrKafkaRespBrokerDown);
@@ -1426,13 +1434,17 @@ static void errorCallback(rd_kafka_t __attribute__((unused)) * rk,
         STATSCOUNTER_INC(ctrKafkaRespOther, mutCtrKafkaRespOther);
     }
 
-    /* Handle common transport error codes*/
+    /* Suspend action on any error that means brokers are unreachable.
+     * RD_KAFKA_RESP_ERR__RESOLVE (-193) was missing from this list, causing
+     * host-resolution failures to bypass suspension and silence
+     * action.reportSuspension/reportSuspensionContinuation messages. */
     if (err == RD_KAFKA_RESP_ERR__MSG_TIMED_OUT || err == RD_KAFKA_RESP_ERR__TRANSPORT ||
-        err == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN || err == RD_KAFKA_RESP_ERR__AUTHENTICATION ||
-        err == RD_KAFKA_RESP_ERR__SSL) {
-        /* Broker transport error, we need to disable the action for now!*/
-        pData->bIsSuspended = 1;
-        LogMsg(0, RS_RET_KAFKA_ERROR, LOG_WARNING, "omkafka: action will suspended due to kafka error %d: %s", err,
+        err == RD_KAFKA_RESP_ERR__RESOLVE || err == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN ||
+        err == RD_KAFKA_RESP_ERR__AUTHENTICATION || err == RD_KAFKA_RESP_ERR__SSL) {
+        if (pData != NULL) {
+            pData->bIsSuspended = 1;
+        }
+        LogMsg(0, RS_RET_KAFKA_ERROR, LOG_WARNING, "omkafka: action suspended due to kafka error %d: %s", err,
                rd_kafka_err2str(err));
     } else {
         LogError(0, RS_RET_KAFKA_ERROR, "omkafka: kafka error message: %d,'%s','%s'", err, rd_kafka_err2str(err),
@@ -1712,7 +1724,7 @@ static rsRetVal loadFailedMsgs(instanceData *const __restrict__ pData) {
         } else {
             puStr = rsCStrGetSzStrNoNULL(pCStr);  // topic
             pStrTabPos = index((char *)puStr, '\t');  // key
-            pStrTabPos2 = index((char *)pStrTabPos + 1, '\t');  // msg
+            pStrTabPos2 = (pStrTabPos == NULL) ? NULL : index((char *)pStrTabPos + 1, '\t');  // msg
             if ((pStrTabPos != NULL) && (pStrTabPos2 != NULL)) {
                 *pStrTabPos = '\0'; /* split string into two */
                 *pStrTabPos2 = '\0'; /* split string into two */
@@ -1767,6 +1779,12 @@ finalize_it:
 
 BEGINdoHUP
     CODESTARTdoHUP;
+    /* Keep doHUP in the same outer serialization domain as doAction and
+     * the callback poller.  Those paths hold mut_doAction while polling
+     * librdkafka, and callbacks from that poll path may take the error or
+     * stats file mutexes.  Preserve one order here:
+     * mut_doAction -> file mutexes / kafka handle locks. */
+    pthread_mutex_lock(&pData->mut_doAction);
     pthread_mutex_lock(&pData->mutErrFile);
     if (pData->fdErrFile != -1) {
         close(pData->fdErrFile);
@@ -1790,6 +1808,7 @@ BEGINdoHUP
                pData->tplName, rd_kafka_outq_len(pData->rk), callbacksCalled);
     }
 finalize_it:
+    pthread_mutex_unlock(&pData->mut_doAction);
 ENDdoHUP
 
 BEGINcreateInstance
@@ -1814,7 +1833,7 @@ BEGINcreateInstance
     INIT_ATOMIC_HELPER_MUT(pData->mutCurrPartition);
     INIT_ATOMIC_HELPER_MUT(pData->mutStopPollThread);
     pData->pollThreadRunning = 0;
-    ATOMIC_STORE_0_TO_INT(&pData->stopPollThread, &pData->mutStopPollThread);
+    ATOMIC_STORE_32BIT_RELAXED(&pData->stopPollThread, &pData->mutStopPollThread, 0);
 finalize_it:
 ENDcreateInstance
 
@@ -2088,7 +2107,7 @@ BEGINnewActInst
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "topic")) {
-            pData->topic = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->topic = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "dynakey")) {
             pData->dynaKey = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "dynatopic")) {
@@ -2144,13 +2163,13 @@ BEGINnewActInst
             ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 #endif
         } else if (!strcmp(actpblk.descr[i].name, "errorfile")) {
-            pData->errorFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->errorFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "statsfile")) {
-            pData->statsFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->statsFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "key")) {
-            pData->key = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->key = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "reopenonhup")) {
             pData->bReopenOnHup = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "resubmitonfailure")) {
@@ -2158,9 +2177,9 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "keepfailedmessages")) {
             pData->bKeepFailedMessages = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "failedmsgfile")) {
-            pData->failedMsgFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->failedMsgFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "statsname")) {
-            pData->statsName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->statsName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             LogError(0, RS_RET_INTERNAL_ERROR, "omkafka: program error, non-handled param '%s'\n",
                      actpblk.descr[i].name);

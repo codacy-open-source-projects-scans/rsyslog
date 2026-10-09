@@ -18,7 +18,7 @@ module(	load="../plugins/imtcp/.libs/imtcp"
 	StreamDriver.AuthMode="x509/name"
 	PermittedPeer=["/CN=rsyslog-client/OU=Adiscon GmbH/O=Adiscon GmbH/L=Grossrinderfeld/ST=BW/C=DE/DC=rsyslog.com","rsyslog.com"]
 	)
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 template(name="outfmt" type="string" string="%msg:F,58:2%\n")
 :msg, contains, "msgnum:" action(	type="omfile" 
@@ -26,7 +26,7 @@ template(name="outfmt" type="string" string="%msg:F,58:2%\n")
 					file=`echo $RSYSLOG_OUT_LOG`)
 '
 startup
-tcpflood -p'$TCPFLOOD_PORT' -m$NUMMESSAGES -Ttls -x$srcdir/tls-certs/ca.pem -Z$srcdir/tls-certs/cert.pem -z$srcdir/tls-certs/key.pem
+tcpflood -m$NUMMESSAGES -Ttls -x$srcdir/tls-certs/ca.pem -Z$srcdir/tls-certs/cert.pem -z$srcdir/tls-certs/key.pem
 wait_file_lines
 shutdown_when_empty
 wait_shutdown

@@ -7,7 +7,8 @@ if [ "$(valgrind --version)" == "valgrind-3.11.0" ]; then
 fi
 . ${srcdir:=.}/diag.sh init
 export USE_VALGRIND="YES"
-export RSYSLOG_PRELOAD=$(find /usr -name libmbed\*.so | sed ':start;N;s/\n\//:\//;t start;P;D')
+RSYSLOG_PRELOAD=$(find /usr -name libmbed\*.so | sed ':start;N;s/\n\//:\//;t start;P;D')
+export RSYSLOG_PRELOAD
 export NUMMESSAGES=1
 generate_conf
 add_conf '
@@ -22,7 +23,7 @@ module(	load="../plugins/imtcp/.libs/imtcp"
 	StreamDriver.Name="mbedtls"
 	StreamDriver.Mode="1"
 	StreamDriver.AuthMode="anon" )
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 template(name="outfmt" type="string" string="%msg:F,58:2%\n")
 :msg, contains, "msgnum:" action(	type="omfile"

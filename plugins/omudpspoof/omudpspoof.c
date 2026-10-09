@@ -245,7 +245,7 @@ BEGINsetModCnf
     for (i = 0; i < modpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(modpblk.descr[i].name, "template")) {
-            loadModConf->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(loadModConf->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             if (cs.tplName != NULL) {
                 LogError(0, RS_RET_DUP_PARAM,
                          "omudpspoof: warning: default template "
@@ -362,7 +362,6 @@ static rsRetVal UDPSend(wrkrInstanceData_t *pWrkrData, uchar *pszSourcename, cha
         len = 65528;
     }
 
-    ip = udp = 0;
     if (pWrkrData->sourcePort++ >= pData->sourcePortEnd) {
         pWrkrData->sourcePort = pData->sourcePortStart;
     }
@@ -396,6 +395,8 @@ static rsRetVal UDPSend(wrkrInstanceData_t *pWrkrData, uchar *pszSourcename, cha
         DBGPRINTF("omudpspoof: stage 1: MF:%d, msgOffs %d, hdrOffs %d, pktLen %d, udpPktLen %d, maxPktLen %d\n",
                   (hdrOffs & IP_MF) >> 13, (hdrOffs & 0x1FFF) << 3, hdrOffs, pktLen, udpPktLen, maxPktLen);
         libnet_clear_packet(pWrkrData->libnet_handle);
+        ip = LIBNET_PTAG_INITIALIZER;
+        udp = LIBNET_PTAG_INITIALIZER;
 
         /* note: libnet does need ports in host order NOT in network byte order! -- rgerhards, 2009-11-12 */
         udp = libnet_build_udp(pWrkrData->sourcePort, /* source port */
@@ -446,6 +447,9 @@ static rsRetVal UDPSend(wrkrInstanceData_t *pWrkrData, uchar *pszSourcename, cha
             bSendSuccess = RSTRUE;
         }
         msgOffs += pktLen;
+        if (bSendSuccess == RSFALSE) {
+            continue;
+        }
 
         /* We need to get rid of the UDP header to build the other fragments */
         libnet_clear_packet(pWrkrData->libnet_handle);
@@ -487,7 +491,7 @@ static rsRetVal UDPSend(wrkrInstanceData_t *pWrkrData, uchar *pszSourcename, cha
                 DBGPRINTF("omudpspoof: fragment write error len %d, sent %d: %s\n",
                           (int)(LIBNET_IPV4_H + LIBNET_UDP_H + len), lsent, libnet_geterror(pWrkrData->libnet_handle));
                 bSendSuccess = RSFALSE;
-                continue;
+                break;
             }
             msgOffs += pktLen;
         }
@@ -633,12 +637,12 @@ BEGINnewActInst
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "target")) {
-            pData->host = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->host = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "port")) {
-            pData->port = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->port = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "sourcetemplate")) {
             free(pData->sourceTpl);
-            pData->sourceTpl = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->sourceTpl = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "sourceport.start")) {
             pData->sourcePortStart = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "sourceport.end")) {
@@ -646,7 +650,7 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "mtu")) {
             pData->mtu = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             DBGPRINTF(
                 "omudpspoof: program error, non-handled "

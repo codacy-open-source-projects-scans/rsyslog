@@ -9,7 +9,8 @@ export TESTMESSAGES=100000
 export TESTMESSAGESFULL=100000
 
 # Generate random topic name
-export RANDTOPIC="$(printf '%08x' "$(( (RANDOM<<16) ^ RANDOM ))")"
+RANDTOPIC="$(printf '%08x' "$(( (RANDOM<<16) ^ RANDOM ))")"
+export RANDTOPIC
 
 # Set EXTRA_EXITCHECK to dump kafka/zookeeperlogfiles on failure only.
 export EXTRA_EXITCHECK=dumpkafkalogs
@@ -41,7 +42,7 @@ main_queue(queue.timeoutactioncompletion="60000" queue.timeoutshutdown="60000")
 
 module(load="../plugins/omkafka/.libs/omkafka")
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" Ruleset="omkafka")	/* this port for tcpflood! */
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" Ruleset="omkafka")	/* this port for tcpflood! */
 
 template(name="outfmt" type="string" string="%msg%\n")
 

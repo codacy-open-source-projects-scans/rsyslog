@@ -61,6 +61,8 @@ DEFobjCurrIf(parser)
                                               {"parser", eCmdHdlrArray, 0}};
 static struct cnfparamblk rspblk = {CNFPARAMBLK_VERSION, sizeof(rspdescr) / sizeof(struct cnfparamdescr), rspdescr};
 
+#define RULESET_CALL_DEPTH_MAX 1024
+
 /* forward definitions */
 static rsRetVal processBatch(batch_t *pBatch, wti_t *pWti);
 static rsRetVal scriptExec(struct cnfstmt *root, smsg_t *pMsg, wti_t *pWti);
@@ -200,6 +202,37 @@ static rsRetVal execUnset(struct cnfstmt *stmt, smsg_t *pMsg) {
     RETiRet;
 }
 
+static int rulesetCallDepthExceeded(wti_t *const pWti, const char *const rulesetName, const size_t rulesetNameLen) {
+    if (pWti->execState.rulesetCallDepth < RULESET_CALL_DEPTH_MAX) {
+        return 0;
+    }
+
+    LogError(0, RS_RET_ERR,
+             "ruleset call nesting limit of %u reached; call to ruleset '%.*s' "
+             "ignored to avoid runaway recursion",
+             RULESET_CALL_DEPTH_MAX, (int)rulesetNameLen, rulesetName);
+    return 1;
+}
+
+static rsRetVal execSynchronousRulesetCall(struct cnfstmt *const root,
+                                           const char *const rulesetName,
+                                           const size_t rulesetNameLen,
+                                           smsg_t *const pMsg,
+                                           wti_t *const pWti) {
+    DEFiRet;
+
+    if (rulesetCallDepthExceeded(pWti, rulesetName, rulesetNameLen)) {
+        FINALIZE;
+    }
+
+    ++pWti->execState.rulesetCallDepth;
+    iRet = scriptExec(root, pMsg, pWti);
+    --pWti->execState.rulesetCallDepth;
+
+finalize_it:
+    RETiRet;
+}
+
 static rsRetVal execCallIndirect(struct cnfstmt *const __restrict__ stmt,
                                  smsg_t *pMsg,
                                  wti_t *const __restrict__ pWti) {
@@ -233,7 +266,7 @@ static rsRetVal execCallIndirect(struct cnfstmt *const __restrict__ stmt,
          */
         submitMsg2(pMsg);
     } else {
-        CHKiRet(scriptExec(pRuleset->root, pMsg, pWti));
+        CHKiRet(execSynchronousRulesetCall(pRuleset->root, (const char *)rsName, ustrlen(rsName), pMsg, pWti));
     }
 finalize_it:
     varDelete(&result);
@@ -244,7 +277,8 @@ finalize_it:
 static rsRetVal execCall(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti) {
     DEFiRet;
     if (stmt->d.s_call.ruleset == NULL) {
-        CHKiRet(scriptExec(stmt->d.s_call.stmt, pMsg, pWti));
+        CHKiRet(execSynchronousRulesetCall(stmt->d.s_call.stmt, (const char *)es_getBufAddr(stmt->d.s_call.name),
+                                           es_strlen(stmt->d.s_call.name), pMsg, pWti));
     } else {
         CHKmalloc(pMsg = MsgDup((smsg_t *)pMsg));
         DBGPRINTF("CALL: forwarding message to async ruleset %p\n", stmt->d.s_call.ruleset->pQueue);
@@ -260,16 +294,47 @@ finalize_it:
 }
 
 static rsRetVal execIf(struct cnfstmt *const stmt, smsg_t *const pMsg, wti_t *const pWti) {
-    sbool bRet;
+    int bRet;
+    struct cnfstmt *cur = stmt;
+    struct cnfstmt *selected = NULL;
+    struct rscript_var_cache cache = {0};
+    struct rscript_var_cache *const previous_cache = pWti->execState.var_cache;
     DEFiRet;
-    bRet = cnfexprEvalBool(stmt->d.s_if.expr, pMsg, pWti);
-    DBGPRINTF("if condition result is %d\n", bRet);
-    if (bRet) {
-        if (stmt->d.s_if.t_then != NULL) CHKiRet(scriptExec(stmt->d.s_if.t_then, pMsg, pWti));
+
+    if (stmt->d.s_if.cache_slots == 0) {
+        bRet = cnfexprEvalBool(stmt->d.s_if.expr, pMsg, pWti);
+        DBGPRINTF("if condition result is %d\n", bRet);
+        selected = bRet ? stmt->d.s_if.t_then : stmt->d.s_if.t_else;
     } else {
-        if (stmt->d.s_if.t_else != NULL) CHKiRet(scriptExec(stmt->d.s_if.t_else, pMsg, pWti));
+        cache.n_entries = stmt->d.s_if.cache_slots;
+        cache.entries = calloc(cache.n_entries, sizeof(*cache.entries));
+        if (cache.entries == NULL) {
+            /* Allocation failure preserves the old interpreter path. */
+            bRet = cnfexprEvalBool(stmt->d.s_if.expr, pMsg, pWti);
+            selected = bRet ? stmt->d.s_if.t_then : stmt->d.s_if.t_else;
+        } else {
+            pWti->execState.var_cache = &cache;
+            for (;;) {
+                bRet = cnfexprEvalBool(cur->d.s_if.expr, pMsg, pWti);
+                DBGPRINTF("if condition result is %d\n", bRet);
+                if (bRet) {
+                    selected = cur->d.s_if.t_then;
+                    break;
+                }
+                selected = cur->d.s_if.t_else;
+                if (selected == NULL || selected->nodetype != S_IF || !selected->d.s_if.is_else_if) break;
+                cur = selected;
+            }
+            pWti->execState.var_cache = previous_cache;
+            for (unsigned short i = 0; i < cache.n_entries; ++i) {
+                if (cache.entries[i].populated) varFreeMembers(&cache.entries[i].value);
+            }
+            free(cache.entries);
+        }
     }
+    if (selected != NULL) CHKiRet(scriptExec(selected, pMsg, pWti));
 finalize_it:
+    pWti->execState.var_cache = previous_cache;
     RETiRet;
 }
 
@@ -504,7 +569,7 @@ static rsRetVal ATTR_NONNULL(2, 3) scriptExec(struct cnfstmt *const root, smsg_t
     DEFiRet;
 
     for (stmt = root; stmt != NULL; stmt = stmt->next) {
-        if (*pWti->pbShutdownImmediate) {
+        if (wtiIsShutdownImmediate(pWti)) {
             DBGPRINTF(
                 "scriptExec: ShutdownImmediate set, "
                 "force terminating\n");
@@ -574,7 +639,7 @@ static rsRetVal processBatch(batch_t *pBatch, wti_t *pWti) {
     wtiResetExecState(pWti, pBatch);
 
     /* execution phase */
-    for (i = 0; i < batchNumMsgs(pBatch) && !*(pWti->pbShutdownImmediate); ++i) {
+    for (i = 0; i < batchNumMsgs(pBatch) && !wtiIsShutdownImmediate(pWti); ++i) {
         pMsg = pBatch->pElem[i].pMsg;
         DBGPRINTF("processBATCH: next msg %d: %.128s\n", i, pMsg->pszRawMsg);
         pRuleset = (pMsg->pRuleset == NULL) ? runConf->rulesets.pDflt : pMsg->pRuleset;

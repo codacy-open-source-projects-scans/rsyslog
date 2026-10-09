@@ -153,6 +153,14 @@ Action Parameters
      - .. include:: ../../reference/parameters/omelasticsearch-errorfile.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-omelasticsearch-erroronly`
+     - .. include:: ../../reference/parameters/omelasticsearch-erroronly.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omelasticsearch-interleaved`
+     - .. include:: ../../reference/parameters/omelasticsearch-interleaved.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
    * - :ref:`param-omelasticsearch-tls-cacert`
      - .. include:: ../../reference/parameters/omelasticsearch-tls-cacert.rst
         :start-after: .. summary-start
@@ -163,6 +171,18 @@ Action Parameters
         :end-before: .. summary-end
    * - :ref:`param-omelasticsearch-tls-myprivkey`
      - .. include:: ../../reference/parameters/omelasticsearch-tls-myprivkey.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omelasticsearch-tls-tlsversion`
+     - .. include:: ../../reference/parameters/omelasticsearch-tls-tlsversion.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omelasticsearch-tls-ciphersuites`
+     - .. include:: ../../reference/parameters/omelasticsearch-tls-ciphersuites.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-omelasticsearch-tls-keyexchangegroups`
+     - .. include:: ../../reference/parameters/omelasticsearch-tls-keyexchangegroups.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
    * - :ref:`param-omelasticsearch-allowunsignedcerts`
@@ -238,9 +258,14 @@ Action Parameters
    ../../reference/parameters/omelasticsearch-pwd
    ../../reference/parameters/omelasticsearch-apikey
    ../../reference/parameters/omelasticsearch-errorfile
+   ../../reference/parameters/omelasticsearch-erroronly
+   ../../reference/parameters/omelasticsearch-interleaved
    ../../reference/parameters/omelasticsearch-tls-cacert
    ../../reference/parameters/omelasticsearch-tls-mycert
    ../../reference/parameters/omelasticsearch-tls-myprivkey
+   ../../reference/parameters/omelasticsearch-tls-tlsversion
+   ../../reference/parameters/omelasticsearch-tls-ciphersuites
+   ../../reference/parameters/omelasticsearch-tls-keyexchangegroups
    ../../reference/parameters/omelasticsearch-allowunsignedcerts
    ../../reference/parameters/omelasticsearch-skipverifyhost
    ../../reference/parameters/omelasticsearch-bulkid
@@ -276,6 +301,19 @@ Parameters are:
    this counter does NOT count the number of failed messages but the number of
    times a failure occurred (a potentially much smaller number). Counting messages
    would be quite performance-intense and is thus not done.
+
+-  **requests.count** - number of attempted index or bulk HTTP requests. This
+   includes requests that later fail at the transport or HTTP level.
+
+-  **requests.time_ms** - accumulated libcurl total time in milliseconds for
+   these requests. It includes name resolution, connection setup, TLS, request
+   transmission, and response transfer, but excludes request preparation,
+   response parsing, health checks, and platform detection. The average request
+   duration for an impstats interval is ``requests.time_ms / requests.count``.
+
+-  **requests.time_ms.min** and **requests.time_ms.max** - shortest and longest
+   observed request duration in milliseconds for the interval. A value of zero
+   means no request was observed in that interval.
 
 The following counters are available when `retryfailures="on"` is used:
 

@@ -4,13 +4,13 @@
 generate_conf
 add_conf '
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 set $.n = "-1";
 set $!ip!v1 = 1 + $.n;
 
 template(name="outfmt" type="string" string="%!ip%\n")
-local4.* action(type="omfile" file=`echo $RSYSLOG_OUT_LOG` template="outfmt")
+local4.* action(type="omfile" file="'$RSYSLOG_OUT_LOG'" template="outfmt")
 '
 startup
 tcpflood -m1

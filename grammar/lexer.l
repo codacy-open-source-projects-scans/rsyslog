@@ -50,6 +50,8 @@
 %{
 #include <libestr.h>
 #include <ctype.h>
+#include <errno.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -71,6 +73,8 @@ read_file(const char *const filename)
 	int fd = -1;
 	struct stat sb;
 	ssize_t nread;
+	size_t cap;
+	size_t len = 0;
 	assert(filename != NULL);
 
 	if((fd = open((const char*) filename, O_RDONLY)) == -1) {
@@ -81,18 +85,54 @@ read_file(const char *const filename)
 		goto done;
 	}
 
-	content = malloc(sb.st_size+1);
+	if(!S_ISREG(sb.st_mode)) {
+		goto done;
+	}
+
+	if(sb.st_size < 0) {
+		goto done;
+	}
+
+	if(sb.st_size > 0 && (uintmax_t) sb.st_size > SIZE_MAX - 1) {
+		goto done;
+	}
+	cap = (sb.st_size > 0) ? (size_t) sb.st_size : 4096;
+	content = malloc(cap+1);
 	if(content == NULL) {
 		goto done;
 	}
 
-	nread = read(fd, content, sb.st_size);
-	content[nread] = '\0';
-	if(nread != (ssize_t) sb.st_size) {
-		free(content);
-		content = NULL;
-		goto done;
+	while(1) {
+		if(len == cap) {
+			if(cap > (SIZE_MAX - 1) / 2) {
+				free(content);
+				content = NULL;
+				goto done;
+			}
+			char *const new_content = realloc(content, cap * 2 + 1);
+			if(new_content == NULL) {
+				free(content);
+				content = NULL;
+				goto done;
+			}
+			content = new_content;
+			cap *= 2;
+		}
+		nread = read(fd, content + len, cap - len);
+		if(nread == -1) {
+			if(errno == EINTR) {
+				continue;
+			}
+			free(content);
+			content = NULL;
+			goto done;
+		}
+		if(nread == 0) {
+			break;
+		}
+		len += (size_t) nread;
 	}
+	content[len] = '\0';
 
 done:
 	if(fd != -1) {
@@ -244,6 +284,8 @@ expand_backticks(char *const param)
 	 * wrote this ugly, but the price needed to pay in order to remain
 	 * compatible to the previous format.
 	 */
+%x ELSE_IF
+	/* ELSE_IF preserves the structural else-if link while skipping comments. */
 %{
 #include <ctype.h>
 #include <stdio.h>
@@ -280,12 +322,12 @@ static void cnfPrintToken(const char *token);
 "foreach"			{ cnfPrintToken(yytext); BEGIN EXPR; return FOREACH; }
 "reload_lookup_table"		{ cnfPrintToken(yytext); BEGIN IN_PROCEDURE_CALL; return RELOAD_LOOKUP_TABLE_PROCEDURE; }
 <IN_PROCEDURE_CALL>"("		{ cnfPrintToken(yytext); return yytext[0]; }
-<IN_PROCEDURE_CALL>\'([^'\\]|\\['"\\$bntr]|\\x[0-9a-f][0-9a-f]|\\[0-7][0-7][0-7])*\'	 {
+<IN_PROCEDURE_CALL>\'([^'\\]|\\['"\\$bntr]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7][0-7][0-7])*\'	 {
 				  cnfPrintToken(yytext);  yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = es_newStrFromBuf(yytext+1, strlen(yytext)-1);
 				   return STRING; }
-<IN_PROCEDURE_CALL>\"([^"\\$]|\\["'\\$bntr]|\\x[0-9a-f][0-9a-f]|\\[0-7][0-7][0-7])*\" {
+<IN_PROCEDURE_CALL>\"([^"\\$]|\\["'\\$bntr]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7][0-7][0-7])*\" {
 				   cnfPrintToken(yytext); yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = es_newStrFromBuf(yytext+1, strlen(yytext)-1);
@@ -331,22 +373,22 @@ static void cnfPrintToken(const char *token);
 <EXPR>0x[0-9a-f]+ |		/* hex number, following rule is dec; strtoll handles all! */
 <EXPR>([1-9][0-9]*|0)		{ cnfPrintToken(yytext); yylval.n = strtoll(yytext, NULL, 0); return NUMBER; }
 <EXPR>\$[$!./]{0,1}[@a-z_]*[!@a-z0-9\-_\.\[\]]*	{ cnfPrintToken(yytext); yylval.s = strdup(yytext+1); return VAR; }
-<EXPR>\'([^'\\]|\\['"\\$bntr]|\\x[0-9a-f][0-9a-f]|\\[0-7][0-7][0-7])*\'	 {
+<EXPR>\'([^'\\]|\\['"\\$bntr]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7][0-7][0-7])*\'	 {
 				   cnfPrintToken(yytext); yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = es_newStrFromBuf(yytext+1, strlen(yytext)-1);
 				   return STRING; }
-<EXPR>`([^`\\]|\\['`"\\bntr]|\\x[0-9a-f][0-9a-f]|\\[0-7][0-7][0-7])*`	 {
+<EXPR>`([^`\\]|\\['`"\\bntr]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7][0-7][0-7])*`	 {
 				   cnfPrintToken(yytext); yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = expand_backticks(yytext+1);
 				   return STRING; }
-<EXPR>\"([^"\\$]|\\["'\\$bntr]|\\x[0-9a-f][0-9a-f]|\\[0-7][0-7][0-7])*\" {
+<EXPR>\"([^"\\$]|\\["'\\$bntr]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7][0-7][0-7])*\" {
 				   cnfPrintToken(yytext); yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = es_newStrFromBuf(yytext+1, strlen(yytext)-1);
 				   return STRING; }
-<EXPR>\"([^"\\]|\\["'\\$bntr]|\\x[0-9a-f][0-9a-f]|\\[0-7][0-7][0-7])*\" {
+<EXPR>\"([^"\\]|\\["'\\$bntr]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7][0-7][0-7])*\" {
 				   cnfPrintToken(yytext); parser_errmsg("$-sign in double quotes must be "
 					        "escaped, problem string is: %s",
 						yytext); }
@@ -368,7 +410,12 @@ static void cnfPrintToken(const char *token);
 "{"				{ cnfPrintToken(yytext); return '{'; }
 "}"				{ cnfPrintToken(yytext); return '}'; }
 "stop"				{ cnfPrintToken(yytext); return STOP; }
-"else"				{ cnfPrintToken(yytext); return ELSE; }
+"else"				{ cnfPrintToken(yytext); BEGIN ELSE_IF; }
+<ELSE_IF>[ \t\r\n]+		{ cnfPrintToken(yytext); }
+<ELSE_IF>"/*"			{ cnfPrintToken(yytext); preCommentState = YY_START; BEGIN COMMENT; }
+<ELSE_IF>#.*\n			{ cnfPrintToken(yytext); }
+<ELSE_IF>"if"			{ cnfPrintToken(yytext); BEGIN EXPR; return ELSEIF; }
+<ELSE_IF>.				{ yyless(0); BEGIN INITIAL; return ELSE; }
 "call"				{ cnfPrintToken(yytext); BEGIN INCALL; return CALL; }
 "call_indirect"			{ cnfPrintToken(yytext); BEGIN EXPR; return CALL_INDIRECT; }
 "set"				{ cnfPrintToken(yytext); BEGIN EXPR; return SET; }
@@ -439,12 +486,12 @@ static void cnfPrintToken(const char *token);
 <INOBJ>"[" |
 <INOBJ>"]" |
 <INOBJ>"="			{ cnfPrintToken(yytext); return(yytext[0]); }
-<INOBJ>\"([^"\\]|\\['"?\\abfnrtv]|\\[0-7]{1,3})*\" {
+<INOBJ>\"([^"\\]|\\['"?\\abfnrtv]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7]{1,3})*\" {
 				   cnfPrintToken(yytext); yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = es_newStrFromBuf(yytext+1, strlen(yytext)-1);
 				   return STRING; }
-<INOBJ>`([^`\\]|\\['`?\\abfnrtv]|\\[0-7]{1,3})*` {
+<INOBJ>`([^`\\]|\\['`?\\abfnrtv]|\\x[0-9a-fA-F][0-9a-fA-F]|\\[0-7]{1,3})*` {
 				   cnfPrintToken(yytext); yytext[yyleng-1] = '\0';
 				   unescapeStr((uchar*)yytext+1, yyleng-2);
 				   yylval.estr = expand_backticks(yytext+1);

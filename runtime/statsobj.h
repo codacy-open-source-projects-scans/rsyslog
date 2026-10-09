@@ -172,6 +172,15 @@ BEGINinterface(statsobj) /* name must also be changed in ENDinterface macro! */
                                  int8_t bResetCtr);
     rsRetVal (*GetAllCounters)(statsobj_counter_cb_t cb, void *ctx);
     /**
+     * Encode a complete metric name for Prometheus text and Remote Write.
+     *
+     * @param raw_name non-NULL NUL-terminated metric name to encode
+     * @param encoded_name non-NULL output location for the heap allocation
+     * @return RS_RET_OK on success, RS_RET_PARAM_ERROR for NULL arguments,
+     *         or RS_RET_OUT_OF_MEMORY on allocation failure
+     */
+    rsRetVal (*EncodePrometheusMetricName)(const uchar *raw_name, char **encoded_name);
+    /**
      * @brief Register a counter value with a stats object.
      *
      * The counter name is duplicated internally; the caller retains ownership
@@ -212,13 +221,13 @@ BEGINinterface(statsobj) /* name must also be changed in ENDinterface macro! */
      */
     rsRetVal (*AddManagedCounter)(statsobj_t *pThis, const uchar *ctrName, statsCtrType_t ctrType, int8_t flags,
                                   void *pCtr, ctr_t **ref, int8_t linked);
-    void (*AddPreCreatedCtr)(statsobj_t *pThis, ctr_t *ctr);
+    rsRetVal (*AddPreCreatedCtr)(statsobj_t *pThis, ctr_t *ctr);
     void (*DestructCounter)(statsobj_t *pThis, ctr_t *ref);
     void (*DestructUnlinkedCounter)(ctr_t *ctr);
     ctr_t *(*UnlinkAllCounters)(statsobj_t *pThis);
     rsRetVal (*EnableStats)(void);
 ENDinterface(statsobj)
-#define statsobjCURR_IF_VERSION 14 /* increment whenever you change the interface structure! */
+#define statsobjCURR_IF_VERSION 16 /* increment whenever you change the interface structure! */
 /* Changes
  * v2-v9 rserved for future use in "older" version branches
  * v10, 2012-04-01: GetAllStatsLines got fmt parameter
@@ -226,6 +235,8 @@ ENDinterface(statsobj)
  *                  - GetAllStatsLines got parameter telling if ctrs shall be reset
  * v13, 2016-05-19: GetAllStatsLines cb data type changed (char* instead of cstr)
  * v14, 2026-02-01: Add GetAllCounters() native counter iteration API
+ * v15, 2026-06-23: AddPreCreatedCtr returns rsRetVal for lock failure propagation
+ * v16, 2026-07-15: add EncodePrometheusMetricName() for shared exporter name escaping
  */
 
 
@@ -281,20 +292,22 @@ void checkGoneAwaySenders(time_t);
     INIT_ATOMIC_HELPER_MUT64(mut);  \
     ctr = 0;
 
+#define STATSCOUNTER_ENABLED() (PREFER_FETCH_32BIT(GatherStats) != 0)
+
 #define STATSCOUNTER_INC(ctr, mut) \
-    if (GatherStats) ATOMIC_INC_uint64(&ctr, &mut);
+    if (STATSCOUNTER_ENABLED()) ATOMIC_INC_uint64_RELAXED(&ctr, &mut);
 
 #define STATSCOUNTER_ADD(ctr, mut, delta) \
-    if (GatherStats) ATOMIC_ADD_uint64(&ctr, &mut, delta);
+    if (STATSCOUNTER_ENABLED()) ATOMIC_ADD_uint64_RELAXED(&ctr, &mut, delta);
 
 #define STATSCOUNTER_DEC(ctr, mut) \
-    if (GatherStats) ATOMIC_DEC_uint64(&ctr, &mut);
+    if (STATSCOUNTER_ENABLED()) ATOMIC_DEC_uint64_RELAXED(&ctr, &mut);
 
 /* the next macro works only if the variable is already guarded
  * by mutex (or the users risks a wrong result). It is assumed
  * that there are not concurrent operations that modify the counter.
  */
 #define STATSCOUNTER_SETMAX_NOMUT(ctr, newmax) \
-    if (GatherStats && ((newmax) > (ctr))) ctr = newmax;
+    if (STATSCOUNTER_ENABLED() && ((newmax) > (ctr))) ctr = newmax;
 
 #endif /* #ifndef INCLUDED_STATSOBJ_H */

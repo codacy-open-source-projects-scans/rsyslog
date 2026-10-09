@@ -90,10 +90,12 @@ RainerScript fragments and vice versa.
    documented in :doc:`../containers/index`.
 
    In addition, rsyslog must have been compiled with libyaml
-   (``yaml-0.1``).  If libyaml is absent at build time the daemon will
-   print an error and refuse to load a ``.yaml`` / ``.yml`` file.
-   Install the ``libyaml-dev`` (Debian/Ubuntu) or ``libyaml-devel``
-   (RHEL/Fedora) package before compiling.
+   (``yaml-0.1``).  Libyaml support is enabled by default at build time
+   and can be disabled explicitly with ``--disable-libyaml``.  If libyaml
+   support is disabled, the daemon will print an error and refuse to load a
+   ``.yaml`` / ``.yml`` file.  Install the ``libyaml-dev`` (Debian/Ubuntu)
+   or ``libyaml-devel`` (RHEL/Fedora) package before compiling with the
+   default options.
 
 Schema Overview
 ---------------
@@ -137,6 +139,7 @@ mapping of parameter names to values.
    global:
      workdirectory: "/var/spool/rsyslog"
      maxmessagesize: 8192
+     maxOpenFiles: 2000
      defaultnetstreamdriver: "gtls"
      privdrop.user.name: "syslog"
      privdrop.group.name: "syslog"
@@ -145,6 +148,7 @@ mapping of parameter names to values.
      type: linkedlist
      size: 100000
      dequeuebatchsize: 1024
+     queue.mutexContentionStats: on  # opt-in diagnostics for this queue
 
 Parameter names are identical to their RainerScript counterparts (see
 :doc:`global configuration parameters <global/index>` and
@@ -206,7 +210,13 @@ placeholders:
        string: "%HOSTNAME% %syslogfacility-text%.%syslogseverity-text% %msg%\n"
      - name: filePerHost     # use with omfile dynafile: filePerHost
        type: string
-       string: "/var/log/hosts/%HOSTNAME%.log"
+       string: "/var/log/hosts/%HOSTNAME:::secpath-replace%.log"
+
+When a template is used as an ``omfile`` dynafile name, escape every
+message-derived path component. In string templates, use
+``secpath-replace`` on fields such as ``HOSTNAME``, ``programname``, or
+``APP-NAME`` so sender-controlled values cannot select parent
+directories or absolute paths.
 
 *Subtree template* — serialises a JSON sub-tree of the message object:
 

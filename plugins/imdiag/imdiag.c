@@ -1,4 +1,8 @@
 /* imdiag.c
+ * Diagnostic input module for the testbench and controlled diagnostics.
+ * The module has no internal access control; limit exposure with external
+ * controls such as firewalls or host isolation.
+ *
  * This is a testbench tool. It started out with a broader scope,
  * but we dropped this idea. To learn about rsyslog runtime statistics
  * have a look at impstats.
@@ -34,12 +38,12 @@
 #include <ctype.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <pthread.h>
-#include <semaphore.h>
 #if HAVE_FCNTL_H
     #include <fcntl.h>
 #endif
@@ -86,7 +90,12 @@ STATSCOUNTER_DEF(potentialArtificialDelayMs, mutPotentialArtificialDelayMs)
 STATSCOUNTER_DEF(actualArtificialDelayMs, mutActualArtificialDelayMs)
 STATSCOUNTER_DEF(delayInvocationCount, mutDelayInvocationCount)
 
-static sem_t statsReportingBlocker;
+/* stats_reporting_blocker gates impstats reads across imdiag command and stats
+ * callback threads; use a condition variable instead of mutex ownership
+ * handoff so the command thread can unblock a callback thread safely. */
+static pthread_mutex_t stats_reporting_blocker_mut;
+static pthread_cond_t stats_reporting_blocker_cond;
+static int stats_reporting_blocked = 0;
 static long long statsReportingBlockStartTimeMs = 0;
 static int allowOnlyOnce = 0;
 DEF_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
@@ -95,12 +104,25 @@ pthread_cond_t statsReporterWatch;
 int statsReported = 0;
 static int abortTimeout = -1; /* for timeoutGuard - if set, abort rsyslogd after that many seconds */
 static pthread_t timeoutGuard_thrd; /* thread ID for timeoutGuard thread (if active) */
+static pthread_mutex_t timeoutGuardMut = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t timeoutGuardCond = PTHREAD_COND_INITIALIZER;
+static int timeoutGuardStop = 0;
+static int timeoutGuardActive = 0;
+static pid_t timeoutGuardPid = 0;
 
 /* config settings */
 struct modConfData_s {
     rsconf_t *pConf; /* our overall config object */
     uchar *pszLstnPortFileName; /* port file name (module-level param) */
+    uchar *pszServerRun;
+    uchar *pszInjectDelayMode;
+    uchar *pszStrmDrvrAuthMode;
+    uchar *pszInputName;
+    uchar *pszProperTerminationFile;
+    permittedPeers_t *pPermPeersRoot;
     int abortTimeout; /* abort timeout in seconds, -1 = disabled */
+    int iTCPSessMax;
+    int iStrmDrvrMode;
     int configSetViaV2Method; /* 1 if module() was used to configure */
 };
 
@@ -110,6 +132,14 @@ static modConfData_t *loadModConf = NULL; /* modConf ptr for current load proces
 static struct cnfparamdescr modpdescr[] = {
     {"listenportfilename", eCmdHdlrString, 0},
     {"aborttimeout", eCmdHdlrInt, 0},
+    {"properterminationfile", eCmdHdlrString, 0},
+    {"serverrun", eCmdHdlrString, 0},
+    {"injectdelaymode", eCmdHdlrString, 0},
+    {"maxsessions", eCmdHdlrInt, 0},
+    {"serverstreamdrivermode", eCmdHdlrInt, 0},
+    {"serverstreamdriverauthmode", eCmdHdlrString, 0},
+    {"serverstreamdriverpermittedpeer", eCmdHdlrArray, 0},
+    {"serverinputname", eCmdHdlrString, 0},
     {"mainmsgqueuetimeoutshutdown", eCmdHdlrInt, 0},
     {"mainmsgqueuetimeoutenqueue", eCmdHdlrInt, 0},
     {"inputshutdowntimeout", eCmdHdlrInt, 0},
@@ -125,6 +155,9 @@ static struct cnfparamblk inppblk = {CNFPARAMBLK_VERSION, sizeof(inppdescr) / si
 static flowControl_t injectmsgDelayMode = eFLOWCTL_NO_DELAY;
 static int iTCPSessMax = 20; /* max number of sessions */
 static int iStrmDrvrMode = 0; /* mode for stream driver, driver-dependent (0 mostly means plain tcp) */
+static int bLegacyInjectDelayModeSet = 0;
+static int bLegacyTCPSessMaxSet = 0;
+static int bLegacyStrmDrvrModeSet = 0;
 static uchar *pszLstnPortFileName = NULL;
 static uchar *pszStrmDrvrAuthMode = NULL; /* authentication mode to use */
 static uchar *pszInputName = NULL; /* value for inputname property, NULL is OK and handled by core engine */
@@ -219,6 +252,12 @@ static rsRetVal __attribute__((format(printf, 2, 3))) sendResponse(tcps_sess_t *
     va_start(ap, fmt);
     len = vsnprintf((char *)buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    if (len < 0) {
+        memcpy(buf, "imdiag::error formatting response failed\n", sizeof("imdiag::error formatting response failed\n"));
+        len = sizeof("imdiag::error formatting response failed\n") - 1;
+    } else if ((size_t)len >= sizeof(buf)) {
+        len = sizeof(buf) - 1;
+    }
     CHKiRet(netstrm.Send(pSess->pStrm, buf, &len));
 
 finalize_it:
@@ -290,11 +329,15 @@ finalize_it:
 
 /* This function injects messages. Command format:
  * injectmsg <fromnbr> <number-of-messages>
+ * injectmsg <fromnbr> <number-of-messages> <delay-between-messages-ms>
+ * Additional trailing arguments are ignored for backward compatibility with
+ * older testbench helpers.
  * rgerhards, 2009-05-27
  */
 static rsRetVal injectMsg(uchar *pszCmd, tcps_sess_t *pSess) {
     uchar wordBuf[1024];
     int64_t iFrom, nMsgs;
+    int64_t delayMs = 0;
     uchar *literalMsg;
     int64_t i;
     ratelimit_t *ratelimit = NULL;
@@ -315,8 +358,19 @@ static rsRetVal injectMsg(uchar *pszCmd, tcps_sess_t *pSess) {
         CHKiRet(parseInt64Arg(wordBuf, "from", &iFrom));
         getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
         CHKiRet(parseInt64Arg(wordBuf, "count", &nMsgs));
+        getFirstWord(&pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+        if (wordBuf[0] != '\0') {
+            CHKiRet(parseInt64Arg(wordBuf, "delay-ms", &delayMs));
+            if (delayMs < 0 || delayMs > (int64_t)INT_MAX * 1000) {
+                LogError(0, RS_RET_PARAM_ERROR, "imdiag: invalid delay-ms value '%s'", wordBuf);
+                ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+            }
+        }
         for (i = 0; i < nMsgs; ++i) {
             CHKiRet(doInjectNumericSuffixMsg(i + iFrom, ratelimit));
+            if (delayMs > 0 && i + 1 < nMsgs) {
+                srSleep((int)(delayMs / 1000), (int)((delayMs % 1000) * 1000));
+            }
         }
     }
     CHKiRet(sendResponse(pSess, "%" PRId64 " messages injected\n", nMsgs));
@@ -447,15 +501,23 @@ finalize_it:
 static void imdiag_statsReadCallback(statsobj_t __attribute__((unused)) *const ignore_stats,
                                      void __attribute__((unused)) *const ignore_ctx) {
     long long waitStartTimeMs = currentTimeMills();
-    sem_wait(&statsReportingBlocker);
+    if (pthread_mutex_lock(&stats_reporting_blocker_mut) != 0) {
+        return;
+    }
+    while (stats_reporting_blocked) {
+        if (pthread_cond_wait(&stats_reporting_blocker_cond, &stats_reporting_blocker_mut) != 0) {
+            pthread_mutex_unlock(&stats_reporting_blocker_mut);
+            return;
+        }
+    }
     long delta = currentTimeMills() - waitStartTimeMs;
-    if ((int)ATOMIC_DEC_AND_FETCH(&allowOnlyOnce, &mutAllowOnlyOnce) < 0) {
-        sem_post(&statsReportingBlocker);
-    } else {
+    if ((int)ATOMIC_DEC_AND_FETCH(&allowOnlyOnce, &mutAllowOnlyOnce) >= 0) {
+        stats_reporting_blocked = 1;
         LogError(0, RS_RET_OK,
                  "imdiag(stats-read-callback): current stats-reporting "
                  "cycle will proceed now, next reporting cycle will again be blocked");
     }
+    pthread_mutex_unlock(&stats_reporting_blocker_mut);
 
     if (pthread_mutex_lock(&mutStatsReporterWatch) == 0) {
         statsReported = 1;
@@ -471,11 +533,13 @@ static void imdiag_statsReadCallback(statsobj_t __attribute__((unused)) *const i
 static rsRetVal blockStatsReporting(tcps_sess_t *pSess) {
     DEFiRet;
 
-    sem_wait(&statsReportingBlocker);
+    CHKiConcCtrl(pthread_mutex_lock(&stats_reporting_blocker_mut));
+    stats_reporting_blocked = 1;
+    CHKiConcCtrl(pthread_mutex_unlock(&stats_reporting_blocker_mut));
     CHKiConcCtrl(pthread_mutex_lock(&mutStatsReporterWatch));
     statsReported = 0;
     CHKiConcCtrl(pthread_mutex_unlock(&mutStatsReporterWatch));
-    ATOMIC_STORE_0_TO_INT(&allowOnlyOnce, &mutAllowOnlyOnce);
+    ATOMIC_STORE_32BIT(&allowOnlyOnce, &mutAllowOnlyOnce, 0);
     statsReportingBlockStartTimeMs = currentTimeMills();
     LogError(0, RS_RET_OK, "imdiag: blocked stats reporting");
     CHKiRet(sendResponse(pSess, "next stats reporting call will be blocked\n"));
@@ -499,13 +563,16 @@ static rsRetVal awaitStatsReport(uchar *pszCmd, tcps_sess_t *pSess) {
     if (statsReportingBlockStartTimeMs > 0) {
         long delta = currentTimeMills() - statsReportingBlockStartTimeMs;
         if (blockAgain) {
-            ATOMIC_STORE_1_TO_INT(&allowOnlyOnce, &mutAllowOnlyOnce);
+            ATOMIC_STORE_32BIT(&allowOnlyOnce, &mutAllowOnlyOnce, 1);
             LogError(0, RS_RET_OK, "imdiag: un-blocking ONLY the next cycle of stats reporting");
         } else {
             statsReportingBlockStartTimeMs = 0;
             LogError(0, RS_RET_OK, "imdiag: un-blocking stats reporting");
         }
-        sem_post(&statsReportingBlocker);
+        CHKiConcCtrl(pthread_mutex_lock(&stats_reporting_blocker_mut));
+        stats_reporting_blocked = 0;
+        pthread_cond_signal(&stats_reporting_blocker_cond);
+        CHKiConcCtrl(pthread_mutex_unlock(&stats_reporting_blocker_mut));
         LogError(0, RS_RET_OK, "imdiag: stats reporting unblocked");
         STATSCOUNTER_ADD(potentialArtificialDelayMs, mutPotentialArtificialDelayMs, delta);
         STATSCOUNTER_INC(delayInvocationCount, mutDelayInvocationCount);
@@ -545,6 +612,59 @@ static int parsePosLong(const uchar *const s, long *const val) {
     /* accept optional trailing newline/space but nothing else */
     while (*endptr == ' ' || *endptr == '\r' || *endptr == '\n') ++endptr;
     return (*endptr == '\0' && *val >= 0) ? 1 : 0;
+}
+
+static rsRetVal set_seg_disk_fault(uchar *pszCmd, tcps_sess_t *pSess) {
+    uchar point[128] = {0};
+    long hit_count = 1;
+    DEFiRet;
+
+    getFirstWord(&pszCmd, point, sizeof(point), TO_LOWERCASE);
+    if (point[0] == '\0') {
+        CHKiRet(sendResponse(pSess, "ERROR: missing segmentedDisk fault point\n"));
+        FINALIZE;
+    }
+    while (*pszCmd == ' ' || *pszCmd == '\t') ++pszCmd;
+    if (*pszCmd != '\0' && !parsePosLong(pszCmd, &hit_count)) {
+        CHKiRet(sendResponse(pSess, "ERROR: invalid segmentedDisk fault hit count\n"));
+        FINALIZE;
+    }
+    if (hit_count <= 0 || (uintmax_t)hit_count > UINT_MAX) {
+        CHKiRet(sendResponse(pSess, "ERROR: segmentedDisk fault hit count is out of range\n"));
+        FINALIZE;
+    }
+    if (runConf->pMsgQueue == NULL) {
+        CHKiRet(sendResponse(pSess, "ERROR: main queue not yet initialized\n"));
+        FINALIZE;
+    }
+    iRet = qqueueSetSegDiskTestFault(runConf->pMsgQueue, (const char *)point, (unsigned int)hit_count);
+    if (iRet == RS_RET_INVALID_VALUE) {
+        CHKiRet(sendResponse(pSess, "ERROR: unknown fault point or main queue is not segmentedDisk\n"));
+        iRet = RS_RET_OK;
+    } else if (iRet == RS_RET_OK) {
+        CHKiRet(sendResponse(pSess, "OK\n"));
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal clear_seg_disk_fault(tcps_sess_t *pSess) {
+    DEFiRet;
+    if (runConf->pMsgQueue == NULL) {
+        CHKiRet(sendResponse(pSess, "ERROR: main queue not yet initialized\n"));
+        FINALIZE;
+    }
+    iRet = qqueueClearSegDiskTestFault(runConf->pMsgQueue);
+    if (iRet == RS_RET_INVALID_VALUE) {
+        CHKiRet(sendResponse(pSess, "ERROR: main queue is not segmentedDisk\n"));
+        iRet = RS_RET_OK;
+    } else if (iRet == RS_RET_OK) {
+        CHKiRet(sendResponse(pSess, "OK\n"));
+    }
+
+finalize_it:
+    RETiRet;
 }
 
 /* Function to handle received messages. This is our core function!
@@ -589,6 +709,10 @@ static rsRetVal ATTR_NONNULL() OnMsgReceived(tcps_sess_t *const pSess, uchar *co
         CHKiRet(awaitHUPComplete(pSess));
     } else if (!ustrcmp(cmdBuf, UCHAR_CONSTANT("enabledebug"))) {
         CHKiRet(enableDebug(pSess));
+    } else if (!ustrcmp(cmdBuf, UCHAR_CONSTANT("setsegdiskfault"))) {
+        CHKiRet(set_seg_disk_fault(pszMsg, pSess));
+    } else if (!ustrcmp(cmdBuf, UCHAR_CONSTANT("clearsegdiskfault"))) {
+        CHKiRet(clear_seg_disk_fault(pSess));
     } else if (!ustrcmp(cmdBuf, UCHAR_CONSTANT("setmainmsgqueuetimeoutshutdown"))) {
         long val;
         if (!parsePosLong(pszMsg, &val)) {
@@ -655,7 +779,7 @@ finalize_it:
 }
 
 
-static rsRetVal setInjectDelayMode(void __attribute__((unused)) * pVal, uchar *const pszMode) {
+static rsRetVal setInjectDelayModeFromString(const uchar *const pszMode) {
     DEFiRet;
 
     if (!strcasecmp((char *)pszMode, "no")) {
@@ -667,7 +791,17 @@ static rsRetVal setInjectDelayMode(void __attribute__((unused)) * pVal, uchar *c
     } else {
         LogError(0, RS_RET_PARAM_ERROR, "imdiag: invalid imdiagInjectDelayMode '%s' - ignored", pszMode);
     }
+    RETiRet;
+}
+
+
+static rsRetVal setInjectDelayMode(void __attribute__((unused)) * pVal, uchar *const pszMode) {
+    DEFiRet;
+
+    bLegacyInjectDelayModeSet = 1;
+    iRet = setInjectDelayModeFromString(pszMode);
     free(pszMode);
+
     RETiRet;
 }
 
@@ -727,6 +861,10 @@ finalize_it:
 }
 
 
+/* timeoutGuard is mandatory testbench hang protection. Do not remove,
+ * disable, or weaken it to make shutdown tests pass; fix lifecycle, fork,
+ * or unload bugs while preserving this inside-rsyslogd timeout oracle.
+ */
 static void *timeoutGuard(ATTR_UNUSED void *arg) {
     assert(abortTimeout != -1);
     sigset_t sigSet;
@@ -743,18 +881,17 @@ static void *timeoutGuard(ATTR_UNUSED void *arg) {
     time(&strtTO);
     endTO = strtTO + abortTimeout;
 
-    while (1) {
-        int to = endTO - time(NULL);
-        dbgprintf("timeoutGuard: sleep timeout %d seconds\n", to);
-        if (to > 0) {
-            srSleep(to, 0);
-        }
-        if (time(NULL) < endTO) {
-            dbgprintf("timeoutGuard: spurios wakeup, going back to sleep, time: %lld\n", (long long)time(NULL));
-        } else {
-            break;
-        }
+    pthread_mutex_lock(&timeoutGuardMut);
+    while (!timeoutGuardStop && time(NULL) < endTO) {
+        struct timespec timeout = {.tv_sec = endTO, .tv_nsec = 0};
+        pthread_cond_timedwait(&timeoutGuardCond, &timeoutGuardMut, &timeout);
     }
+    if (timeoutGuardStop) {
+        pthread_mutex_unlock(&timeoutGuardMut);
+        return NULL;
+    }
+    pthread_mutex_unlock(&timeoutGuardMut);
+
     dbgprintf("timeoutGuard: sleep expired, aborting\n");
     /* note: we use fprintf to stderr intentionally! */
 
@@ -764,7 +901,16 @@ static void *timeoutGuard(ATTR_UNUSED void *arg) {
             (long long)strtTO, (long long)endTO, (long long)time(NULL), (long long)(time(NULL) - strtTO),
             (int)glblGetOurPid());
     fflush(stderr);
+    (void)rsyslogdWriteTerminationMarker("error", "timeoutGuard", "timeoutguard-abort");
     abort();
+}
+
+
+static void stopTimeoutGuard(void) {
+    pthread_mutex_lock(&timeoutGuardMut);
+    timeoutGuardStop = 1;
+    pthread_cond_signal(&timeoutGuardCond);
+    pthread_mutex_unlock(&timeoutGuardMut);
 }
 
 
@@ -784,8 +930,23 @@ static rsRetVal setAbortTimeout(void __attribute__((unused)) * pVal, int timeout
         ABORT_FINALIZE(RS_RET_ERR);
     }
     abortTimeout = timeout;
+    pthread_mutex_lock(&timeoutGuardMut);
+    timeoutGuardStop = 0;
+    pthread_mutex_unlock(&timeoutGuardMut);
+
     const int iState = pthread_create(&timeoutGuard_thrd, NULL, timeoutGuard, NULL);
-    if (iState != 0) {
+    if (iState == 0) {
+        pthread_mutex_lock(&timeoutGuardMut);
+        timeoutGuardActive = 1;
+        timeoutGuardPid = getpid();
+        pthread_mutex_unlock(&timeoutGuardMut);
+    } else {
+        pthread_mutex_lock(&timeoutGuardMut);
+        timeoutGuardStop = 0;
+        timeoutGuardActive = 0;
+        timeoutGuardPid = 0;
+        pthread_mutex_unlock(&timeoutGuardMut);
+        abortTimeout = -1;
         LogError(iState, NO_ERRCODE,
                  "imdiag: error enabling timeoutGuard thread -"
                  "not guarding against system hang");
@@ -797,12 +958,40 @@ finalize_it:
 }
 
 
+static rsRetVal setMaxSessions(void __attribute__((unused)) * pVal, int maxSessions) {
+    DEFiRet;
+
+    iTCPSessMax = maxSessions;
+    bLegacyTCPSessMaxSet = 1;
+
+    RETiRet;
+}
+
+
+static rsRetVal setStrmDrvrMode(void __attribute__((unused)) * pVal, int mode) {
+    DEFiRet;
+
+    iStrmDrvrMode = mode;
+    bLegacyStrmDrvrModeSet = 1;
+
+    RETiRet;
+}
+
+
 BEGINbeginCnfLoad
     CODESTARTbeginCnfLoad;
     loadModConf = pModConf;
     pModConf->pConf = pConf;
     pModConf->pszLstnPortFileName = NULL;
+    pModConf->pszServerRun = NULL;
+    pModConf->pszInjectDelayMode = NULL;
+    pModConf->pszStrmDrvrAuthMode = NULL;
+    pModConf->pszInputName = NULL;
+    pModConf->pszProperTerminationFile = NULL;
+    pModConf->pPermPeersRoot = NULL;
     pModConf->abortTimeout = -1;
+    pModConf->iTCPSessMax = -1;
+    pModConf->iStrmDrvrMode = -1;
     pModConf->configSetViaV2Method = 0;
 ENDbeginCnfLoad
 
@@ -827,6 +1016,28 @@ BEGINsetModCnf
             CHKmalloc(loadModConf->pszLstnPortFileName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "aborttimeout")) {
             loadModConf->abortTimeout = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "properterminationfile")) {
+            CHKmalloc(loadModConf->pszProperTerminationFile = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "serverrun")) {
+            CHKmalloc(loadModConf->pszServerRun = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "injectdelaymode")) {
+            CHKmalloc(loadModConf->pszInjectDelayMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "maxsessions")) {
+            loadModConf->iTCPSessMax = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "serverstreamdrivermode")) {
+            loadModConf->iStrmDrvrMode = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "serverstreamdriverauthmode")) {
+            CHKmalloc(loadModConf->pszStrmDrvrAuthMode = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(modpblk.descr[i].name, "serverstreamdriverpermittedpeer")) {
+            for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
+                uchar *const peer = (uchar *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
+                CHKmalloc(peer);
+                iRet = net.AddPermittedPeer(&loadModConf->pPermPeersRoot, peer);
+                free(peer);
+                CHKiRet(iRet);
+            }
+        } else if (!strcmp(modpblk.descr[i].name, "serverinputname")) {
+            CHKmalloc(loadModConf->pszInputName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(modpblk.descr[i].name, "mainmsgqueuetimeoutshutdown")) {
             loadModConf->pConf->globals.mainQ.iMainMsgQtoQShutdown = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "mainmsgqueuetimeoutenqueue")) {
@@ -855,6 +1066,34 @@ BEGINendCnfLoad
         pszLstnPortFileName = loadModConf->pszLstnPortFileName;
         loadModConf->pszLstnPortFileName = NULL; /* ownership transferred to global */
     }
+    if (loadModConf->pszInjectDelayMode != NULL && !bLegacyInjectDelayModeSet) {
+        CHKiRet(setInjectDelayModeFromString(loadModConf->pszInjectDelayMode));
+    }
+    if (loadModConf->iTCPSessMax != -1 && !bLegacyTCPSessMaxSet) {
+        iTCPSessMax = loadModConf->iTCPSessMax;
+    }
+    if (loadModConf->iStrmDrvrMode != -1 && !bLegacyStrmDrvrModeSet) {
+        iStrmDrvrMode = loadModConf->iStrmDrvrMode;
+    }
+    if (loadModConf->pszStrmDrvrAuthMode != NULL && pszStrmDrvrAuthMode == NULL) {
+        pszStrmDrvrAuthMode = loadModConf->pszStrmDrvrAuthMode;
+        loadModConf->pszStrmDrvrAuthMode = NULL; /* ownership transferred to global */
+    }
+    if (loadModConf->pszInputName != NULL && pszInputName == NULL) {
+        pszInputName = loadModConf->pszInputName;
+        loadModConf->pszInputName = NULL; /* ownership transferred to global */
+    }
+    if (loadModConf->pszProperTerminationFile != NULL) {
+        CHKiRet(rsyslogdSetProperTerminationFile(loadModConf->pszProperTerminationFile));
+    }
+    if (loadModConf->pPermPeersRoot != NULL && pPermPeersRoot == NULL) {
+        pPermPeersRoot = loadModConf->pPermPeersRoot;
+        loadModConf->pPermPeersRoot = NULL; /* ownership transferred to global */
+    }
+    if (loadModConf->pszServerRun != NULL && pOurTcpsrv == NULL) {
+        CHKiRet(addTCPListener(NULL, loadModConf->pszServerRun));
+        loadModConf->pszServerRun = NULL; /* ownership transferred to addTCPListener */
+    }
     if (loadModConf->abortTimeout != -1 && abortTimeout == -1) {
         CHKiRet(setAbortTimeout(NULL, loadModConf->abortTimeout));
     }
@@ -876,6 +1115,14 @@ ENDactivateCnf
 BEGINfreeCnf
     CODESTARTfreeCnf;
     free(pModConf->pszLstnPortFileName);
+    free(pModConf->pszServerRun);
+    free(pModConf->pszInjectDelayMode);
+    free(pModConf->pszStrmDrvrAuthMode);
+    free(pModConf->pszInputName);
+    free(pModConf->pszProperTerminationFile);
+    if (pModConf->pPermPeersRoot != NULL) {
+        net.DestructPermittedPeers(&pModConf->pPermPeersRoot);
+    }
 ENDfreeCnf
 
 
@@ -958,6 +1205,21 @@ ENDafterRun
 
 BEGINmodExit
     CODESTARTmodExit;
+    /* Ask the guard thread to stop and join it before imdiag can be unloaded. */
+    stopTimeoutGuard();
+    pthread_mutex_lock(&timeoutGuardMut);
+    const int joinTimeoutGuard = timeoutGuardActive && timeoutGuardPid == getpid();
+    pthread_mutex_unlock(&timeoutGuardMut);
+    if (joinTimeoutGuard) {
+        void *dummy;
+        pthread_join(timeoutGuard_thrd, &dummy);
+    }
+    pthread_mutex_lock(&timeoutGuardMut);
+    timeoutGuardActive = 0;
+    timeoutGuardPid = 0;
+    timeoutGuardStop = 0;
+    abortTimeout = -1;
+    pthread_mutex_unlock(&timeoutGuardMut);
     if (pOurTcpsrv != NULL) iRet = tcpsrv.Destruct(&pOurTcpsrv);
 
     if (pPermPeersRoot != NULL) {
@@ -970,7 +1232,8 @@ BEGINmodExit
     free(pszStrmDrvrAuthMode);
 
     statsobj.Destruct(&diagStats);
-    sem_destroy(&statsReportingBlocker);
+    pthread_cond_destroy(&stats_reporting_blocker_cond);
+    pthread_mutex_destroy(&stats_reporting_blocker_mut);
     DESTROY_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
     pthread_cond_destroy(&statsReporterWatch);
     pthread_mutex_destroy(&mutStatsReporterWatch);
@@ -983,26 +1246,18 @@ BEGINmodExit
     objRelease(datetime, CORE_COMPONENT);
     objRelease(prop, CORE_COMPONENT);
     objRelease(statsobj, CORE_COMPONENT);
-
-    /* clean up timeoutGuard if active */
-    if (abortTimeout != -1) {
-        int r = pthread_cancel(timeoutGuard_thrd);
-        if (r == 0) {
-            void *dummy;
-            pthread_join(timeoutGuard_thrd, &dummy);
-        }
-        abortTimeout = -1; /* mark cleaned up so resetConfigVariables won't double-cancel */
-    }
 ENDmodExit
 
 
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __attribute__((unused)) * pVal) {
     iTCPSessMax = 200;
     iStrmDrvrMode = 0;
+    bLegacyInjectDelayModeSet = 0;
+    bLegacyTCPSessMaxSet = 0;
+    bLegacyStrmDrvrModeSet = 0;
     free(pszInputName);
     free(pszLstnPortFileName);
     pszLstnPortFileName = NULL;
-    abortTimeout = -1;
     if (pszStrmDrvrAuthMode != NULL) {
         free(pszStrmDrvrAuthMode);
         pszStrmDrvrAuthMode = NULL;
@@ -1069,9 +1324,9 @@ BEGINmodInit()
                                STD_LOADABLE_MODULE_ID));
     CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiaginjectdelaymode"), 0, eCmdHdlrGetWord, setInjectDelayMode, NULL,
                                STD_LOADABLE_MODULE_ID));
-    CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagmaxsessions"), 0, eCmdHdlrInt, NULL, &iTCPSessMax,
+    CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagmaxsessions"), 0, eCmdHdlrInt, setMaxSessions, NULL,
                                STD_LOADABLE_MODULE_ID));
-    CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdrivermode"), 0, eCmdHdlrInt, NULL, &iStrmDrvrMode,
+    CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdrivermode"), 0, eCmdHdlrInt, setStrmDrvrMode, NULL,
                                STD_LOADABLE_MODULE_ID));
     CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiaglistenportfilename"), 0, eCmdHdlrGetWord, NULL,
                                &pszLstnPortFileName, STD_LOADABLE_MODULE_ID));
@@ -1084,7 +1339,9 @@ BEGINmodInit()
     CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("resetconfigvariables"), 1, eCmdHdlrCustomHandler, resetConfigVariables,
                                NULL, STD_LOADABLE_MODULE_ID));
 
-    sem_init(&statsReportingBlocker, 0, 1);
+    CHKiConcCtrl(pthread_mutex_init(&stats_reporting_blocker_mut, NULL));
+    CHKiConcCtrl(pthread_cond_init(&stats_reporting_blocker_cond, NULL));
+    stats_reporting_blocked = 0;
     INIT_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
     CHKiConcCtrl(pthread_mutex_init(&mutStatsReporterWatch, NULL));
     CHKiConcCtrl(pthread_cond_init(&statsReporterWatch, NULL));

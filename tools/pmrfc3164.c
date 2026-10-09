@@ -60,10 +60,6 @@ DEFobjCurrIf(datetime);
 DEFobjCurrIf(ruleset);
 
 
-/* static data */
-static int bParseHOSTNAMEandTAG; /* cache for the equally-named global param - performance enhancement */
-
-
 /* parser instance parameters */
 static struct cnfparamdescr parserpdescr[] = {
     {"detect.yearaftertimestamp", eCmdHdlrBinary, 0},
@@ -89,7 +85,7 @@ struct instanceConf_s {
     int bPermitAtSignsInHostname;
     int bForceTagEndingByColon;
     int bRemoveMsgFirstSpace;
-    int bHdrLessMode; /** < is headerless mode activated? 0 - no, other - yes */
+    int bHdrLessMode; /**< is headerless mode activated? 0 - no, other - yes */
     uchar* pszHeaderlessHostname; /** < HOSTNAME to use for headerless messages */
     uchar* pszHeaderlessTag; /** < TAG to use for headerless messages */
     uchar* pszHeaderlessRulesetName; /** < name of Ruleset to use for headerless messages */
@@ -99,6 +95,7 @@ struct instanceConf_s {
     FILE* fpHeaderlessErr; /**< file pointer for error file (headerless) */
     pthread_mutex_t mutErrFile;
     int bDropHeaderless;
+    int bParseHOSTNAMEandTAG;
 };
 
 
@@ -132,7 +129,7 @@ static rsRetVal createInstance(instanceConf_t** pinst) {
     inst->fpHeaderlessErr = NULL;
     pthread_mutex_init(&inst->mutErrFile, NULL);
     inst->bDropHeaderless = 0;
-    bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(loadConf);
+    inst->bParseHOSTNAMEandTAG = 1;
     *pinst = inst;
 finalize_it:
     RETiRet;
@@ -175,13 +172,13 @@ BEGINnewParserInst
         } else if (!strcmp(parserpblk.descr[i].name, "detect.headerless")) {
             inst->bHdrLessMode = (int)pvals[i].val.d.n;
         } else if (!strcmp(parserpblk.descr[i].name, "headerless.hostname")) {
-            inst->pszHeaderlessHostname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszHeaderlessHostname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(parserpblk.descr[i].name, "headerless.tag")) {
-            inst->pszHeaderlessTag = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszHeaderlessTag = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(parserpblk.descr[i].name, "headerless.ruleset")) {
-            inst->pszHeaderlessRulesetName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszHeaderlessRulesetName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(parserpblk.descr[i].name, "headerless.errorfile")) {
-            inst->pszHeaderlessErrFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(inst->pszHeaderlessErrFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(parserpblk.descr[i].name, "headerless.drop")) {
             inst->bDropHeaderless = (int)pvals[i].val.d.n;
         } else {
@@ -211,6 +208,8 @@ ENDfreeParserInst
 
 BEGINcheckParserInst
     CODESTARTcheckParserInst;
+
+    pInst->bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(loadConf);
 
     if (pInst->pszHeaderlessRulesetName != NULL) {
         ruleset_t* myRuleset = NULL;
@@ -288,7 +287,7 @@ finalize_it:
     RETiRet;
 }
 
-/* parse a legay-formatted syslog message.
+/* parse a legacy-formatted syslog message.
  * We apply heuristics during header detection. These are not 100% failure
  * prove, but the best compromise we came up within 20+ years of adapting
  * the heuristics.
@@ -381,7 +380,7 @@ BEGINparse2
      * machine that we received the message from and the tag will be empty. This
      * is meant to be an interim solution, but for now it is in the code.
      */
-    if (bParseHOSTNAMEandTAG && !(pMsg->msgFlags & INTERNAL_MSG)) {
+    if (pInst->bParseHOSTNAMEandTAG && !(pMsg->msgFlags & INTERNAL_MSG)) {
         /* parse HOSTNAME - but only if this is network-received!
          * rger, 2005-11-14: we still have a problem with BSD messages. These messages
          * do NOT include a host name. In most cases, this leads to the TAG to be treated
@@ -432,7 +431,12 @@ BEGINparse2
                 int isHostName = 0;
                 if (i > 0) {
                     if (bHadSBracket) {
-                        if (p2parse[i] == ']') {
+                        /* the scan loop above only reserves room for the string
+                         * terminator, so we must check that the closing bracket
+                         * still fits as well - otherwise this is not a hostname
+                         * we can represent.
+                         */
+                        if (p2parse[i] == ']' && i < CONF_HOSTNAME_MAXSIZE - 1) {
                             bufParseHOSTNAME[i] = ']';
                             ++i;
                             isHostName = 1;
@@ -468,6 +472,7 @@ BEGINparse2
          * in RFC3164...). We now receive the full size, but will modify the
          * outputs so that only 32 characters max are used by default.
          */
+        uchar* const pTagStart = p2parse;
         i = 0;
         while (lenMsg > 0 && *p2parse != ':' && *p2parse != ' ' && i < CONF_TAG_MAXSIZE - 2) {
             bufParseTAG[i++] = *p2parse++;
@@ -481,8 +486,12 @@ BEGINparse2
             /* Tag need to be ended by a colon or it's not a tag but the
              * begin of the message
              */
-            p2parse -= (i + 1);
-            lenMsg += (i + 1);
+            size_t rewind = i;
+            if (pTagStart > pMsg->pszRawMsg && pTagStart[-1] == ' ') {
+                ++rewind;
+            }
+            p2parse -= rewind;
+            lenMsg += rewind;
             i = 0;
             /* Default TAG is dash (without ':')
              */
@@ -510,6 +519,43 @@ finalize_it:
     }
     MsgSetMSGoffs(pMsg, p2parse - pMsg->pszRawMsg);
 ENDparse2
+
+#ifdef ENABLE_FUZZING
+static instanceConf_t* fuzzParserInstance;
+rsRetVal pmrfc3164FuzzInit(void);
+void pmrfc3164FuzzExit(void);
+rsRetVal pmrfc3164FuzzParse(smsg_t* pMsg);
+
+rsRetVal pmrfc3164FuzzInit(void) {
+    DEFiRet;
+
+    CHKiRet(objGetObjInterface(&obj));
+    CHKiRet(objUse(glbl, CORE_COMPONENT));
+    CHKiRet(objUse(parser, CORE_COMPONENT));
+    CHKiRet(objUse(datetime, CORE_COMPONENT));
+    CHKiRet(objUse(ruleset, CORE_COMPONENT));
+    CHKiRet(createInstance(&fuzzParserInstance));
+
+finalize_it:
+    RETiRet;
+}
+
+void pmrfc3164FuzzExit(void) {
+    if (fuzzParserInstance != NULL) {
+        freeParserInst(fuzzParserInstance);
+        fuzzParserInstance = NULL;
+    }
+    objRelease(glbl, CORE_COMPONENT);
+    objRelease(parser, CORE_COMPONENT);
+    objRelease(datetime, CORE_COMPONENT);
+    objRelease(ruleset, CORE_COMPONENT);
+}
+
+rsRetVal pmrfc3164FuzzParse(smsg_t* pMsg) {
+    if (fuzzParserInstance == NULL) return RS_RET_ERR;
+    return parse2(fuzzParserInstance, pMsg);
+}
+#endif
 
 
 BEGINmodExit
@@ -541,6 +587,4 @@ BEGINmodInit(pmrfc3164)
 
     DBGPRINTF("rfc3164 parser init called\n");
 
-    /* cache value, is set only during rsyslogd option processing */
-    bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(loadConf);
 ENDmodInit

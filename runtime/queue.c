@@ -6,7 +6,7 @@
  *
  * There is some in-depth documentation available in doc/dev_queue.html
  * (and in the web doc set on https://www.rsyslog.com/doc/). Be sure to read it
- * if you are getting aquainted to the object.
+ * if you are getting acquainted to the object.
  *
  * NOTE: as of 2009-04-22, I have begin to remove the qqueue* prefix from static
  * function names - this makes it really hard to read and does not provide much
@@ -73,9 +73,9 @@
  * "WAL-only" log shippers, making rsyslog uniquely versatile.
  *
  *
- * @subsection queue_types The Four Queue Types
+ * @subsection queue_types Queue Types
  *
- * Rsyslog offers four queue types, each with a specific performance and
+ * Rsyslog offers multiple queue types, each with a specific performance and
  * reliability profile. They are listed here from most lightweight to most
  * robust.
  *
@@ -130,6 +130,14 @@
  * - **Use Case:** The recommended choice for any potentially unreliable or
  * slow action, or for a ruleset queue that needs to survive downstream
  * outages.
+ *
+ * 5.  **Segmented Disk**
+ * - **Behavior:** A pure-disk queue backed by a log-structured segmented
+ * store. It uses one serial writer, sealed segment files, and durable
+ * per-segment commit offsets. It can be selected as the disk store used by
+ * disk-assisted (DA) queues via DA engine/store selection.
+ * - **Use Case:** Durable queueing with segmented-store mechanics, including
+ * DA deployments that use the segmented disk store.
  *
  *
  * @subsection comparison_to_wal Rsyslog's "Bounded Queue" vs. a WAL's "Unbounded Stream"
@@ -248,6 +256,11 @@ static rsRetVal qDestructDirect(qqueue_t __attribute__((unused)) * pThis);
 static rsRetVal qConstructDirect(qqueue_t __attribute__((unused)) * pThis);
 static rsRetVal qConstructDisk(qqueue_t *pThis);
 static rsRetVal qDestructDisk(qqueue_t *pThis);
+static rsRetVal qConstructSegDisk(qqueue_t *pThis);
+static rsRetVal qDestructSegDisk(qqueue_t *pThis);
+static rsRetVal qAddSegDisk(qqueue_t *pThis, smsg_t *pMsg);
+static rsRetVal qDeqBatchSegDisk(qqueue_t *pThis, batch_t *batch, int max, int *skipped);
+static rsRetVal qCompleteBatchSegDisk(qqueue_t *pThis, batch_t *batch, int *committed, int *retried);
 rsRetVal qqueueSetSpoolDir(qqueue_t *pThis, uchar *pszSpoolDir, int lenSpoolDir);
 static rsRetVal handleReadSeekError(rsRetVal seekRet, qqueue_t *pThis, const char *streamName, sbool *pReadSeekFailed);
 static void alignReadDeqToWrite(qqueue_t *pThis);
@@ -255,6 +268,8 @@ static void recoverFromInvalidQi(qqueue_t *pThis, int wr_fd, int64_t wr_offs);
 static void qqueueDestroyDiskStreams(qqueue_t *pThis);
 static rsRetVal qqueueSwitchToInMemoryEmergency(qqueue_t *pThis);
 static rsRetVal qqueueResetDiskQueueAfterCorruption(qqueue_t *pThis);
+static rsRetVal msgConstructFromVoid(void **ppThis);
+static rsRetVal msgDeserializeFromVoid(void *pObj, strm_t *pStrm);
 
 /* some constants for queuePersist () */
 #define QUEUE_CHECKPOINT 1
@@ -277,6 +292,9 @@ static struct cnfparamdescr cnfpdescr[] = {{"queue.filename", eCmdHdlrGetWord, 0
                                            {"queue.checkpointinterval", eCmdHdlrInt, 0},
                                            {"queue.syncqueuefiles", eCmdHdlrBinary, 0},
                                            {"queue.type", eCmdHdlrQueueType, 0},
+                                           {"queue.diskqueuetype", eCmdHdlrGetWord, 0},
+                                           {"queue.diskqueueautoupgrade", eCmdHdlrBinary, 0},
+                                           {"queue.diskqueueidletimeout", eCmdHdlrInt, 0},
                                            {"queue.workerthreads", eCmdHdlrPositiveInt, 0},
                                            {"queue.timeoutshutdown", eCmdHdlrInt, 0},
                                            {"queue.timeoutactioncompletion", eCmdHdlrInt, 0},
@@ -291,6 +309,7 @@ static struct cnfparamdescr cnfpdescr[] = {{"queue.filename", eCmdHdlrGetWord, 0
                                            {"queue.cry.provider", eCmdHdlrGetWord, 0},
                                            {"queue.samplinginterval", eCmdHdlrInt, 0},
                                            {"queue.takeflowctlfrommsg", eCmdHdlrBinary, 0},
+                                           {"queue.mutexcontentionstats", eCmdHdlrBinary, 0},
                                            {"queue.oncorruption", eCmdHdlrGetWord, 0}};
 static struct cnfparamblk pblk = {CNFPARAMBLK_VERSION, sizeof(cnfpdescr) / sizeof(struct cnfparamdescr), cnfpdescr};
 
@@ -444,6 +463,9 @@ static const char *getQueueTypeName(queueType_t t) {
         case QUEUETYPE_DIRECT:
             r = "Direct";
             break;
+        case QUEUETYPE_SEGMENTED_DISK:
+            r = "segmentedDisk";
+            break;
         default:
             r = "invalid/unknown queue mode";
             break;
@@ -457,6 +479,7 @@ void qqueueDbgPrint(qqueue_t *pThis) {
               (pThis->pszFilePrefix == NULL) ? "[NONE]" : (char *)pThis->pszFilePrefix);
     dbgoprint((obj_t *)pThis, "queue.size: %d\n", pThis->iMaxQueueSize);
     dbgoprint((obj_t *)pThis, "queue.dequeuebatchsize: %d\n", pThis->iDeqBatchSize);
+    dbgoprint((obj_t *)pThis, "queue.mutexcontentionstats: %d\n", pThis->bMutexContentionStats);
     dbgoprint((obj_t *)pThis, "queue.mindequeuebatchsize: %d\n", pThis->iMinDeqBatchSize);
     dbgoprint((obj_t *)pThis, "queue.mindequeuebatchsize.timeout: %d\n", pThis->toMinDeqBatchSize);
     dbgoprint((obj_t *)pThis, "queue.maxdiskspace: %lld\n", pThis->sizeOnDiskMax);
@@ -489,7 +512,11 @@ void qqueueDbgPrint(qqueue_t *pThis) {
  * rgerhards, 2008-01-29
  */
 static int getPhysicalQueueSize(qqueue_t *pThis) {
-    return (int)PREFER_FETCH_32BIT(pThis->iQueueSize);
+    const int size = (int)PREFER_FETCH_32BIT(pThis->iQueueSize);
+    if (size == 0 && pThis->qType == QUEUETYPE_SEGMENTED_DISK && pThis->tVars.segdisk != NULL &&
+        segdiskStoreMayHaveData(pThis->tVars.segdisk))
+        return 1;
+    return size;
 }
 
 
@@ -498,7 +525,155 @@ static int getPhysicalQueueSize(qqueue_t *pThis) {
  * rgerhards, 2009-05-19
  */
 static int getLogicalQueueSize(qqueue_t *pThis) {
-    return pThis->iQueueSize - pThis->nLogDeq;
+    const int size = pThis->iQueueSize - pThis->nLogDeq;
+    if (size == 0 && pThis->qType == QUEUETYPE_SEGMENTED_DISK && pThis->tVars.segdisk != NULL &&
+        segdiskStoreMayHaveData(pThis->tVars.segdisk))
+        return 1;
+    return size;
+}
+
+/*
+ * Acquire the queue mutex while optionally recording observable contention.
+ * The normal path deliberately remains a plain mutex lock. The diagnostic
+ * path is selected explicitly per queue because trylock affects throughput.
+ * Observed wait time includes scheduler delay and is not mutex hold time.
+ */
+static inline void qqueueLock(qqueue_t *const pThis) {
+    if (!pThis->bMutexContentionStats || !STATSCOUNTER_ENABLED()) {
+        d_pthread_mutex_lock(pThis->mut);
+        return;
+    }
+
+    const int trylock_ret = d_pthread_mutex_trylock(pThis->mut);
+    if (trylock_ret == 0) return;
+    if (trylock_ret != EBUSY) {
+        d_pthread_mutex_lock(pThis->mut);
+        return;
+    }
+
+    STATSCOUNTER_INC(pThis->ctrMutexContention, pThis->mutCtrMutexContention);
+    struct timespec before;
+    const int have_before = clock_gettime(CLOCK_MONOTONIC, &before) == 0;
+    d_pthread_mutex_lock(pThis->mut);
+    if (have_before) {
+        struct timespec after;
+        if (clock_gettime(CLOCK_MONOTONIC, &after) == 0) {
+            const int64_t wait_ns =
+                ((int64_t)(after.tv_sec - before.tv_sec) * 1000000000LL) + (int64_t)(after.tv_nsec - before.tv_nsec);
+            if (wait_ns >= 0) STATSCOUNTER_ADD(pThis->ctrMutexWaitNs, pThis->mutCtrMutexWaitNs, (uint64_t)wait_ns);
+        }
+    }
+}
+
+static int64 getQueueDiskBytes(qqueue_t *pThis) {
+    if (pThis->qType == QUEUETYPE_SEGMENTED_DISK && pThis->tVars.segdisk != NULL) {
+        segdisk_store_stats_t stats;
+        segdiskStoreGetStats(pThis->tVars.segdisk, &stats);
+        return stats.bytes;
+    }
+    return pThis->tVars.disk.sizeOnDisk;
+}
+
+static int segdiskStatsInt(const uint64_t value) {
+    return value > INT_MAX ? INT_MAX : (int)value;
+}
+
+static void qqueueUpdateSegDiskStats(qqueue_t *pThis) {
+    if (pThis->qType != QUEUETYPE_SEGMENTED_DISK || pThis->tVars.segdisk == NULL) return;
+    segdisk_store_stats_t stats;
+    segdiskStoreGetStats(pThis->tVars.segdisk, &stats);
+    pThis->segdiskBytes = stats.bytes > INT_MAX ? INT_MAX : (stats.bytes < 0 ? 0 : (int)stats.bytes);
+    pThis->segdiskSegments = stats.segments;
+    pThis->segdiskCheckpoints = segdiskStatsInt(stats.checkpoints);
+    pThis->segdiskReplayed = segdiskStatsInt(stats.replayed);
+    pThis->segdiskCorruptionEvents = segdiskStatsInt(stats.corruption_events);
+    pThis->segdiskCorruptionBytes = segdiskStatsInt(stats.corruption_bytes);
+    pThis->segdiskCorruptionRecords = segdiskStatsInt(stats.corruption_records);
+    pThis->segdiskRetryOverageBytes = stats.retry_overage_bytes > INT_MAX ? INT_MAX : (int)stats.retry_overage_bytes;
+    pThis->segdiskRetryOverageMaxBytes =
+        stats.retry_overage_max_bytes > INT_MAX ? INT_MAX : (int)stats.retry_overage_max_bytes;
+    pThis->segdiskStateWrites = segdiskStatsInt(stats.state_writes);
+    pThis->segdiskForcedStateWrites = segdiskStatsInt(stats.forced_state_writes);
+    pThis->segdiskRecoveryBytes = segdiskStatsInt(stats.recovery_bytes);
+    pThis->segdiskRecoveryRecords = segdiskStatsInt(stats.recovery_records);
+    pThis->segdiskStartupPayloadBytes = segdiskStatsInt(stats.startup_payload_bytes_read);
+    pThis->segdiskStartupSegmentFilesProbed = segdiskStatsInt(stats.startup_segment_files_probed);
+    pThis->segdiskRecoveryPending = segdiskStatsInt(stats.recovery_pending);
+    pThis->segdiskCorruptionSegments = segdiskStatsInt(stats.corruption_segments);
+    pThis->segdiskMaterializations = segdiskStatsInt(stats.materializations);
+    pThis->segdiskDematerializations = segdiskStatsInt(stats.dematerializations);
+    pThis->segdiskIdleCleanupFailures = segdiskStatsInt(stats.idle_cleanup_failures);
+}
+
+static rsRetVal qqueueSegDiskIdleTimeout(qqueue_t *pThis) {
+    if (!pThis->segdiskDAChild || pThis->qType != QUEUETYPE_SEGMENTED_DISK || pThis->tVars.segdisk == NULL)
+        return RS_RET_RETRY;
+    if (getLogicalQueueSize(pThis) != 0 || getPhysicalQueueSize(pThis) != 0 ||
+        !segdiskStoreCanDematerialize(pThis->tVars.segdisk))
+        return RS_RET_RETRY;
+    /* A DA child shares its parent queue mutex.  The child can become empty
+     * while ConsumerDA still owns a parent batch that has not reached the
+     * child store.  The parent physical count includes those logically
+     * dequeued batches until ConsumerDA commits them, so it is the required
+     * transfer-in-flight barrier.  Without it, an immediate idle timeout can
+     * remove the child store and a crash can lose the parent-only batch. */
+    if (pThis->pqParent == NULL || getPhysicalQueueSize(pThis->pqParent) != 0) {
+        return RS_RET_RETRY;
+    }
+    if (pThis->segdiskIdleObservedActivity != pThis->pqParent->daActivityGeneration) {
+        pThis->segdiskIdleObservedActivity = pThis->pqParent->daActivityGeneration;
+        return RS_RET_RETRY;
+    }
+    const rsRetVal r = segdiskStoreDematerialize(pThis->tVars.segdisk);
+    qqueueUpdateSegDiskStats(pThis);
+    if (r != RS_RET_OK) {
+        LogError(0, r, "%s: segmented disk-assisted idle store cleanup failed; will retry",
+                 obj.GetName((obj_t *)pThis));
+        return RS_RET_RETRY;
+    }
+    return RS_RET_OK;
+}
+
+#ifdef ENABLE_IMDIAG
+rsRetVal qqueueSetSegDiskTestFault(qqueue_t *pThis, const char *point, unsigned int hit_count) {
+    if (pThis == NULL || point == NULL || hit_count == 0) return RS_RET_PARAM_ERROR;
+    qqueue_t *target = pThis->qType == QUEUETYPE_SEGMENTED_DISK ? pThis : pThis->pqDA;
+    if (target == NULL || target->qType != QUEUETYPE_SEGMENTED_DISK || target->tVars.segdisk == NULL)
+        return RS_RET_INVALID_VALUE;
+    d_pthread_mutex_lock(target->mut);
+    const rsRetVal r = segdiskStoreSetTestFault(target->tVars.segdisk, point, hit_count);
+    d_pthread_mutex_unlock(target->mut);
+    return r;
+}
+
+rsRetVal qqueueClearSegDiskTestFault(qqueue_t *pThis) {
+    if (pThis == NULL) return RS_RET_PARAM_ERROR;
+    qqueue_t *target = pThis->qType == QUEUETYPE_SEGMENTED_DISK ? pThis : pThis->pqDA;
+    if (target == NULL || target->qType != QUEUETYPE_SEGMENTED_DISK || target->tVars.segdisk == NULL)
+        return RS_RET_INVALID_VALUE;
+    d_pthread_mutex_lock(target->mut);
+    segdiskStoreClearTestFault(target->tVars.segdisk);
+    d_pthread_mutex_unlock(target->mut);
+    return RS_RET_OK;
+}
+#endif
+
+
+static int qqueueIsShutdownImmediate(qqueue_t *const pThis) {
+    return ATOMIC_LOAD_32BIT(&pThis->bShutdownImmediate, &pThis->mutShutdownImmediate);
+}
+
+
+static void qqueueSetShutdownImmediate(qqueue_t *const pThis, const int value) {
+    ATOMIC_STORE_32BIT(&pThis->bShutdownImmediate, &pThis->mutShutdownImmediate, value);
+}
+
+
+static void qqueueSetWtiShutdownImmediate(qqueue_t *const pThis, wti_t *const pWti) {
+    pWti->pbShutdownImmediate = &pThis->bShutdownImmediate;
+#ifndef HAVE_ATOMIC_BUILTINS
+    pWti->pmutShutdownImmediate = &pThis->mutShutdownImmediate;
+#endif
 }
 
 
@@ -545,7 +720,7 @@ static rsRetVal qqueueAdviseMaxWorkers(qqueue_t *pThis) {
         if (pThis->bIsDA && getLogicalQueueSize(pThis) >= pThis->iHighWtrMrk) {
             DBGOPRINT((obj_t *)pThis, "(re)activating DA worker\n");
             wtpAdviseMaxWorkers(pThis->pWtpDA, 1, DENY_WORKER_START_DURING_SHUTDOWN);
-            /* disk queues have always one worker */
+            /* The DA transfer pool intentionally has one worker. */
         }
         if (getLogicalQueueSize(pThis) == 0) {
             iMaxWorkers = 0;
@@ -583,8 +758,20 @@ static rsRetVal qqueueChkIsDA(qqueue_t *pThis) {
 }
 
 
-/* Start disk-assisted queue mode.
- * rgerhards, 2008-01-15
+/**
+ * @brief Construct and configure the persistent child of a memory-first DA queue.
+ *
+ * Disk-assisted queues have an in-memory parent and a separate child that
+ * receives overflow. The resolver chooses the child's concrete store before
+ * construction, preserving legacy backlogs and rejecting mixed stores rather
+ * than attempting in-place conversion. For a fresh segmented child, this
+ * routine deliberately leaves the store unmaterialized: the marker, .segq
+ * directory, state file, and disk worker are created only on the first spill.
+ *
+ * The durable marker is published before opening existing data or replacing a
+ * drained classic selection. A fresh child instead carries marker-pending
+ * state until its first append, which keeps normal memory-only operation free
+ * of disk artifacts while still preventing a later engine ambiguity.
  */
 static rsRetVal StartDA(qqueue_t *pThis) {
     DEFiRet;
@@ -592,8 +779,50 @@ static rsRetVal StartDA(qqueue_t *pThis) {
 
     ISOBJ_TYPE_assert(pThis, qqueue);
 
+    const qda_engine_config_t engine_config = {
+        .spool_dir = (const char *)pThis->pszSpoolDir,
+        .file_prefix = (const char *)pThis->pszFilePrefix,
+        .requested = pThis->diskQueueType,
+        .auto_upgrade = pThis->diskQueueAutoUpgrade,
+        .requires_classic_features = pThis->useCryprov || pThis->onCorruption != QUEUE_ON_CORRUPTION_SAFE_MODE,
+    };
+    qda_engine_result_t engine_result;
+    iRet = qdaEngineResolve(&engine_config, &engine_result);
+    if (iRet != RS_RET_OK) {
+        LogError(0, iRet,
+                 "%s: cannot select disk-assisted queue engine for prefix '%s'; classic and segmented data, "
+                 "an explicit engine conflict, a malformed engine marker, or unsupported segmented options "
+                 "require operator intervention",
+                 obj.GetName((obj_t *)pThis), pThis->pszFilePrefix);
+        FINALIZE;
+    }
+    pThis->effectiveDiskQueueType = engine_result.effective;
+    if (pThis->diskQueueType == QDA_ENGINE_AUTO && engine_result.effective == QDA_ENGINE_DISK) {
+        if (engine_result.reason == QDA_REASON_CLASSIC_FEATURE)
+            LogMsg(0, RS_RET_OK_WARN, LOG_WARNING,
+                   "%s: disk-assisted queue automatically selected the classic disk engine for prefix '%s' "
+                   "because classic-only queue options are configured",
+                   obj.GetName((obj_t *)pThis), pThis->pszFilePrefix);
+        else
+            LogMsg(0, RS_RET_OK_WARN, LOG_WARNING,
+                   "%s: disk-assisted queue automatically selected the classic disk engine for prefix '%s' "
+                   "because classic queue state is present or retained; set queue.diskQueueAutoUpgrade=\"on\" "
+                   "to use segmentedDisk after the classic backlog drains",
+                   obj.GetName((obj_t *)pThis), pThis->pszFilePrefix);
+    }
+    /* A marker mismatch is the intentional auto-upgrade case.  The resolver
+     * permits it only after proving that the old classic store is empty, so
+     * publish the new selection durably at this restart boundary. */
+    if (engine_result.classic_data || engine_result.segmented_data ||
+        (engine_result.marker_present && engine_result.marker_engine != engine_result.effective)) {
+        CHKiRet(qdaEngineWriteMarker((const char *)pThis->pszSpoolDir, (const char *)pThis->pszFilePrefix,
+                                     engine_result.effective));
+    }
+
+    const queueType_t child_type =
+        engine_result.effective == QDA_ENGINE_SEGMENTED_DISK ? QUEUETYPE_SEGMENTED_DISK : QUEUETYPE_DISK;
     /* create message queue */
-    CHKiRet(qqueueConstruct(&pThis->pqDA, QUEUETYPE_DISK, pThis->iNumWorkerThreads, 0, pThis->pConsumer));
+    CHKiRet(qqueueConstruct(&pThis->pqDA, child_type, pThis->iNumWorkerThreads, 0, pThis->pConsumer));
 
     /* give it a name */
     snprintf((char *)pszDAQName, sizeof(pszDAQName), "%s[DA]", obj.GetName((obj_t *)pThis));
@@ -603,6 +832,11 @@ static rsRetVal StartDA(qqueue_t *pThis) {
      * liberty to access its properties directly.
      */
     pThis->pqDA->pqParent = pThis;
+    pThis->pqDA->segdiskDAChild = child_type == QUEUETYPE_SEGMENTED_DISK;
+    pThis->pqDA->segdiskLazyCreate = pThis->pqDA->segdiskDAChild && !engine_result.segmented_data;
+    pThis->pqDA->daEngineMarkerPending =
+        !engine_result.marker_present && !engine_result.classic_data && !engine_result.segmented_data;
+    pThis->pqDA->diskQueueIdleTimeout = pThis->diskQueueIdleTimeout;
 
     CHKiRet(qqueueSetpAction(pThis->pqDA, pThis->pAction));
     CHKiRet(qqueueSetsizeOnDiskMax(pThis->pqDA, pThis->sizeOnDiskMax));
@@ -624,7 +858,7 @@ static rsRetVal StartDA(qqueue_t *pThis) {
     pThis->pqDA->iMinMsgsPerWrkr = pThis->iMinMsgsPerWrkr;
     pThis->pqDA->iLowWtrMrk = pThis->iLowWtrMrk;
     pThis->pqDA->onCorruption = pThis->onCorruption;
-    if (pThis->useCryprov) {
+    if (pThis->useCryprov && child_type == QUEUETYPE_DISK) {
         /* hand over cryprov to DA queue - in-mem queue does no longer need it
          * and DA queue will be kept active from now on until termination.
          */
@@ -654,11 +888,12 @@ static rsRetVal StartDA(qqueue_t *pThis) {
 
 finalize_it:
     if (iRet != RS_RET_OK) {
+        const rsRetVal startup_error = iRet;
         if (pThis->pqDA != NULL) {
             qqueueDestruct(&pThis->pqDA);
         }
-        LogError(0, iRet, "%s: error creating disk queue - giving up.", obj.GetName((obj_t *)pThis));
         pThis->bIsDA = 0;
+        LogError(0, startup_error, "%s: error creating disk queue - giving up.", obj.GetName((obj_t *)pThis));
     }
 
     RETiRet;
@@ -708,6 +943,7 @@ static rsRetVal ATTR_NONNULL() InitDA(qqueue_t *const pThis, const int bLockMute
     }
 
 finalize_it:
+    if (iRet != RS_RET_OK) pThis->bIsDA = 0;
     if (bLockMutex == LOCK_MUTEX) {
         d_pthread_mutex_unlock(pThis->mut);
     }
@@ -912,6 +1148,9 @@ static void qqueueDestroyDiskStreams(qqueue_t *pThis) {
 }
 
 static void qqueueResetRecoveredQueueSize(qqueue_t *pThis, const sbool adjustOverallQueueSize) {
+#ifndef ENABLE_IMDIAG
+    (void)adjustOverallQueueSize;
+#endif
     if (pThis->iQueueSize > 0) {
 #ifdef ENABLE_IMDIAG
         if (adjustOverallQueueSize) {
@@ -925,6 +1164,9 @@ static void qqueueResetRecoveredQueueSize(qqueue_t *pThis, const sbool adjustOve
         pThis->iQueueSize = 0;
     }
     pThis->nLogDeq = 0;
+    if (pThis->qType == QUEUETYPE_DISK || pThis->bIsDA) {
+        pThis->tVars.disk.sizeOnDisk = 0;
+    }
 }
 
 static void qqueueSubtractOverallQueueSize(const int nElem) {
@@ -940,6 +1182,19 @@ static void qqueueSubtractOverallQueueSize(const int nElem) {
 #endif
 }
 
+static void qqueueAddOverallQueueSize(const int nElem) {
+    if (nElem <= 0) {
+        return;
+    }
+#ifdef ENABLE_IMDIAG
+    #ifdef HAVE_ATOMIC_BUILTINS
+    ATOMIC_ADD(iOverallQueueSize, nElem);
+    #else
+    iOverallQueueSize += nElem; /* racy, but we can't wait for a mutex! */
+    #endif
+#endif
+}
+
 static void qqueueAddLogDeq(qqueue_t *pThis, const int nElem) {
 #ifdef HAVE_ATOMIC_BUILTINS
     ATOMIC_ADD(pThis->nLogDeq, nElem);
@@ -950,6 +1205,103 @@ static void qqueueAddLogDeq(qqueue_t *pThis, const int nElem) {
 #endif
 }
 
+static void qqueueAddPhysicalQueueSize(qqueue_t *pThis, const int nElem) {
+#ifdef HAVE_ATOMIC_BUILTINS
+    ATOMIC_ADD(pThis->iQueueSize, nElem);
+#else
+    pthread_mutex_lock(&pThis->mutQueueSize);
+    pThis->iQueueSize += nElem;
+    pthread_mutex_unlock(&pThis->mutQueueSize);
+#endif
+}
+
+/**
+ * @brief Open the segmented store backing a pure or disk-assisted queue.
+ *
+ * The same store implementation backs eager pure segmentedDisk queues and
+ * lazy DA children. For the latter, lazy_create allows open to succeed without
+ * creating files; qAddSegDisk() materializes them when overflow actually
+ * occurs. Recovered logical count is reflected in both child and overall queue
+ * accounting before workers are advised.
+ */
+static rsRetVal qConstructSegDisk(qqueue_t *pThis) {
+    segdisk_store_config_t cfg = {
+        .work_dir = (const char *)pThis->pszSpoolDir,
+        .file_prefix = (const char *)pThis->pszFilePrefix,
+        .queue_name = (const char *)obj.GetName((obj_t *)pThis),
+        .max_file_size = pThis->iMaxFileSize,
+        .max_disk_space = pThis->sizeOnDiskMax,
+        .checkpoint_interval = (unsigned int)pThis->iPersistUpdCnt,
+        .sync_files = pThis->bSyncQueueFiles,
+        .lazy_create = pThis->segdiskLazyCreate,
+    };
+    int recovered = 0;
+    DEFiRet;
+
+    CHKiRet(segdiskStoreOpen(&pThis->tVars.segdisk, &cfg, &recovered));
+    pThis->iQueueSize = recovered;
+    qqueueAddOverallQueueSize(recovered);
+    qqueueUpdateSegDiskStats(pThis);
+
+finalize_it:
+    if (iRet != RS_RET_OK)
+        LogError(0, iRet, "%s: segmentedDisk store initialization failed", obj.GetName((obj_t *)pThis));
+    RETiRet;
+}
+
+static rsRetVal qDestructSegDisk(qqueue_t *pThis) {
+    return segdiskStoreClose(&pThis->tVars.segdisk, getPhysicalQueueSize(pThis) == 0);
+}
+
+/**
+ * @brief Serialize one message into a segmented store and account for DA activity.
+ *
+ * A lazy DA child must durably claim segmentedDisk before its first append can
+ * create .segq. The marker write therefore precedes serialization and remains
+ * pending after a failure. A successful DA append increments the parent
+ * activity generation, invalidating any in-progress idle-dematerialization
+ * grace period. The store consumes no message reference, so this function
+ * always destroys the queue-owned reference before returning.
+ */
+static rsRetVal qAddSegDisk(qqueue_t *pThis, smsg_t *pMsg) {
+    DEFiRet;
+    if (pThis->daEngineMarkerPending) {
+        /* The marker lives in workDirectory beside <prefix>.segq, not inside
+         * that lazy store directory.  StartDA has already validated the
+         * parent spool directory, so publishing the engine choice here can
+         * and must precede segdiskStoreAppend() materializing .segq. */
+        CHKiRet(qdaEngineWriteMarker((const char *)pThis->pszSpoolDir, (const char *)pThis->pszFilePrefix,
+                                     QDA_ENGINE_SEGMENTED_DISK));
+        pThis->daEngineMarkerPending = 0;
+    }
+    CHKiRet(segdiskStoreAppend(pThis->tVars.segdisk, pMsg, 0, NULL));
+    if (pThis->segdiskDAChild) ++pThis->pqParent->daActivityGeneration;
+    qqueueUpdateSegDiskStats(pThis);
+finalize_it:
+    /* The store serializes synchronously and never retains the message. The
+     * queue owns the reference even when serialization or I/O fails. */
+    msgDestruct(&pMsg);
+    RETiRet;
+}
+
+static rsRetVal qDeqBatchSegDisk(qqueue_t *pThis, batch_t *batch, int max, int *skipped) {
+    int discovered = 0;
+    const rsRetVal store_ret = segdiskStoreDequeueBatch(pThis->tVars.segdisk, batch, max, skipped, &discovered);
+    if (discovered > 0) {
+        qqueueAddPhysicalQueueSize(pThis, discovered);
+        qqueueAddOverallQueueSize(discovered);
+    }
+    qqueueUpdateSegDiskStats(pThis);
+    return store_ret == RS_RET_RETRY ? RS_RET_NO_DATA : store_ret;
+}
+
+static rsRetVal qCompleteBatchSegDisk(qqueue_t *pThis, batch_t *batch, int *committed, int *retried) {
+    const rsRetVal r = segdiskStoreCompleteBatch(pThis->tVars.segdisk, batch, committed, retried);
+    if (r == RS_RET_OK && pThis->segdiskDAChild && segdiskStoreCanDematerialize(pThis->tVars.segdisk))
+        pThis->segdiskIdleObservedActivity = pThis->pqParent->daActivityGeneration;
+    qqueueUpdateSegDiskStats(pThis);
+    return r;
+}
 static rsRetVal qqueueSwitchToInMemoryEmergency(qqueue_t *pThis) {
     DEFiRet;
     qqueueResetRecoveredQueueSize(pThis, 1);
@@ -993,6 +1345,27 @@ static sbool fileEntryExistsByNumber(const fileEntry_t *files, int nFiles, int n
     key.number = number;
     key.name = NULL;
     return bsearch(&key, files, (size_t)nFiles, sizeof(fileEntry_t), fileEntryCmpByNumber) != NULL;
+}
+
+static sbool qqueueLoadRetIsStructuralCorruption(rsRetVal loadRet) {
+    /* This classifier is used only by qConstructDisk() after parsing classic
+     * .qi state. Segmented state and DA engine markers have separate fail-fast
+     * validation paths and never reach it. Do not classify the generic
+     * RS_RET_INVALID_VALUE here: it is not a classic deserializer framing
+     * result and may represent a non-corruption startup/configuration error. */
+    static const rsRetVal structural_errors[] = {
+        RS_RET_FILE_TRUNCATED,      RS_RET_EOF,
+        RS_RET_INVALID_OID,         RS_RET_INVALID_HEADER,
+        RS_RET_INVALID_HEADER_VERS, RS_RET_INVALID_DELIMITER,
+        RS_RET_INVALID_PROPFRAME,   RS_RET_NO_PROPLINE,
+        RS_RET_INVALID_TRAILER,     RS_RET_INVALID_HEADER_RECTYPE,
+        RS_RET_QTYPE_MISMATCH,      RS_RET_SYNTAX_ERROR,
+        RS_RET_DS_PROP_SEQ_ERR,     RS_RET_INVLD_PROP,
+    };
+    for (size_t i = 0; i < sizeof(structural_errors) / sizeof(structural_errors[0]); ++i) {
+        if (loadRet == structural_errors[i]) return 1;
+    }
+    return 0;
 }
 
 static rsRetVal qqueueVerifyAndRecover(qqueue_t *pThis, rsRetVal loadRet) {
@@ -1175,6 +1548,13 @@ static rsRetVal qqueueVerifyAndRecover(qqueue_t *pThis, rsRetVal loadRet) {
             corruptionDetected = 1;
             LogError(0, RS_RET_ERR, "queue corruption: .qi file missing or inaccessible but %d segment files exist",
                      nFiles);
+        } else if (qqueueLoadRetIsStructuralCorruption(loadRet)) {
+            /* Only deterministic parser/framing failures prove that the .qi
+             * contents are corrupt.  I/O, access, allocation, and other
+             * operational failures retain loadRet and fail startup so a
+             * transient storage problem can never quarantine healthy state. */
+            corruptionDetected = 1;
+            LogError(0, RS_RET_ERR, "queue corruption: .qi file is invalid and contains no usable queue state");
         }
     }
 
@@ -1539,6 +1919,7 @@ static rsRetVal qqueueLoadPersStrmInfoFixup(strm_t *pStrm, qqueue_t __attribute_
     ISOBJ_TYPE_assert(pThis, qqueue);
     CHKiRet(strm.SetDir(pStrm, pThis->pszSpoolDir, pThis->lenSpoolDir));
     CHKiRet(strm.SetbSync(pStrm, pThis->bSyncQueueFiles));
+    CHKiRet(strm.SetbNoFollowFinal(pStrm, 1));
 finalize_it:
     RETiRet;
 }
@@ -1571,6 +1952,7 @@ static rsRetVal qqueueTryLoadPersistedInfo(qqueue_t *pThis) {
     CHKiRet(strm.Construct(&psQIF));
     CHKiRet(strm.SettOperationsMode(psQIF, STREAMMODE_READ));
     CHKiRet(strm.SetsType(psQIF, STREAMTYPE_FILE_SINGLE));
+    CHKiRet(strm.SetbNoFollowFinal(psQIF, 1));
     CHKiRet(strm.SetFName(psQIF, pThis->pszQIFNam, pThis->lenQIFNam));
     CHKiRet(strm.ConstructFinalize(psQIF));
 
@@ -1667,6 +2049,7 @@ static rsRetVal qConstructDisk(qqueue_t *pThis) {
         CHKiRet(strm.SetiMaxFiles(pThis->tVars.disk.pWrite, MAX_DISK_QUEUE_FILES));
         CHKiRet(strm.SettOperationsMode(pThis->tVars.disk.pWrite, STREAMMODE_WRITE));
         CHKiRet(strm.SetsType(pThis->tVars.disk.pWrite, STREAMTYPE_FILE_CIRCULAR));
+        CHKiRet(strm.SetbNoFollowFinal(pThis->tVars.disk.pWrite, 1));
         if (pThis->useCryprov) {
             CHKiRet(strm.Setcryprov(pThis->tVars.disk.pWrite, &pThis->cryprov));
             CHKiRet(strm.SetcryprovData(pThis->tVars.disk.pWrite, pThis->cryprovData));
@@ -1679,6 +2062,7 @@ static rsRetVal qConstructDisk(qqueue_t *pThis) {
         CHKiRet(strm.SetiMaxFiles(pThis->tVars.disk.pReadDeq, MAX_DISK_QUEUE_FILES));
         CHKiRet(strm.SettOperationsMode(pThis->tVars.disk.pReadDeq, STREAMMODE_READ));
         CHKiRet(strm.SetsType(pThis->tVars.disk.pReadDeq, STREAMTYPE_FILE_CIRCULAR));
+        CHKiRet(strm.SetbNoFollowFinal(pThis->tVars.disk.pReadDeq, 1));
         if (pThis->useCryprov) {
             CHKiRet(strm.Setcryprov(pThis->tVars.disk.pReadDeq, &pThis->cryprov));
             CHKiRet(strm.SetcryprovData(pThis->tVars.disk.pReadDeq, pThis->cryprovData));
@@ -1692,6 +2076,7 @@ static rsRetVal qConstructDisk(qqueue_t *pThis) {
         CHKiRet(strm.SetiMaxFiles(pThis->tVars.disk.pReadDel, MAX_DISK_QUEUE_FILES));
         CHKiRet(strm.SettOperationsMode(pThis->tVars.disk.pReadDel, STREAMMODE_READ));
         CHKiRet(strm.SetsType(pThis->tVars.disk.pReadDel, STREAMTYPE_FILE_CIRCULAR));
+        CHKiRet(strm.SetbNoFollowFinal(pThis->tVars.disk.pReadDel, 1));
         if (pThis->useCryprov) {
             CHKiRet(strm.Setcryprov(pThis->tVars.disk.pReadDel, &pThis->cryprov));
             CHKiRet(strm.SetcryprovData(pThis->tVars.disk.pReadDel, pThis->cryprovData));
@@ -1744,6 +2129,11 @@ static rsRetVal ATTR_NONNULL(1, 2) qAddDisk(qqueue_t *const pThis, smsg_t *pMsg)
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, qqueue);
     ISOBJ_TYPE_assert(pMsg, msg);
+    if (pThis->daEngineMarkerPending) {
+        CHKiRet(qdaEngineWriteMarker((const char *)pThis->pszSpoolDir, (const char *)pThis->pszFilePrefix,
+                                     QDA_ENGINE_DISK));
+        pThis->daEngineMarkerPending = 0;
+    }
     number_t nWriteCount;
     const int oldfile = strmGetCurrFileNum(pThis->tVars.disk.pWrite);
 
@@ -1927,7 +2317,7 @@ static rsRetVal qAddDirect(qqueue_t *pThis, smsg_t *pMsg) {
     DEFiRet;
 
     pWti = wtiGetDummy();
-    pWti->pbShutdownImmediate = &pThis->bShutdownImmediate;
+    qqueueSetWtiShutdownImmediate(pThis, pWti);
     iRet = qAddDirectWithWti(pThis, pMsg, pWti);
     RETiRet;
 }
@@ -1957,6 +2347,14 @@ static rsRetVal qqueueAdd(qqueue_t *pThis, smsg_t *pMsg) {
     }
 
     CHKiRet(pThis->qAdd(pThis, pMsg));
+
+    if (pThis->bIsDA && pThis->pqDA != NULL && pThis->pqDA->segdiskDAChild) {
+        /* Parent and DA child intentionally share this queue mutex. The idle
+         * callback therefore observes this activity generation atomically
+         * with both producer enqueue and child store operations. */
+        ++pThis->daActivityGeneration;
+        if (pThis->pqDA->pWtpReg != NULL) wtpWakeupAllWrkr(pThis->pqDA->pWtpReg);
+    }
 
     if (pThis->qType != QUEUETYPE_DIRECT) {
         ATOMIC_INC(&pThis->iQueueSize, &pThis->mutQueueSize);
@@ -2072,11 +2470,11 @@ static rsRetVal tryShutdownWorkersWithinActionTimeout(qqueue_t *pThis) {
     DBGOPRINT((obj_t *)pThis, "trying to shutdown workers within Action Timeout");
     DBGOPRINT((obj_t *)pThis, "setting EnqOnly mode\n");
     pThis->bEnqOnly = 1;
-    pThis->bShutdownImmediate = 1;
+    qqueueSetShutdownImmediate(pThis, 1);
     /* now DA queue */
     if (pThis->bIsDA) {
         pThis->pqDA->bEnqOnly = 1;
-        pThis->pqDA->bShutdownImmediate = 1;
+        qqueueSetShutdownImmediate(pThis->pqDA, 1);
     }
 
     /* now give the queue workers a last chance to gracefully shut down (based on action timeout setting) */
@@ -2141,6 +2539,7 @@ static rsRetVal tryShutdownWorkersWithinActionTimeout(qqueue_t *pThis) {
  */
 static rsRetVal cancelWorkers(qqueue_t *pThis) {
     rsRetVal iRetLocal;
+    struct timespec tTimeout;
     DEFiRet;
 
     assert(pThis->qType != QUEUETYPE_DIRECT);
@@ -2158,6 +2557,11 @@ static rsRetVal cancelWorkers(qqueue_t *pThis) {
                   "threads, continuing, but results are unpredictable\n",
                   iRetLocal);
     }
+    timeoutComp(&tTimeout, QUEUE_TIMEOUT_ETERNAL);
+    iRetLocal = wtpShutdownAll(pThis->pWtpReg, wtpState_SHUTDOWN_IMMEDIATE, &tTimeout);
+    if (iRetLocal != RS_RET_OK) {
+        DBGOPRINT((obj_t *)pThis, "unexpected state %d joining cancelled primary workers\n", iRetLocal);
+    }
 
     /* ... and now the DA queue, if it exists (should always be after the primary one) */
     if (pThis->pqDA != NULL) {
@@ -2172,6 +2576,11 @@ static rsRetVal cancelWorkers(qqueue_t *pThis) {
                       "threads, continuing, but results are unpredictable\n",
                       iRetLocal);
         }
+        timeoutComp(&tTimeout, QUEUE_TIMEOUT_ETERNAL);
+        iRetLocal = wtpShutdownAll(pThis->pqDA->pWtpReg, wtpState_SHUTDOWN_IMMEDIATE, &tTimeout);
+        if (iRetLocal != RS_RET_OK) {
+            DBGOPRINT((obj_t *)pThis, "unexpected state %d joining cancelled DA child workers\n", iRetLocal);
+        }
 
         /* finally, we cancel the main queue's DA worker pool, if it still is running. It may be
          * restarted later to persist the queue. But we stop it, because otherwise we get into
@@ -2181,6 +2590,11 @@ static rsRetVal cancelWorkers(qqueue_t *pThis) {
         DBGOPRINT((obj_t *)pThis, "checking to see if main queue DA worker pool needs to be cancelled\n");
         wtpCancelAll(pThis->pWtpDA, objGetName((obj_t *)pThis));
         /* returns immediately if all threads already have terminated */
+        timeoutComp(&tTimeout, QUEUE_TIMEOUT_ETERNAL);
+        iRetLocal = wtpShutdownAll(pThis->pWtpDA, wtpState_SHUTDOWN_IMMEDIATE, &tTimeout);
+        if (iRetLocal != RS_RET_OK) {
+            DBGOPRINT((obj_t *)pThis, "unexpected state %d joining cancelled DA transfer workers\n", iRetLocal);
+        }
     }
 
     RETiRet;
@@ -2219,19 +2633,22 @@ rsRetVal ATTR_NONNULL(1) qqueueShutdownWorkers(qqueue_t *const pThis) {
     CHKiRet(tryShutdownWorkersWithinQueueTimeout(pThis));
 
     pthread_mutex_lock(pThis->mut);
-    int physQueueSize;
-    physQueueSize = getPhysicalQueueSize(pThis);
+    const int parent_phys_queue_size = getPhysicalQueueSize(pThis);
+    const int child_phys_queue_size = pThis->pqDA == NULL ? 0 : getPhysicalQueueSize(pThis->pqDA);
     pthread_mutex_unlock(pThis->mut);
-    if (physQueueSize > 0) {
+    /* The DA transfer worker can empty the memory parent while the disk child
+     * still owns queued or in-flight work.  Skipping the action-completion
+     * phase in that state sends the child directly to cancellation, which can
+     * discard an action at the cancellation boundary.  Parent and child share
+     * the queue mutex, so inspect both at one stable point. */
+    if (parent_phys_queue_size > 0 || child_phys_queue_size > 0) {
         CHKiRet(tryShutdownWorkersWithinActionTimeout(pThis));
     }
 
     CHKiRet(cancelWorkers(pThis));
 
-    /* ... finally ... all worker threads have terminated :-)
-     * Well, more precisely, they *are in termination*. Some cancel cleanup handlers
-     * may still be running. Note that the main queue's DA worker may still be running.
-     */
+    /* All worker threads have terminated and been joined. This stable point is
+     * required before save-on-shutdown may restart the DA transfer pool. */
     DBGOPRINT((obj_t *)pThis, "worker threads terminated, remaining queue size log %d, phys %d.\n",
               getLogicalQueueSize(pThis), getPhysicalQueueSize(pThis));
 
@@ -2281,6 +2698,9 @@ rsRetVal qqueueConstruct(qqueue_t **ppThis,
     pThis->iMinDeqBatchSize = 0; /* conservative default, should still provide good performance */
     pThis->isRunning = 0;
     pThis->onCorruption = QUEUE_ON_CORRUPTION_SAFE_MODE;
+    pThis->diskQueueType = QDA_ENGINE_AUTO;
+    pThis->effectiveDiskQueueType = QDA_ENGINE_AUTO;
+    pThis->diskQueueIdleTimeout = 60000;
 
     pThis->pszFilePrefix = NULL;
     pThis->qType = qType;
@@ -2288,6 +2708,9 @@ rsRetVal qqueueConstruct(qqueue_t **ppThis,
 
     INIT_ATOMIC_HELPER_MUT(pThis->mutQueueSize);
     INIT_ATOMIC_HELPER_MUT(pThis->mutLogDeq);
+    INIT_ATOMIC_HELPER_MUT(pThis->mutShutdownImmediate);
+    STATSCOUNTER_INIT(pThis->ctrMutexContention, pThis->mutCtrMutexContention);
+    STATSCOUNTER_INIT(pThis->ctrMutexWaitNs, pThis->mutCtrMutexWaitNs);
     CHKiRet(qqueueSetiNumWorkerThreads(pThis, iWorkerThreads));
 
 finalize_it:
@@ -2328,6 +2751,7 @@ void qqueueSetDefaultsActionQueue(qqueue_t *pThis) {
     pThis->iDeqtWinFromHr = 0;
     pThis->iDeqtWinToHr = 25; /* disable time-windowed dequeuing by default */
     pThis->iSmpInterval = 0; /* disable sampling */
+    pThis->bMutexContentionStats = 0;
     pThis->onCorruption = QUEUE_ON_CORRUPTION_SAFE_MODE;
 }
 
@@ -2360,6 +2784,7 @@ void qqueueSetDefaultsRulesetQueue(qqueue_t *pThis) {
     pThis->iDeqtWinFromHr = 0;
     pThis->iDeqtWinToHr = 25; /* disable time-windowed dequeuing by default */
     pThis->iSmpInterval = 0; /* disable sampling */
+    pThis->bMutexContentionStats = 0;
     pThis->onCorruption = QUEUE_ON_CORRUPTION_SAFE_MODE;
 }
 
@@ -2497,7 +2922,7 @@ static void recoverFromInvalidQi(qqueue_t *pThis, const int wr_fd, const int64_t
  */
 static rsRetVal ATTR_NONNULL(1) DoDeleteBatchFromQStore(qqueue_t *const pThis, const int nElem) {
     int i;
-    off64_t bytesDel = 0; /* keep CLANG static anaylzer happy */
+    off64_t bytesDel = 0; /* keep CLANG static analyzer happy */
     DEFiRet;
 
     ISOBJ_TYPE_assert(pThis, qqueue);
@@ -2525,7 +2950,15 @@ static rsRetVal ATTR_NONNULL(1) DoDeleteBatchFromQStore(qqueue_t *const pThis, c
             /* awake possibly waiting enq process */
             pthread_cond_signal(&pThis->notFull); /* we hold the mutex while we are in here! */
         }
-    } else { /* memory queue */
+    } else if (pThis->qType == QUEUETYPE_FIXED_ARRAY) {
+        /* RAM retirement releases completed counts, not the original slots of
+         * this batch: another worker may finish an older batch later. Batch
+         * pointers own the messages independently of these reusable slots.
+         * Subtraction avoids overflowing head + nElem near INT_MAX. */
+        const int remaining = pThis->iMaxQueueSize - pThis->tVars.farray.head;
+        assert(nElem >= 0 && nElem <= pThis->iMaxQueueSize);
+        pThis->tVars.farray.head = nElem >= remaining ? nElem - remaining : pThis->tVars.farray.head + nElem;
+    } else { /* linked-list memory queue */
         for (i = 0; i < nElem; ++i) {
             pThis->qDel(pThis);
         }
@@ -2566,9 +2999,9 @@ typedef enum tdlPhase_e { TDL_EMPTY, TDL_PROCESS_HEAD, TDL_QUEUE } tdlPhase_t;
  *   current batch.
  * - TDL_QUEUE:  current batch cannot be deleted and is queued for later.
  *
- * The dequeue identifier advances strictly monotonically, ensuring
- * deterministic order and proper resource release for both disk and
- * memory queue implementations.
+ * RAM batches release completed counts, including out-of-order worker
+ * completions when the list is empty. Do not turn this into an ordered RAM
+ * retirement frontier: workers already own independent message references.
  */
 static rsRetVal DeleteBatchFromQStore(qqueue_t *pThis, batch_t *pBatch) {
     toDeleteLst_t *pTdl;
@@ -2624,12 +3057,47 @@ finalize_it:
 }
 
 
+/* Concurrency & Locking: completed batch references move to a worker-owned
+ * buffer under the queue mutex, after store commit. The buffer holds at most
+ * one batch and is drained without the queue mutex and with cancellation
+ * disabled. No other worker, producer, or shutdown path accesses this buffer.
+ */
+static void qqueueDrainDeferred(wti_t *const pWti) {
+    for (int i = 0; i < pWti->n_deferred_msgs; ++i) {
+        msgDestruct(&pWti->p_deferred_msgs[i]);
+    }
+    pWti->n_deferred_msgs = 0;
+}
+
+/* Exceptional idle/minbatch/cleanup path: never retain a completed batch
+ * across a condition wait. Recheck queue predicates after reacquiring. */
+static void qqueueDrainDeferredLocked(qqueue_t *const pThis, wti_t *const pWti) {
+    if (pWti->n_deferred_msgs != 0) {
+        d_pthread_mutex_unlock(pThis->mut);
+        qqueueDrainDeferred(pWti);
+        qqueueLock(pThis);
+    }
+}
+
+static void qqueueDeferBatch(wti_t *const pWti) {
+    batch_t *const pBatch = &pWti->batch;
+    assert(pWti->n_deferred_msgs == 0);
+    assert(pBatch->nElem <= pBatch->maxElem);
+    for (int i = 0; i < pBatch->nElem; ++i) {
+        pWti->p_deferred_msgs[i] = pBatch->pElem[i].pMsg;
+        pBatch->pElem[i].pMsg = NULL;
+    }
+    pWti->n_deferred_msgs = pBatch->nElem;
+    pBatch->nElem = pBatch->nElemDeq = 0;
+}
+
 /* Delete a batch of processed user objects from the queue, which includes
  * destructing the objects themself. Any entries not marked as finally
  * processed are enqueued again. The new enqueue is necessary because we have a
  * rgerhards, 2009-05-13
  */
-static rsRetVal DeleteProcessedBatch(qqueue_t *pThis, batch_t *pBatch) {
+static rsRetVal DeleteProcessedBatch(qqueue_t *pThis, wti_t *pWti) {
+    batch_t *const pBatch = &pWti->batch;
     int i;
     smsg_t *pMsg;
     int nEnqueued = 0;
@@ -2638,6 +3106,32 @@ static rsRetVal DeleteProcessedBatch(qqueue_t *pThis, batch_t *pBatch) {
 
     ISOBJ_TYPE_assert(pThis, qqueue);
     assert(pBatch != NULL);
+
+    if (pThis->qCompleteBatch != NULL && pBatch->storeData != NULL) {
+        int committed = 0;
+        int retried = 0;
+        iRet = pThis->qCompleteBatch(pThis, pBatch, &committed, &retried);
+        if (iRet != RS_RET_OK) RETiRet;
+        /* committed is the physical-record count. It intentionally includes
+         * salvaged corrupt records because recovery included those records in
+         * iQueueSize; retried counts only decoded messages appended again. */
+        if (committed > retried) {
+            const int removed = committed - retried;
+            ATOMIC_SUB(&pThis->iQueueSize, removed, &pThis->mutQueueSize);
+            qqueueSubtractOverallQueueSize(removed);
+            /* A producer may be waiting on either the logical queue limit or
+             * segmented-store disk space released by this completion. */
+            pthread_cond_signal(&pThis->notFull);
+        } else if (retried > committed) {
+            const int added = retried - committed;
+            qqueueAddPhysicalQueueSize(pThis, added);
+            qqueueAddOverallQueueSize(added);
+        }
+        ATOMIC_SUB(&pThis->nLogDeq, committed, &pThis->mutLogDeq);
+        qqueueDeferBatch(pWti);
+        pBatch->storeData = NULL;
+        RETiRet;
+    }
 
     for (i = 0; i < pBatch->nElem; ++i) {
         pMsg = pBatch->pElem[i].pMsg;
@@ -2652,7 +3146,6 @@ static rsRetVal DeleteProcessedBatch(qqueue_t *pThis, batch_t *pBatch) {
                     localRet);
             }
         }
-        msgDestruct(&pMsg);
     }
 
     DBGPRINTF("DeleteProcessedBatch: we deleted %d objects and enqueued %d objects\n", i - nEnqueued, nEnqueued);
@@ -2661,7 +3154,7 @@ static rsRetVal DeleteProcessedBatch(qqueue_t *pThis, batch_t *pBatch) {
 
     iRet = DeleteBatchFromQStore(pThis, pBatch);
 
-    pBatch->nElem = pBatch->nElemDeq = 0; /* reset batch */  // TODO: more fine init, new fields! 2010-06-14
+    qqueueDeferBatch(pWti);
 
     RETiRet;
 }
@@ -2693,9 +3186,40 @@ static rsRetVal ATTR_NONNULL() DequeueConsumableElements(qqueue_t *const pThis,
     DEFiRet;
 
     nDeleted = pWti->batch.nElemDeq;
-    DeleteProcessedBatch(pThis, &pWti->batch);
+    localRet = DeleteProcessedBatch(pThis, pWti);
+    if (pThis->qCompleteBatch != NULL) CHKiRet(localRet);
 
     nDequeued = nDiscarded = 0;
+    if (pThis->qDeqBatch != NULL) {
+        localRet = pThis->qDeqBatch(pThis, &pWti->batch, pThis->iDeqBatchSize, pSkippedMsgs);
+        if (localRet == RS_RET_NO_DATA) {
+            /* With a returned batch, framed corrupt records are included in
+             * nElemDeq and retired by qCompleteBatch. Only an all-corrupt
+             * result has no batch context, so retire those records here. */
+            if (*pSkippedMsgs > 0) {
+                ATOMIC_SUB(&pThis->iQueueSize, *pSkippedMsgs, &pThis->mutQueueSize);
+                qqueueSubtractOverallQueueSize(*pSkippedMsgs);
+            }
+            pWti->batch.nElem = pWti->batch.nElemDeq = 0;
+            *piRemainingQueueSize = getLogicalQueueSize(pThis);
+            iRet = RS_RET_OK;
+            FINALIZE;
+        }
+        CHKiRet(localRet);
+        for (int i = 0; i < pWti->batch.nElem; ++i) {
+            localRet = qqueueChkDiscardMsg(pThis, pThis->iQueueSize, pWti->batch.pElem[i].pMsg);
+            if (localRet == RS_RET_QUEUE_FULL) {
+                pWti->batch.eltState[i] = BATCH_STATE_DISC;
+                ++nDiscarded;
+            } else {
+                CHKiRet(localRet);
+            }
+        }
+        qqueueAddLogDeq(pThis, pWti->batch.nElemDeq);
+        pWti->batch.deqID = getNextDeqID(pThis);
+        *piRemainingQueueSize = getLogicalQueueSize(pThis);
+        FINALIZE;
+    }
     if (pThis->qType == QUEUETYPE_DISK) {
         pThis->tVars.disk.deqFileNumIn = strmGetCurrFileNum(pThis->tVars.disk.pReadDeq);
         pThis->tVars.disk.runtimeCorruptionSkip = 0;
@@ -2894,7 +3418,8 @@ static rsRetVal ATTR_NONNULL() DequeueConsumableElements(qqueue_t *const pThis,
         pWti->batch.eltState[nDequeued] = BATCH_STATE_RDY;
         ++nDequeued;
         if (nDequeued < iMinDeqBatchSize && getLogicalQueueSize(pThis) == 0) {
-            while (!pThis->bShutdownImmediate && keep_running && nDequeued < iMinDeqBatchSize &&
+            qqueueDrainDeferredLocked(pThis, pWti);
+            while (!qqueueIsShutdownImmediate(pThis) && keep_running && nDequeued < iMinDeqBatchSize &&
                    getLogicalQueueSize(pThis) == 0) {
                 dbgprintf(
                     "%s minDeqBatchSize doing wait, batch is %d messages, "
@@ -2957,7 +3482,10 @@ static rsRetVal DequeueConsumable(qqueue_t *pThis, wti_t *pWti, int *const pSkip
     /* dequeue element batch (still protected from mutex) */
     iRet = DequeueConsumableElements(pThis, pWti, &iQueueSize, pSkippedMsgs);
     if (*pSkippedMsgs > 0) {
-        if (pThis->qType == QUEUETYPE_DISK && pThis->tVars.disk.runtimeCorruptionSkip) {
+        if (pThis->qType == QUEUETYPE_SEGMENTED_DISK) {
+            LogMsg(0, RS_RET_ERR, LOG_ERR, "%s: segmentedDisk salvage skipped %d corrupt records",
+                   obj.GetName((obj_t *)pThis), *pSkippedMsgs);
+        } else if (pThis->qType == QUEUETYPE_DISK && pThis->tVars.disk.runtimeCorruptionSkip) {
             LogMsg(0, RS_RET_ERR, LOG_ERR, "%s: skipped %d messages from diskqueue during runtime corruption handling",
                    obj.GetName((obj_t *)pThis), *pSkippedMsgs);
         } else {
@@ -3087,7 +3615,7 @@ static rsRetVal RateLimiter(qqueue_t *pThis) {
         pthread_mutex_unlock(pThis->mut);
         DBGOPRINT((obj_t *)pThis, "outside dequeue time window, delaying %d seconds\n", iDelay);
         srSleep(iDelay, 0);
-        pthread_mutex_lock(pThis->mut);
+        qqueueLock(pThis);
     }
 
     RETiRet;
@@ -3104,12 +3632,18 @@ static rsRetVal DequeueForConsumer(qqueue_t *pThis, wti_t *pWti, int *const pSki
     ISOBJ_TYPE_assert(pThis, qqueue);
     ISOBJ_TYPE_assert(pWti, wti);
 
+retry_dequeue:
     CHKiRet(DequeueConsumable(pThis, pWti, pSkippedMsgs));
 
     if (pWti->batch.nElem == 0) ABORT_FINALIZE(RS_RET_IDLE);
 
-
 finalize_it:
+    if (iRet != RS_RET_OK && pWti->n_deferred_msgs != 0) {
+        qqueueDrainDeferredLocked(pThis, pWti);
+        /* An enqueue during disposal could not signal us as a waiter yet.
+         * Retest under the mutex before returning IDLE to the wait loop. */
+        if (iRet == RS_RET_IDLE && getLogicalQueueSize(pThis) > 0) goto retry_dequeue;
+    }
     RETiRet;
 }
 
@@ -3131,10 +3665,14 @@ static rsRetVal batchProcessed(qqueue_t *pThis, wti_t *pWti) {
     ISOBJ_TYPE_assert(pWti, wti);
 
     int iCancelStateSave;
+    /* DeleteProcessedBatch() defers final message destruction by resetting
+     * the batch counters, so retain the dequeue count for checkpointing. */
+    const int nElemDeq = pWti->batch.nElemDeq;
     /* at this spot, we must not be cancelled */
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iCancelStateSave);
-    DeleteProcessedBatch(pThis, &pWti->batch);
-    qqueueChkPersist(pThis, pWti->batch.nElemDeq);
+    DeleteProcessedBatch(pThis, pWti);
+    qqueueChkPersist(pThis, nElemDeq);
+    qqueueDrainDeferredLocked(pThis, pWti);
     pthread_setcancelstate(iCancelStateSave, NULL);
 
     RETiRet;
@@ -3146,7 +3684,7 @@ static rsRetVal batchProcessed(qqueue_t *pThis, wti_t *pWti) {
  * rgerhards, 2008-01-21
  */
 static rsRetVal ConsumerReg(qqueue_t *pThis, wti_t *pWti) {
-    int iCancelStateSave;
+    int iCancelStateSave = PTHREAD_CANCEL_DISABLE;
     int bNeedReLock = 0; /**< do we need to lock the mutex again? */
     int skippedMsgs = 0; /**< did the queue loose any messages (can happen with
                           ** disk queue if .qi file is corrupt */
@@ -3162,7 +3700,7 @@ static rsRetVal ConsumerReg(qqueue_t *pThis, wti_t *pWti) {
         DBGOPRINT((obj_t *)pThis, "got 'file not found' error %d, queue defunct\n", iRet);
         iRet = queueSwitchToEmergencyMode(pThis, iRet);
         // TODO: think about what to return as iRet -- keep RS_RET_FILE_NOT_FOUND?
-        d_pthread_mutex_lock(pThis->mut);
+        qqueueLock(pThis);
     }
     if (iRet != RS_RET_OK) {
         FINALIZE;
@@ -3171,21 +3709,23 @@ static rsRetVal ConsumerReg(qqueue_t *pThis, wti_t *pWti) {
     /* we now have a non-idle batch of work, so we can release the queue mutex and process it */
     d_pthread_mutex_unlock(pThis->mut);
     bNeedReLock = 1;
+    qqueueDrainDeferred(pWti);
 
     /* report errors, now that we are outside of queue lock */
     if (skippedMsgs > 0) {
-        LogError(0, 0,
-                 "problem on disk queue '%s': "
-                 "queue files contain %d messages fewer than specified "
-                 "in .qi file -- we lost those messages. That's all we know.",
-                 obj.GetName((obj_t *)pThis), skippedMsgs);
+        if (pThis->qType != QUEUETYPE_SEGMENTED_DISK)
+            LogError(0, 0,
+                     "problem on disk queue '%s': "
+                     "queue files contain %d messages fewer than specified "
+                     "in .qi file -- we lost those messages. That's all we know.",
+                     obj.GetName((obj_t *)pThis), skippedMsgs);
     }
 
     /* at this spot, we may be cancelled */
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &iCancelStateSave);
 
 
-    pWti->pbShutdownImmediate = &pThis->bShutdownImmediate;
+    qqueueSetWtiShutdownImmediate(pThis, pWti);
     CHKiRet(pThis->pConsumer(pThis->pAction, &pWti->batch, pWti));
 
     /* we now need to check if we should deliberately delay processing a bit
@@ -3196,15 +3736,15 @@ static rsRetVal ConsumerReg(qqueue_t *pThis, wti_t *pWti) {
         srSleep(pThis->iDeqSlowdown / 1000000, pThis->iDeqSlowdown % 1000000);
     }
 
-    /* but now cancellation is no longer permitted */
-    pthread_setcancelstate(iCancelStateSave, NULL);
-
 finalize_it:
+    /* Consumer errors also leave cancellation disabled before taking the
+     * queue mutex. The cancel handler therefore always enters unlocked. */
+    pthread_setcancelstate(iCancelStateSave, NULL);
     DBGPRINTF("regular consumer finished, iret=%d, szlog %d sz phys %d\n", iRet, getLogicalQueueSize(pThis),
               getPhysicalQueueSize(pThis));
 
     /* now we are done, but potentially need to re-acquire the mutex */
-    if (bNeedReLock) d_pthread_mutex_lock(pThis->mut);
+    if (bNeedReLock) qqueueLock(pThis);
 
     RETiRet;
 }
@@ -3221,7 +3761,7 @@ finalize_it:
  */
 static rsRetVal ConsumerDA(qqueue_t *pThis, wti_t *pWti) {
     int i;
-    int iCancelStateSave;
+    int iCancelStateSave = PTHREAD_CANCEL_DISABLE;
     int bNeedReLock = 0; /**< do we need to lock the mutex again? */
     int skippedMsgs = 0;
     DEFiRet;
@@ -3234,12 +3774,13 @@ static rsRetVal ConsumerDA(qqueue_t *pThis, wti_t *pWti) {
     /* we now have a non-idle batch of work, so we can release the queue mutex and process it */
     d_pthread_mutex_unlock(pThis->mut);
     bNeedReLock = 1;
+    qqueueDrainDeferred(pWti);
 
     /* at this spot, we may be cancelled */
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &iCancelStateSave);
 
     /* iterate over returned results and enqueue them in DA queue */
-    for (i = 0; i < pWti->batch.nElem && !pThis->bShutdownImmediate; i++) {
+    for (i = 0; i < pWti->batch.nElem && !qqueueIsShutdownImmediate(pThis); i++) {
         iRet = qqueueEnqMsg(pThis->pqDA, eFLOWCTL_NO_DELAY, MsgAddRef(pWti->batch.pElem[i].pMsg));
         if (iRet != RS_RET_OK) {
             if (iRet == RS_RET_ERR_QUEUE_EMERGENCY) {
@@ -3253,15 +3794,23 @@ static rsRetVal ConsumerDA(qqueue_t *pThis, wti_t *pWti) {
                           "ConsumerDA:qqueueEnqMsg item (%d) returned "
                           "with error state: '%d'\n",
                           i, iRet);
+                if (pThis->pqDA->qType == QUEUETYPE_SEGMENTED_DISK) {
+                    /* The segmented child may fail before the event becomes
+                     * durable (for example while publishing its engine marker
+                     * or materializing the store). Leave this and the
+                     * remaining batch elements uncommitted so normal parent
+                     * retry handling preserves them. Classic DA behavior is
+                     * intentionally unchanged. */
+                    break;
+                }
             }
         }
         pWti->batch.eltState[i] = BATCH_STATE_COMM; /* commited to other queue! */
     }
 
-    /* but now cancellation is no longer permitted */
-    pthread_setcancelstate(iCancelStateSave, NULL);
-
 finalize_it:
+    /* Early errors must also restore the queue-locked cancellation contract. */
+    pthread_setcancelstate(iCancelStateSave, NULL);
     /*	Check the last return state of qqueueEnqMsg. If an error was returned, we acknowledge it only.
      *	Unless the error code is RS_RET_ERR_QUEUE_EMERGENCY, we reset the return state to RS_RET_OK.
      *	Otherwise the Caller functions would run into an infinite Loop trying to enqueue the
@@ -3289,7 +3838,7 @@ finalize_it:
     }
 
     /* now we are done, but potentially need to re-acquire the mutex */
-    if (bNeedReLock) d_pthread_mutex_lock(pThis->mut);
+    if (bNeedReLock) qqueueLock(pThis);
 
     RETiRet;
 }
@@ -3316,8 +3865,9 @@ static rsRetVal qqueueChkStopWrkrDA(qqueue_t *pThis) {
 
 /* must only be called when the queue mutex is locked, else results
  * are not stable!
- * If we are a child, we have done our duty when the queue is empty. In that case,
- * we can terminate. Version for the regular worker thread.
+ * Version for the regular worker thread. DA child queues intentionally keep
+ * their regular worker alive while idle so worker-instance state, such as
+ * output connections, survives short refill gaps.
  */
 static rsRetVal ChkStopWrkrReg(qqueue_t *pThis) {
     DEFiRet;
@@ -3325,8 +3875,6 @@ static rsRetVal ChkStopWrkrReg(qqueue_t *pThis) {
     pThis->iLowWtrMrk, getLogicalQueueSize(pThis), getPhysicalQueueSize(pThis), pThis->bEnqOnly);*/
     if (pThis->bEnqOnly) {
         iRet = RS_RET_TERMINATE_NOW;
-    } else if (pThis->pqParent != NULL) {
-        iRet = RS_RET_TERMINATE_WHEN_IDLE;
     }
 
     RETiRet;
@@ -3373,9 +3921,17 @@ rsRetVal qqueueStart(rsconf_t *cnf, qqueue_t *pThis) /* this is the Construction
             ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
         pThis->lenSpoolDir = ustrlen(pThis->pszSpoolDir);
     }
+    if (pThis->qType == QUEUETYPE_SEGMENTED_DISK && pThis->pszSpoolDir[0] == '\0') {
+        LogError(0, RS_RET_CONF_PARAM_INVLD,
+                 "error on queue '%s': segmentedDisk requires queue.spoolDirectory or a global workDirectory",
+                 obj.GetName((obj_t *)pThis));
+        ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+    }
     /* set type-specific handlers and other very type-specific things
      * (we can not totally hide it...)
      */
+    pThis->qDeqBatch = NULL;
+    pThis->qCompleteBatch = NULL;
     switch (pThis->qType) {
         case QUEUETYPE_FIXED_ARRAY:
             pThis->qConstruct = qConstructFixedArray;
@@ -3405,6 +3961,16 @@ rsRetVal qqueueStart(rsconf_t *cnf, qqueue_t *pThis) /* this is the Construction
                                         (char *)pThis->pszFilePrefix);
             pThis->pszQIFNam = ustrdup(pszQIFNam);
             DBGOPRINT((obj_t *)pThis, ".qi file name is '%s', len %d\n", pThis->pszQIFNam, (int)pThis->lenQIFNam);
+            break;
+        case QUEUETYPE_SEGMENTED_DISK:
+            pThis->qConstruct = qConstructSegDisk;
+            pThis->qDestruct = qDestructSegDisk;
+            pThis->qAdd = qAddSegDisk;
+            pThis->qDeq = NULL;
+            pThis->qDel = NULL;
+            pThis->qDeqBatch = qDeqBatchSegDisk;
+            pThis->qCompleteBatch = qCompleteBatchSegDisk;
+            pThis->MultiEnq = qqueueMultiEnqObjNonDirect;
             break;
         case QUEUETYPE_DIRECT:
             pThis->qConstruct = qConstructDirect;
@@ -3489,11 +4055,27 @@ rsRetVal qqueueStart(rsconf_t *cnf, qqueue_t *pThis) /* this is the Construction
     CHKiRet(wtpSetpmutUsr(pThis->pWtpReg, pThis->mut));
     CHKiRet(wtpSetiNumWorkerThreads(pThis->pWtpReg, pThis->iNumWorkerThreads));
     CHKiRet(wtpSettoWrkShutdown(pThis->pWtpReg, pThis->toWrkShutdown));
+    /* This callback implements runtime idle dematerialization only.  Process
+     * shutdown deliberately stops and joins the workers without waiting for
+     * this timer; qDestructSegDisk() then closes the store and, when empty,
+     * removes its segments, state file, and directory synchronously. */
+    if (pThis->segdiskDAChild && pThis->diskQueueIdleTimeout != -1) {
+        CHKiRet(wtpSetbAllowFirstWorkerToTimeout(pThis->pWtpReg, 1));
+        CHKiRet(wtpSetpfIdleTimeout(pThis->pWtpReg, (rsRetVal(*)(void *pUsr))qqueueSegDiskIdleTimeout));
+        CHKiRet(wtpSettoFirstWrkShutdown(pThis->pWtpReg, pThis->diskQueueIdleTimeout));
+    } else if (pThis->segdiskDAChild) {
+        /* An idle timeout of -1 disables dematerialization without disabling
+         * the normal shutdown timeout for additional workers.  Explicitly
+         * keep slot zero non-timeout-capable: wtpStartWrkr() consequently
+         * marks that slot always-running, so the generic worker timeout can
+         * never terminate the segmented DA child's final worker. */
+        CHKiRet(wtpSetbAllowFirstWorkerToTimeout(pThis->pWtpReg, 0));
+    }
     CHKiRet(wtpSetpUsr(pThis->pWtpReg, pThis));
     CHKiRet(wtpConstructFinalize(pThis->pWtpReg));
 
     /* Validate queue configuration before starting */
-    if (pThis->qType == QUEUETYPE_DISK || pThis->bIsDA) {
+    if (pThis->qType == QUEUETYPE_DISK || pThis->qType == QUEUETYPE_SEGMENTED_DISK || pThis->bIsDA) {
         /* Check that maxDiskSpace is not smaller than maxFileSize */
         if (pThis->sizeOnDiskMax > 0 && pThis->iMaxFileSize > 0 && pThis->sizeOnDiskMax < pThis->iMaxFileSize) {
             LogError(0, RS_RET_CONF_PARAM_INVLD,
@@ -3503,16 +4085,23 @@ rsRetVal qqueueStart(rsconf_t *cnf, qqueue_t *pThis) /* this is the Construction
             pThis->sizeOnDiskMax = pThis->iMaxFileSize;
         }
     }
-
     /* set up DA system if we have a disk-assisted queue */
-    if (pThis->bIsDA) InitDA(pThis, LOCK_MUTEX); /* initiate DA mode */
+    if (pThis->bIsDA) CHKiRet(InitDA(pThis, LOCK_MUTEX)); /* initiate DA mode */
 
     DBGOPRINT((obj_t *)pThis, "queue finished initialization\n");
 
     /* if the queue already contains data, we need to start the correct number of worker threads. This can be
      * the case when a disk queue has been loaded. If we did not start it here, it would never start.
      */
+    /* qqueueAdviseMaxWorkers() publishes worker wakeup reservations under
+     * the queue mutex. A top-level queue is started without that mutex held;
+     * a DA child is started from InitDA(), which already holds its parent's
+     * shared mutex. Keep the child path lock-free here to avoid relocking the
+     * non-recursive parent mutex. */
+    const int bNeedQueueLock = pThis->pqParent == NULL;
+    if (bNeedQueueLock) qqueueLock(pThis);
     qqueueAdviseMaxWorkers(pThis);
+    if (bNeedQueueLock) d_pthread_mutex_unlock(pThis->mut);
 
     /* support statistics gathering */
     qName = obj.GetName((obj_t *)pThis);
@@ -3528,6 +4117,10 @@ rsRetVal qqueueStart(rsconf_t *cnf, qqueue_t *pThis) /* this is the Construction
     CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("enqueued"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &pThis->ctrEnqueued));
 
+    STATSCOUNTER_INIT(pThis->ctrSizeEnqueued, pThis->mutCtrSizeEnqueued);
+    CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("size.enqueued"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &pThis->ctrSizeEnqueued));
+
     STATSCOUNTER_INIT(pThis->ctrFull, pThis->mutCtrFull);
     CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("full"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &pThis->ctrFull));
@@ -3539,9 +4132,61 @@ rsRetVal qqueueStart(rsconf_t *cnf, qqueue_t *pThis) /* this is the Construction
     CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("discarded.nf"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &pThis->ctrNFDscrd));
 
+    if (pThis->bMutexContentionStats) {
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("mutex.contention"), ctrType_IntCtr,
+                                    CTR_FLAG_RESETTABLE, &pThis->ctrMutexContention));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("mutex.wait_ns"), ctrType_IntCtr,
+                                    CTR_FLAG_RESETTABLE, &pThis->ctrMutexWaitNs));
+    }
+
     pThis->ctrMaxqsize = 0; /* no mutex needed, thus no init call */
     CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("maxqsize"), ctrType_Int, CTR_FLAG_NONE,
                                 &pThis->ctrMaxqsize));
+
+    if (pThis->qType == QUEUETYPE_SEGMENTED_DISK) {
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("disk.usage"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskBytes));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("segments"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskSegments));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("checkpoints"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskCheckpoints));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("replayed"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskReplayed));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("corruption.events"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskCorruptionEvents));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("corruption.bytes"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskCorruptionBytes));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("corruption.records"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskCorruptionRecords));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("corruption.segments"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskCorruptionSegments));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("retry.overage.bytes"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskRetryOverageBytes));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("retry.overage.maxbytes"), ctrType_Int,
+                                    CTR_FLAG_NONE, &pThis->segdiskRetryOverageMaxBytes));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("state.writes"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskStateWrites));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("state.forcedWrites"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskForcedStateWrites));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("recovery.pending"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskRecoveryPending));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("recovery.bytes"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskRecoveryBytes));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("recovery.records"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->segdiskRecoveryRecords));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("startup.payloadBytesRead"), ctrType_Int,
+                                    CTR_FLAG_NONE, &pThis->segdiskStartupPayloadBytes));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("startup.segmentFilesProbed"), ctrType_Int,
+                                    CTR_FLAG_NONE, &pThis->segdiskStartupSegmentFilesProbed));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("store.materializations"), ctrType_Int,
+                                    CTR_FLAG_NONE, &pThis->segdiskMaterializations));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("store.idleDematerializations"), ctrType_Int,
+                                    CTR_FLAG_NONE, &pThis->segdiskDematerializations));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("store.idleCleanupFailures"), ctrType_Int,
+                                    CTR_FLAG_NONE, &pThis->segdiskIdleCleanupFailures));
+        CHKiRet(statsobj.AddCounter(pThis->statsobj, UCHAR_CONSTANT("workers.current"), ctrType_Int, CTR_FLAG_NONE,
+                                    &pThis->pWtpReg->iCurNumWrkThrd));
+    }
 
     CHKiRet(statsobj.ConstructFinalize(pThis->statsobj));
 
@@ -3570,6 +4215,12 @@ static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint) {
     char errStr[1024];
 
     assert(pThis != NULL);
+
+    if (pThis->qType == QUEUETYPE_SEGMENTED_DISK) {
+        CHKiRet(segdiskStoreCheckpoint(pThis->tVars.segdisk, bIsCheckpoint != QUEUE_CHECKPOINT));
+        qqueueUpdateSegDiskStats(pThis);
+        FINALIZE;
+    }
 
     if (pThis->qType != QUEUETYPE_DISK) {
         if (getPhysicalQueueSize(pThis) > 0) {
@@ -3604,6 +4255,7 @@ static rsRetVal qqueuePersist(qqueue_t *pThis, int bIsCheckpoint) {
     CHKiRet(strm.SettOperationsMode(psQIF, STREAMMODE_WRITE_TRUNC));
     CHKiRet(strm.SetbSync(psQIF, pThis->bSyncQueueFiles));
     CHKiRet(strm.SetsType(psQIF, STREAMTYPE_FILE_SINGLE));
+    CHKiRet(strm.SetbNoFollowFinal(psQIF, 1));
     CHKiRet(strm.SetFName(psQIF, (uchar *)tmpQIFName, lentmpQIFName));
     CHKiRet(strm.ConstructFinalize(psQIF));
 
@@ -3650,21 +4302,15 @@ finalize_it:
 
     RETiRet;
 }
-
-
-/* check if we need to persist the current queue info. If an
- * error occurs, this should be ignored by caller (but we still
- * abide to our regular call interface)...
- * rgerhards, 2008-01-13
- * nUpdates is the number of updates since the last call to this function.
- * It may be > 1 due to batches. -- rgerhards, 2009-05-12
- */
 static rsRetVal qqueueChkPersist(qqueue_t *const pThis, const int nUpdates) {
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, qqueue);
     assert(nUpdates >= 0);
 
     if (nUpdates == 0) FINALIZE;
+    /* segmentedDisk checkpoints completed dequeue batches in its store. Enqueue
+     * activity must not turn checkpointInterval=1 into one checkpoint per write. */
+    if (pThis->qType == QUEUETYPE_SEGMENTED_DISK) FINALIZE;
 
     pThis->iUpdsSincePersist += nUpdates;
     if (pThis->iPersistUpdCnt && pThis->iUpdsSincePersist >= pThis->iPersistUpdCnt) {
@@ -3695,10 +4341,16 @@ static rsRetVal DoSaveOnShutdown(qqueue_t *pThis) {
      * it is reached.
      */
     DBGOPRINT((obj_t *)pThis, "bSaveOnShutdown set, restarting DA worker...\n");
-    pThis->bShutdownImmediate = 0; /* would termiante the DA worker! */
+    qqueueSetShutdownImmediate(pThis, 0); /* would terminate the DA worker! */
     pThis->iLowWtrMrk = 0;
     wtpSetState(pThis->pWtpDA, wtpState_SHUTDOWN); /* shutdown worker (only) when done (was _IMMEDIATE!) */
+    /* Unlike the normal enqueue advice path, destruction does not already
+     * hold this pool's queue mutex. The targeted-wakeup predicates are
+     * protected by that mutex, including a worker's exiting transition.
+     */
+    d_pthread_mutex_lock(pThis->pWtpDA->pmutUsr);
     wtpAdviseMaxWorkers(pThis->pWtpDA, 1, PERMIT_WORKER_START_DURING_SHUTDOWN); /* restart DA worker */
+    d_pthread_mutex_unlock(pThis->pWtpDA->pmutUsr);
 
     DBGOPRINT((obj_t *)pThis, "waiting for DA worker to terminate...\n");
     timeoutComp(&tTimeout, QUEUE_TIMEOUT_ETERNAL);
@@ -3734,6 +4386,13 @@ BEGINobjDestruct(qqueue) /* be sure to specify the object type also in END and C
         if (pThis->qType != QUEUETYPE_DIRECT && !pThis->bEnqOnly && pThis->pqParent == NULL && pThis->pWtpReg != NULL)
             qqueueShutdownWorkers(pThis);
 
+        /* Destroy the now-joined regular pool before inspecting the remaining
+         * size or starting save-on-shutdown. It is no longer needed, and this
+         * keeps the persistence phase's worker ownership explicit. */
+        if (pThis->qType != QUEUETYPE_DIRECT && pThis->pWtpReg != NULL) {
+            wtpDestruct(&pThis->pWtpReg);
+        }
+
         if (pThis->bIsDA && getPhysicalQueueSize(pThis) > 0) {
             if (pThis->bSaveOnShutdown) {
                 LogMsg(0, RS_RET_TIMED_OUT, LOG_INFO,
@@ -3756,15 +4415,10 @@ BEGINobjDestruct(qqueue) /* be sure to specify the object type also in END and C
          * about this condition here ;)
          * rgerhards, 2008-01-25
          */
-        if (pThis->qType != QUEUETYPE_DIRECT && pThis->pWtpReg != NULL) {
-            wtpDestruct(&pThis->pWtpReg);
-        }
-
         /* Now check if we actually have a DA queue and, if so, destruct it.
-         * Note that the wtp must be destructed first, it may be in cancel cleanup handler
-         * *right now* and actually *need* to access the queue object to persist some final
-         * data (re-queueing case). So we need to destruct the wtp first, which will make
-         * sure all workers have terminated. Please note that this also generates a situation
+         * The wtp must be destructed before the child queue. Shutdown has already
+         * joined its workers, so destruction now releases only pool resources.
+         * Please note that this also generates a situation
          * where it is possible that the DA queue has a parent pointer but the parent has
          * no WtpDA associated with it - which is perfectly legal thanks to this code here.
          */
@@ -3799,6 +4453,9 @@ BEGINobjDestruct(qqueue) /* be sure to specify the object type also in END and C
 
         DESTROY_ATOMIC_HELPER_MUT(pThis->mutQueueSize);
         DESTROY_ATOMIC_HELPER_MUT(pThis->mutLogDeq);
+        DESTROY_ATOMIC_HELPER_MUT(pThis->mutShutdownImmediate);
+        DESTROY_ATOMIC_HELPER_MUT64(pThis->mutCtrMutexContention);
+        DESTROY_ATOMIC_HELPER_MUT64(pThis->mutCtrMutexWaitNs);
 
         /* type-specific destructor */
         iRet = pThis->qDestruct(pThis);
@@ -3885,6 +4542,9 @@ static rsRetVal doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, smsg_
     struct timespec t;
 
     STATSCOUNTER_INC(pThis->ctrEnqueued, pThis->mutCtrEnqueued);
+    /* size.enqueued mirrors enqueued: counted on arrival, before discard checks,
+     * so it represents inbound byte volume (rejected slice tracked by ctrFDscrd). */
+    STATSCOUNTER_ADD(pThis->ctrSizeEnqueued, pThis->mutCtrSizeEnqueued, (uint64_t)pMsg->iLenRawMsg);
     /* first check if we need to discard this message (which will cause CHKiRet() to exit)
      */
     CHKiRet(qqueueChkDiscardMsg(pThis, pThis->iQueueSize, pMsg));
@@ -3967,19 +4627,25 @@ static rsRetVal doEnqSingleObj(qqueue_t *pThis, flowControl_t flowCtlType, smsg_
      */
     while ((pThis->iMaxQueueSize > 0 && pThis->iQueueSize >= pThis->iMaxQueueSize) ||
            ((pThis->qType == QUEUETYPE_DISK || pThis->bIsDA) && pThis->sizeOnDiskMax != 0 &&
-            pThis->tVars.disk.sizeOnDisk > pThis->sizeOnDiskMax)) {
+            pThis->tVars.disk.sizeOnDisk > pThis->sizeOnDiskMax) ||
+           (pThis->qType == QUEUETYPE_SEGMENTED_DISK && pThis->sizeOnDiskMax != 0 &&
+            getQueueDiskBytes(pThis) >= pThis->sizeOnDiskMax)) {
         STATSCOUNTER_INC(pThis->ctrFull, pThis->mutCtrFull);
         if (pThis->toEnq == 0 || pThis->bEnqOnly) {
             DBGOPRINT((obj_t *)pThis,
                       "doEnqSingleObject: queue FULL - configured for immediate "
                       "discarding QueueSize=%d MaxQueueSize=%d sizeOnDisk=%lld "
                       "sizeOnDiskMax=%lld\n",
-                      pThis->iQueueSize, pThis->iMaxQueueSize, pThis->tVars.disk.sizeOnDisk, pThis->sizeOnDiskMax);
+                      pThis->iQueueSize, pThis->iMaxQueueSize, getQueueDiskBytes(pThis), pThis->sizeOnDiskMax);
             STATSCOUNTER_INC(pThis->ctrFDscrd, pThis->mutCtrFDscrd);
             msgDestruct(&pMsg);
             ABORT_FINALIZE(RS_RET_QUEUE_FULL);
         } else {
             DBGOPRINT((obj_t *)pThis, "doEnqSingleObject: queue FULL - waiting %dms to drain.\n", pThis->toEnq);
+            /* Multi-submit and single-message enqueue normally advise workers
+             * only after doEnqSingleObj() returns. If this call blocks first,
+             * an already-idle worker would never be awakened to make room. */
+            qqueueAdviseMaxWorkers(pThis);
             if (glbl.GetGlobalInputTermState()) {
                 DBGOPRINT((obj_t *)pThis,
                           "doEnqSingleObject: queue FULL, discard due to "
@@ -4052,7 +4718,7 @@ static rsRetVal qqueueMultiEnqObjNonDirect(qqueue_t *pThis, multi_submit_t *pMul
     assert(pMultiSub != NULL);
 
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iCancelStateSave);
-    d_pthread_mutex_lock(pThis->mut);
+    qqueueLock(pThis);
     for (i = 0; i < pMultiSub->nElem; ++i) {
         localRet = doEnqSingleObj(pThis, pMultiSub->ppMsgs[i]->flowCtlType, (void *)pMultiSub->ppMsgs[i]);
         if (localRet != RS_RET_OK && localRet != RS_RET_QUEUE_FULL) ABORT_FINALIZE(localRet);
@@ -4077,7 +4743,7 @@ static rsRetVal qqueueMultiEnqObjDirect(qqueue_t *pThis, multi_submit_t *pMultiS
     DEFiRet;
 
     pWti = wtiGetDummy();
-    pWti->pbShutdownImmediate = &pThis->bShutdownImmediate;
+    qqueueSetWtiShutdownImmediate(pThis, pWti);
 
     for (i = 0; i < pMultiSub->nElem; ++i) {
         CHKiRet(qAddDirectWithWti(pThis, (void *)pMultiSub->ppMsgs[i], pWti));
@@ -4101,7 +4767,7 @@ rsRetVal qqueueEnqMsg(qqueue_t *pThis, flowControl_t flowCtlType, smsg_t *pMsg) 
 
     if (isNonDirectQ) {
         pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iCancelStateSave);
-        d_pthread_mutex_lock(pThis->mut);
+        qqueueLock(pThis);
     }
 
     CHKiRet(doEnqSingleObj(pThis, flowCtlType, pMsg));
@@ -4180,7 +4846,7 @@ finalize_it:
     RETiRet;
 }
 
-/* check the the queue file name is unique. */
+/* check the queue file name is unique. */
 static rsRetVal ATTR_NONNULL() checkUniqueDiskFile(qqueue_t *const pThis) {
     DEFiRet;
     struct queue_filename *queue_fn_curr = queue_filename_root;
@@ -4385,13 +5051,13 @@ rsRetVal qqueueApplyCnfParam(qqueue_t *pThis, struct nvlst *lst) {
         if (!pvals[i].bUsed) continue;
         n_params_set++;
         if (!strcmp(pblk.descr[i].name, "queue.filename")) {
-            pThis->pszFilePrefix = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pThis->pszFilePrefix = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             pThis->lenFilePrefix = es_strlen(pvals[i].val.d.estr);
         } else if (!strcmp(pblk.descr[i].name, "queue.cry.provider")) {
-            pThis->cryprovName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pThis->cryprovName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(pblk.descr[i].name, "queue.spooldirectory")) {
             free(pThis->pszSpoolDir);
-            pThis->pszSpoolDir = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pThis->pszSpoolDir = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
             pThis->lenSpoolDir = es_strlen(pvals[i].val.d.estr);
             CHKiRet(validateQueueSpoolDir(pThis));
             if (pThis->lenSpoolDir > 0 && pThis->pszSpoolDir[pThis->lenSpoolDir - 1] == '/') {
@@ -4450,6 +5116,31 @@ rsRetVal qqueueApplyCnfParam(qqueue_t *pThis, struct nvlst *lst) {
                  */
                 n_params_set--;
             }
+        } else if (!strcmp(pblk.descr[i].name, "queue.diskqueuetype")) {
+            char *mode;
+            CHKmalloc(mode = es_str2cstr(pvals[i].val.d.estr, NULL));
+            pThis->diskQueueTypeSet = 1;
+            if (!strcasecmp(mode, "auto"))
+                pThis->diskQueueType = QDA_ENGINE_AUTO;
+            else if (!strcasecmp(mode, "disk"))
+                pThis->diskQueueType = QDA_ENGINE_DISK;
+            else if (!strcasecmp(mode, "segmentedDisk"))
+                pThis->diskQueueType = QDA_ENGINE_SEGMENTED_DISK;
+            else {
+                parser_errmsg("queue.diskQueueType: invalid value '%s'; using 'auto'", mode);
+                pThis->diskQueueType = QDA_ENGINE_AUTO;
+            }
+            free(mode);
+        } else if (!strcmp(pblk.descr[i].name, "queue.diskqueueautoupgrade")) {
+            pThis->diskQueueAutoUpgrade = pvals[i].val.d.n;
+            pThis->diskQueueAutoUpgradeSet = 1;
+        } else if (!strcmp(pblk.descr[i].name, "queue.diskqueueidletimeout")) {
+            pThis->diskQueueIdleTimeout = pvals[i].val.d.n;
+            pThis->diskQueueIdleTimeoutSet = 1;
+            if (pThis->diskQueueIdleTimeout < -1) {
+                parser_errmsg("queue.diskQueueIdleTimeout must be -1 or greater; using 60000");
+                pThis->diskQueueIdleTimeout = 60000;
+            }
         } else if (!strcmp(pblk.descr[i].name, "queue.workerthreads")) {
             CHKiRet(qqueueSetiNumWorkerThreads(pThis, pvals[i].val.d.n));
         } else if (!strcmp(pblk.descr[i].name, "queue.timeoutshutdown")) {
@@ -4476,6 +5167,8 @@ rsRetVal qqueueApplyCnfParam(qqueue_t *pThis, struct nvlst *lst) {
             pThis->iSmpInterval = pvals[i].val.d.n;
         } else if (!strcmp(pblk.descr[i].name, "queue.takeflowctlfrommsg")) {
             pThis->takeFlowCtlFromMsg = pvals[i].val.d.n;
+        } else if (!strcmp(pblk.descr[i].name, "queue.mutexcontentionstats")) {
+            pThis->bMutexContentionStats = pvals[i].val.d.n;
         } else if (!strcmp(pblk.descr[i].name, "queue.oncorruption")) {
             char *mode;
             CHKmalloc(mode = es_str2cstr(pvals[i].val.d.estr, NULL));
@@ -4498,6 +5191,31 @@ rsRetVal qqueueApplyCnfParam(qqueue_t *pThis, struct nvlst *lst) {
         }
     }
 
+    const sbool is_da_memory_queue =
+        (pThis->qType == QUEUETYPE_FIXED_ARRAY || pThis->qType == QUEUETYPE_LINKEDLIST) && pThis->pszFilePrefix != NULL;
+    /* These are deliberately parser_errmsg(), not advisory warnings:
+     * parser_errmsg marks the configuration dirty.  Permissive startup keeps
+     * running after the unusable value is ignored, while
+     * abortOnUncleanConfig="on" rejects the same configuration. */
+    if ((pThis->diskQueueTypeSet || pThis->diskQueueAutoUpgradeSet || pThis->diskQueueIdleTimeoutSet) &&
+        !is_da_memory_queue) {
+        parser_errmsg(
+            "queue.diskQueueType, queue.diskQueueAutoUpgrade, and queue.diskQueueIdleTimeout apply only to "
+            "FixedArray or LinkedList disk-assisted queues; ignoring these parameters");
+        pThis->diskQueueType = QDA_ENGINE_AUTO;
+        pThis->diskQueueAutoUpgrade = 0;
+        pThis->diskQueueIdleTimeout = 60000;
+    }
+    if (is_da_memory_queue && pThis->diskQueueAutoUpgradeSet && pThis->diskQueueType != QDA_ENGINE_AUTO) {
+        parser_errmsg("queue.diskQueueAutoUpgrade applies only when queue.diskQueueType='auto'; ignoring it");
+        pThis->diskQueueAutoUpgrade = 0;
+    }
+    if (is_da_memory_queue && pThis->diskQueueType == QDA_ENGINE_DISK && pThis->diskQueueIdleTimeoutSet &&
+        pThis->diskQueueIdleTimeout != 60000) {
+        parser_errmsg("queue.diskQueueIdleTimeout does not apply to the classic disk engine; using 60000");
+        pThis->diskQueueIdleTimeout = 60000;
+    }
+
     checkUniqueDiskFile(pThis);
 
     if (pThis->qType == QUEUETYPE_DIRECT) {
@@ -4515,6 +5233,26 @@ rsRetVal qqueueApplyCnfParam(qqueue_t *pThis, struct nvlst *lst) {
                      "no queue file name given; queue type changed to 'linkedList'",
                      obj.GetName((obj_t *)pThis));
             pThis->qType = QUEUETYPE_LINKEDLIST;
+        }
+    } else if (pThis->qType == QUEUETYPE_SEGMENTED_DISK) {
+        if (pThis->pszFilePrefix == NULL) {
+            LogError(0, RS_RET_QUEUE_DISK_NO_FN,
+                     "error on queue '%s', segmentedDisk mode selected, but "
+                     "no queue file name given",
+                     obj.GetName((obj_t *)pThis));
+            ABORT_FINALIZE(RS_RET_QUEUE_DISK_NO_FN);
+        }
+        if (pThis->onCorruption != QUEUE_ON_CORRUPTION_SAFE_MODE) {
+            LogError(0, RS_RET_CONF_PARAM_INVLD,
+                     "error on queue '%s': segmentedDisk currently supports only queue.onCorruption=\"safe\"",
+                     obj.GetName((obj_t *)pThis));
+            ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+        }
+        if (pThis->cryprovName != NULL) {
+            LogError(0, RS_RET_CONF_PARAM_INVLD,
+                     "error on queue '%s': queue.cry.provider is not yet supported by segmentedDisk",
+                     obj.GetName((obj_t *)pThis));
+            ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
         }
     }
 
@@ -4538,6 +5276,16 @@ finalize_it:
 
 /* return 1 if the content of two qqueue_t structs equal */
 int queuesEqual(qqueue_t *pOld, qqueue_t *pNew) {
+    const qda_lifecycle_config_t old_da = {
+        .engine = pOld->diskQueueType,
+        .auto_upgrade = pOld->diskQueueAutoUpgrade,
+        .idle_timeout = pOld->diskQueueIdleTimeout,
+    };
+    const qda_lifecycle_config_t new_da = {
+        .engine = pNew->diskQueueType,
+        .auto_upgrade = pNew->diskQueueAutoUpgrade,
+        .idle_timeout = pNew->diskQueueIdleTimeout,
+    };
     return (NUM_EQUALS(qType) && NUM_EQUALS(iMaxQueueSize) && NUM_EQUALS(iDeqBatchSize) &&
             NUM_EQUALS(iMinDeqBatchSize) && NUM_EQUALS(toMinDeqBatchSize) && NUM_EQUALS(sizeOnDiskMax) &&
             NUM_EQUALS(iHighWtrMrk) && NUM_EQUALS(iLowWtrMrk) && NUM_EQUALS(iFullDlyMrk) && NUM_EQUALS(iLightDlyMrk) &&
@@ -4546,8 +5294,8 @@ int queuesEqual(qqueue_t *pOld, qqueue_t *pNew) {
             NUM_EQUALS(toActShutdown) && NUM_EQUALS(toEnq) && NUM_EQUALS(toWrkShutdown) &&
             NUM_EQUALS(iMinMsgsPerWrkr) && NUM_EQUALS(iMaxFileSize) && NUM_EQUALS(bSaveOnShutdown) &&
             NUM_EQUALS(iDeqSlowdown) && NUM_EQUALS(iDeqtWinFromHr) && NUM_EQUALS(iDeqtWinToHr) &&
-            NUM_EQUALS(iSmpInterval) && NUM_EQUALS(takeFlowCtlFromMsg) && USTR_EQUALS(pszFilePrefix) &&
-            USTR_EQUALS(cryprovName));
+            NUM_EQUALS(iSmpInterval) && NUM_EQUALS(bMutexContentionStats) && NUM_EQUALS(takeFlowCtlFromMsg) &&
+            qdaLifecycleConfigEqual(&old_da, &new_da) && USTR_EQUALS(pszFilePrefix) && USTR_EQUALS(cryprovName));
 }
 
 

@@ -5,9 +5,11 @@
 . ${srcdir:=.}/diag.sh init
 . $srcdir/diag.sh check-inotify
 
-export PORT_RCVR="$(get_free_port)"
-export POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.policy.yaml"
-export POLICY_TMP="$(pwd)/${RSYSLOG_DYNNAME}.policy.tmp.yaml"
+export PORT_RCVR_FILE="${RSYSLOG_DYNNAME}.imudp_port"
+POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.policy.yaml"
+export POLICY_FILE
+POLICY_TMP="$(pwd)/${RSYSLOG_DYNNAME}.policy.tmp.yaml"
+export POLICY_TMP
 export SENDMESSAGES=20
 
 cat > "$POLICY_FILE" <<'YAML'
@@ -21,7 +23,8 @@ add_conf '
 global(processInternalMessages="on")
 ratelimit(name="watch_limiter" policy="'$POLICY_FILE'" policyWatch="on" policyWatchDebounce="200ms")
 module(load="../plugins/imudp/.libs/imudp" batchSize="1")
-input(type="imudp" port="'$PORT_RCVR'" ratelimit.name="watch_limiter" ruleset="main")
+input(type="imudp" address="127.0.0.1" port="0" listenPortFileName="'$PORT_RCVR_FILE'"
+      ratelimit.name="watch_limiter" ruleset="main")
 
 template(name="outfmt" type="string" string="RECEIVED RAW: %rawmsg%\n")
 
@@ -30,8 +33,9 @@ ruleset(name="main") {
 }
 '
 startup
+assign_file_content PORT_RCVR "$PORT_RCVR_FILE"
 
-./tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
+tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
 wait_file_lines "$RSYSLOG_OUT_LOG" 20 100
 
 : > "$RSYSLOG_OUT_LOG"
@@ -43,7 +47,7 @@ severity: 0
 YAML
 ./msleep 1500
 
-./tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
+tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
 ./msleep 1000
 wait_queueempty
 
@@ -61,7 +65,7 @@ YAML
 mv -f "$POLICY_TMP" "$POLICY_FILE"
 ./msleep 1500
 
-./tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
+tcpflood -Tudp -p$PORT_RCVR -m $SENDMESSAGES -M "msgnum:"
 wait_file_lines "$RSYSLOG_OUT_LOG" 20 100
 
 shutdown_when_empty

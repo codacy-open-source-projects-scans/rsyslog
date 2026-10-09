@@ -4,7 +4,8 @@
 . ${srcdir:=.}/diag.sh init
 . $srcdir/diag.sh check-inotify
 
-export POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.policy.yaml"
+POLICY_FILE="$(pwd)/${RSYSLOG_DYNNAME}.policy.yaml"
+export POLICY_FILE
 
 cat > "$POLICY_FILE" <<'YAML'
 version: 1
@@ -20,7 +21,7 @@ add_conf '
 global(processInternalMessages="on")
 module(load="../plugins/imtcp/.libs/imtcp")
 module(load="../plugins/mmjsontransform/.libs/mmjsontransform")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 template(name="outfmt" type="string" string="%$!output%\n")
 

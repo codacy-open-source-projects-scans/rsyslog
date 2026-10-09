@@ -11,7 +11,7 @@ export NUMMESSAGES=5 # it's just important that we get any messages at all
 generate_conf
 add_conf '
 module(load="../plugins/imtcp/.libs/imtcp")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" ruleset="rs")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port" ruleset="rs")
 
 $AllowedSender TCP,www.rsyslog.com
 template(name="outfmt" type="string" string="%msg:F,58:2%\n")
@@ -23,7 +23,7 @@ action(type="omfile" file="'$RSYSLOG_OUT_LOG'")
 '
 startup
 assign_tcpflood_port $RSYSLOG_DYNNAME.tcpflood_port
-tcpflood -m$NUMMESSAGES
+tcpflood --check-only -m$NUMMESSAGES
 shutdown_when_empty
 wait_shutdown
 content_check --regex "connection request from disallowed sender .* discarded"

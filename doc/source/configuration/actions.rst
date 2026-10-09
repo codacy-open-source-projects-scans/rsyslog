@@ -185,6 +185,14 @@ Note: parameter names are case-insensitive.
   causes queue to refer to the original message object, with
   reference-counting. (Introduced with 8.10.0).
 
+- **action.ratelimit.name** string
+
+  References a named :doc:`ratelimit object <../rainerscript/configuration_objects/ratelimit>`
+  whose external YAML policy has ``scope: output``. The action carries only
+  the policy name; interval, burst, mode, and future output-limit settings are
+  defined in the policy file so they can be reloaded. ``mode: pace`` requires a
+  non-direct action queue.
+
 Useful Links
 ------------
 
@@ -324,7 +332,15 @@ file for it.
 **Creating directories is also supported**. For example you can use the
 hostname as directory and the program name as file name:
 
-    ``$template DynFile,"/var/log/%HOSTNAME%/%programname%.log"``
+    ``$template DynFile,"/var/log/%HOSTNAME:::secpath-replace%/%programname:::secpath-replace%.log"``
+
+When a dynafile template uses message properties in path components,
+escape each message-derived component. The ``secpath-replace`` property
+option replaces path separators with ``_`` and makes special ``.`` and
+``..`` components non-special, which prevents remote messages from
+selecting parent directories or absolute paths. Apply it to every field
+that can come from the message or sender, such as ``HOSTNAME``,
+``programname``, ``APP-NAME``, or data extracted into variables.
 
 Named Pipes
 ~~~~~~~~~~~

@@ -1,8 +1,8 @@
 sbin_PROGRAMS =
-bin_PROGRAMS =
 CLEANFILES =
+man5_MANS = rsyslog.conf.5
+man8_MANS = rsyslogd.8
 man1_MANS =
-man_MANS = rsyslogd.8 rsyslog.conf.5
 
 sbin_PROGRAMS += rsyslogd
 rsyslogd_SOURCES = \
@@ -36,8 +36,15 @@ rsyslogd_SOURCES = \
 	iminternal.c \
 	iminternal.h \
 	\
-	../dirty.h
+	../runtime/dirty.h
 rsyslogd_CPPFLAGS =  $(PTHREADS_CFLAGS) $(RSRT_CFLAGS)
+
+if ENABLE_LIBZSTD
+rsyslogd_CPPFLAGS += $(ZSTD_CFLAGS)
+rsyslogd_LDADD_ZSTD = $(ZSTD_LIBS)
+else
+rsyslogd_LDADD_ZSTD =
+endif
 
 if ENABLE_LIBLOGGING_STDLOG
 rsyslogd_CPPFLAGS += $(LIBLOGGING_STDLOG_CFLAGS)
@@ -48,7 +55,7 @@ rsyslogd_CPPFLAGS += -DSD_EXPORT_SYMBOLS
 # note: it looks like librsyslog.la must be explicitely given on LDDADD,
 # otherwise dependencies are not properly calculated (resulting in a
 # potentially incomplete build, a problem we had several times...)
-rsyslogd_LDADD = ../grammar/libgrammar.la ../runtime/librsyslog.la ../compat/compat.la $(ZLIB_LIBS) $(PTHREADS_LIBS) $(RSRT_LIBS) $(SOL_LIBS) $(LIBUUID_LIBS) $(HASH_XXHASH_LIBS) $(LIBRESOLV_LIBS) $(LIBYAML_LIBS)
+rsyslogd_LDADD = ../grammar/libgrammar.la ../runtime/librsyslog.la ../compat/compat.la $(ZLIB_LIBS) $(rsyslogd_LDADD_ZSTD) $(PTHREADS_LIBS) $(RSRT_LIBS) $(SOL_LIBS) $(LIBUUID_LIBS) $(HASH_XXHASH_LIBS) $(LIBRESOLV_LIBS) $(LIBYAML_LIBS)
 
 # Note: do NOT indent the if chain - it will not work!
 if OS_LINUX
@@ -71,9 +78,22 @@ endif # if OS_AIX
 endif # if OS_APPLE
 endif # if OS_LINUX
 
-EXTRA_DIST = $(man_MANS) \
+EXTRA_DIST = $(man5_MANS) $(man8_MANS) \
 	rscryutil.rst \
-	recover_qi.pl
+	recover_qi.pl \
+	rsyslog-segqueue.rst
+
+if ENABLE_FUZZING
+noinst_PROGRAMS = fuzz_rsyslog_message fuzz_imtcp_session
+fuzz_rsyslog_message_SOURCES = $(rsyslogd_SOURCES) fuzz_rsyslog_message.c
+fuzz_rsyslog_message_CPPFLAGS = $(rsyslogd_CPPFLAGS) -DRSYSLOG_FUZZ_TARGET -Dmain=rsyslogd_main
+fuzz_rsyslog_message_LDADD = $(rsyslogd_LDADD)
+fuzz_rsyslog_message_LDFLAGS = $(rsyslogd_LDFLAGS) $(LIB_FUZZING_ENGINE)
+fuzz_imtcp_session_SOURCES = $(rsyslogd_SOURCES) fuzz_imtcp_session.c
+fuzz_imtcp_session_CPPFLAGS = $(rsyslogd_CPPFLAGS) -DRSYSLOG_FUZZ_TARGET -Dmain=rsyslogd_main
+fuzz_imtcp_session_LDADD = ../runtime/lmtcpsrv.la $(rsyslogd_LDADD)
+fuzz_imtcp_session_LDFLAGS = $(rsyslogd_LDFLAGS) $(LIB_FUZZING_ENGINE)
+endif
 
 EXTRA_rsyslogd_DEPENDENCIES = $(exports_list_file)
 
@@ -88,6 +108,17 @@ msggen_SOURCES = msggen.c
 endif
 
 if ENABLE_USERTOOLS
+bin_PROGRAMS =
+if ENABLE_SEGQUEUE_TOOL
+dist_bin_SCRIPTS = rsyslog-segqueue
+rsyslog-segqueue.1: rsyslog-segqueue.rst
+	$(AM_V_GEN) $(RST2MAN) rsyslog-segqueue.rst $@
+if ENABLE_GENERATE_MAN_PAGES
+man1_MANS += rsyslog-segqueue.1
+CLEANFILES += rsyslog-segqueue.1
+EXTRA_DIST += rsyslog-segqueue.1
+endif
+endif
 if ENABLE_OMMONGODB
 bin_PROGRAMS += logctl
 logctl_SOURCES = logctl.c

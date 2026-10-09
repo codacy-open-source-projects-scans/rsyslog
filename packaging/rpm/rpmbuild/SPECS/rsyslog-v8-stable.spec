@@ -1,4 +1,4 @@
-# SPEC file for EL8 and EL9 (RHEL 7 dropped - components too old)
+# SPEC file for EL8, EL9, and EL10 (RHEL 7 dropped - components too old)
 %define rsyslog_statedir %{_sharedstatedir}/rsyslog
 %define rsyslog_pkidir %{_sysconfdir}/pki/rsyslog
 %define rsyslog_docdir %{_docdir}/%{name}-%{version}
@@ -11,10 +11,24 @@
 %global want_mongodb 1
 %global want_rabbitmq 1
 %endif
+# EL10 (and current CentOS Stream packaging) use unversioned library package
+# names, while Adiscon EL8/EL9 repos still ship the libfastjson4/liblognorm5
+# names used historically by this spec.
+%if 0%{?rhel} >= 10
+%global libfastjson_pkg libfastjson
+%global libfastjson_devel_pkg libfastjson-devel
+%global liblognorm_pkg liblognorm
+%global liblognorm_devel_pkg liblognorm-devel
+%else
+%global libfastjson_pkg libfastjson4
+%global libfastjson_devel_pkg libfastjson4-devel
+%global liblognorm_pkg liblognorm5
+%global liblognorm_devel_pkg liblognorm5-devel
+%endif
 
 Summary: Enhanced system logging and kernel message trapping daemon
 Name: rsyslog
-Version: 8.2602.0
+Version: 8.2604.0
 Release: 1%{?dist}
 # Build-time generated file list for optional liboverride_*.so modules.
 %global liboverride_filelist %{_builddir}/%{name}-%{version}/liboverride.files
@@ -32,12 +46,13 @@ Source6: qpid-proton-0.38.0.tar.gz
 BuildRequires: make
 BuildRequires: gcc
 BuildRequires: autoconf
+BuildRequires: autoconf-archive
 BuildRequires: automake
 BuildRequires: bison
 BuildRequires: dos2unix
 BuildRequires: flex
 BuildRequires: libgcrypt-devel
-BuildRequires: libfastjson4-devel >= 0.99.8
+BuildRequires: %{libfastjson_devel_pkg} >= 0.99.8
 BuildRequires: libestr-devel >= 0.1.9
 BuildRequires: libtool
 BuildRequires: libuuid-devel
@@ -79,8 +94,9 @@ BuildRequires: ruby-devel
 
 Requires: logrotate >= 3.5.2
 Requires: bash >= 2.0
+Requires: python3
 Requires: libestr >= 0.1.11
-Requires: libfastjson4 >= 0.99.8
+Requires: %{libfastjson_pkg} >= 0.99.8
 
 Requires(post): systemd
 Requires(preun): systemd
@@ -132,21 +148,21 @@ BuildRequires: hiredis-devel >= 0.13.1
 Summary: mmfields support 
 Group: System Environment/Daemons
 Requires: %name = %version-%release
-Requires: liblognorm5 >= 2.0.6
-BuildRequires: liblognorm5-devel >= 2.0.6
+Requires: %{liblognorm_pkg} >= 2.0.6
+BuildRequires: %{liblognorm_devel_pkg} >= 2.0.6
 
 %package mmjsonparse
 Summary: mmjsonparse support 
 Group: System Environment/Daemons
 Requires: %name = %version-%release
-Requires: liblognorm5 >= 2.0.6
-BuildRequires: liblognorm5-devel >= 2.0.6
+Requires: %{liblognorm_pkg} >= 2.0.6
+BuildRequires: %{liblognorm_devel_pkg} >= 2.0.6
 
 %package mmnormalize
 Summary: Log normalization support for rsyslog
 Group: System Environment/Daemons
 Requires: %name = %version-%release
-BuildRequires: liblognorm5-devel >= 2.0.6
+BuildRequires: %{liblognorm_devel_pkg} >= 2.0.6
 
 %package mmaudit
 Summary: Message modification module supporting Linux audit format
@@ -167,8 +183,13 @@ Requires: %name = %version-%release
 Summary: MySQL support for rsyslog
 Group: System Environment/Daemons
 Requires: %name = %version-%release
+%if 0%{?rhel} >= 10
+# EL10 provides the MySQL client ABI via MariaDB Connector/C.
+BuildRequires: mariadb-connector-c-devel
+%else
 BuildRequires: mysql >= 4.0
 BuildRequires: mysql-devel >= 4.0
+%endif
 
 %if %{want_mongodb}
 %package mongodb
@@ -246,6 +267,11 @@ BuildRequires: librdkafka-devel >= 0.11.0
 BuildRequires: lz4-devel
 BuildRequires: cyrus-sasl-devel
 
+%package imbeats
+Summary: Elastic Beats / Lumberjack v2 input module for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+
 %package mmsnareparse
 Summary: NXLog Snare Windows Security event parser support
 Group: System Environment/Daemons
@@ -300,6 +326,37 @@ Group: System Environment/Daemons
 Requires: %name = %version-%release
 BuildRequires: libcurl-devel
 
+%if 0%{?rhel} >= 9
+%package omkinesis
+Summary: Amazon Kinesis Data Streams output module for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+BuildRequires: libcurl-devel
+%endif
+
+%package imhttp
+Summary: imhttp input module for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+BuildRequires: civetweb-devel apr-util-devel
+
+%package omotel
+Summary: omotel output module for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+BuildRequires: libcurl-devel
+
+%package omazuredce
+Summary: Azure Monitor Logs Ingestion output module for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+BuildRequires: libcurl-devel
+
+%package omsendertrack
+Summary: Sender tracking output module for rsyslog
+Group: System Environment/Daemons
+Requires: %name = %version-%release
+
 %package mmdblookup
 Summary: mmdblookup MaxMind/GeoIP DB lookup for rsyslog
 Group: System Environment/Daemons
@@ -310,7 +367,7 @@ BuildRequires: libmaxminddb-devel
 Summary: Log normalization parser module for rsyslog
 Group: System Environment/Daemons
 Requires: %name = %version-%release
-BuildRequires: liblognorm5-devel >= 2.0.6
+BuildRequires: %{liblognorm_devel_pkg} >= 2.0.6
 
 
 %description
@@ -449,6 +506,12 @@ containing both Producer and Consumer support. It was designed with message deli
 reliability and high performance in mind, current figures exceed 800000 msgs/second 
 for the producer and 3 million msgs/second for the consumer.
 
+%description imbeats
+The imbeats input module receives log and metrics traffic from Elastic Beats,
+Elastic Agent, and compatible forwarders using the Lumberjack v2 protocol over
+plain TCP or TLS. It depends on the base rsyslog package for the core engine
+and stream drivers.
+
 %description mmsnareparse
 The mmsnareparse module parses NXLog Snare-formatted Windows Security events
 that are embedded in RFC3164/RFC5424 syslog envelopes or delivered as JSON
@@ -491,6 +554,28 @@ Function module for rainerscript function hash.
 
 %description omhttp
 HTTP output module for sending syslog messages to HTTP endpoints.
+
+%if 0%{?rhel} >= 9
+%description omkinesis
+Output module for sending syslog messages to Amazon Kinesis Data Streams.
+%endif
+
+%description imhttp
+This module provides support for HTTP server.
+
+%description omotel
+OTEL output module for sending syslog messages to OpenTelemetry endpoints.
+
+%description omazuredce
+Azure Monitor Logs Ingestion output module for rsyslog. Batches JSON records
+and sends them to the Azure Monitor Logs Ingestion API via a Data Collection
+Endpoint (DCE), Data Collection Rule (DCR), and Microsoft Entra
+client-credentials authentication.
+
+%description omsendertrack
+Rsyslog output module for tracking message senders across all input sources.
+It records per-sender statistics such as hostname, message count, and last
+event time, and stores the data in a JSON-formatted state file.
 
 %description mmdblookup
 This module provides support for storing information about IP addresses in a highly optimized and flexible database format.
@@ -541,15 +626,19 @@ ls -al ./ 2>&1 | tee /dev/stderr
 if ! grep -q '^version = ' doc/source/conf.py 2>/dev/null; then
   sed -i "/^release = /i version = '%{version}'" doc/source/conf.py
 fi
-cd doc
-echo "Step 1: Installing sphinx and requirements via pip..."
-pip3 install -U sphinx
-pip3 install -r requirements.txt
+cd doc || exit 1
+if [ -f build/index.html ]; then
+  echo "Step 1: Using pre-built Sphinx documentation from doc/build"
+else
+  echo "Step 1: Installing sphinx and requirements via pip..."
+  pip3 install -U sphinx
+  pip3 install -r requirements.txt
 
-echo "Step 2: Building Sphinx documentation (output in doc/build)..."
-num_cpus=$(nproc)
-sphinx-build -j$num_cpus -b html source build 2>&1
-echo "✓ Sphinx documentation built"
+  echo "Step 2: Building Sphinx documentation (output in doc/build)..."
+  num_cpus=$(nproc)
+  sphinx-build -j$num_cpus -b html source build 2>&1
+  echo "✓ Sphinx documentation built"
+fi
 
 echo "Step 3: Listing doc directory contents..."
 ls -al 2>&1
@@ -633,6 +722,7 @@ export HIREDIS_LIBS=-L%{_libdir}
 	--enable-uuid \
  	--enable-omkafka \
 	--enable-imkafka \
+	--enable-imbeats \
 %if 0%{?rhel} >= 8
 	--enable-omdtls \
 	--enable-imdtls \
@@ -648,6 +738,13 @@ export HIREDIS_LIBS=-L%{_libdir}
 	--enable-pmciscoios \
 	--enable-mmkubernetes \
 	--enable-omhttp \
+%if 0%{?rhel} >= 9
+	--enable-omkinesis \
+%endif
+	--enable-imhttp \
+	--enable-omotel \
+	--enable-omazuredce \
+	--enable-omsendertrack \
 	--enable-pmnull \
 	--enable-mmdblookup \
 	--enable-pmnormalize \
@@ -697,14 +794,10 @@ cp -r doc/build/* %{buildroot}%{rsyslog_docdir}/html
 # Keep file non-empty for older sources where no liboverride modules exist.
 # rpmbuild errors out on an empty %files -f input file.
 echo "%%exclude %{_libdir}/rsyslog/__liboverride_filelist_placeholder__.so" > %{liboverride_filelist}
-for so in \
-  liboverride_getaddrinfo.so \
-  liboverride_gethostname.so \
-  liboverride_gethostname_nonfqdn.so
+for so in %{buildroot}%{_libdir}/rsyslog/liboverride_*.so
 do
-  if [ -f %{buildroot}%{_libdir}/rsyslog/$so ]; then
-    echo %{_libdir}/rsyslog/$so >> %{liboverride_filelist}
-  fi
+	[ -e "$so" ] || continue
+	echo "${so#%{buildroot}}" >> %{liboverride_filelist}
 done
 
 # get rid of libtool libraries
@@ -739,6 +832,8 @@ done
 %dir %{rsyslog_pkidir}
 %{_sbindir}/rsyslogd
 %attr(755,root,root) %{_bindir}/rsyslog-recover-qi.pl
+%attr(755,root,root) %{_bindir}/rsyslog-segqueue
+%{_mandir}/man1/rsyslog-segqueue.1.gz
 %{_mandir}/man5/rsyslog.conf.5.gz
 %{_mandir}/man8/rsyslogd.8.gz
 %{_unitdir}/rsyslog.service
@@ -898,6 +993,10 @@ done
 %{_libdir}/rsyslog/omkafka.so
 %{_libdir}/rsyslog/imkafka.so
 
+%files imbeats
+%defattr(-,root,root)
+%{_libdir}/rsyslog/imbeats.so
+
 %files mmsnareparse
 %defattr(-,root,root)
 %{_libdir}/rsyslog/mmsnareparse.so
@@ -939,6 +1038,28 @@ done
 %defattr(-,root,root)
 %{_libdir}/rsyslog/omhttp.so
 
+%if 0%{?rhel} >= 9
+%files omkinesis
+%defattr(-,root,root)
+%{_libdir}/rsyslog/omkinesis.so
+%endif
+
+%files imhttp
+%defattr(-,root,root)
+%{_libdir}/rsyslog/imhttp.so
+
+%files omotel
+%defattr(-,root,root)
+%{_libdir}/rsyslog/omotel.so
+
+%files omazuredce
+%defattr(-,root,root)
+%{_libdir}/rsyslog/omazuredce.so
+
+%files omsendertrack
+%defattr(-,root,root)
+%{_libdir}/rsyslog/omsendertrack.so
+
 %files mmdblookup
 %defattr(-,root,root)
 %{_libdir}/rsyslog/mmdblookup.so
@@ -949,6 +1070,13 @@ done
 
 
 %changelog
+* Tue Jul 14 2026 Andre Lorbach - 8.2604.0-1
+- Rebase the stable RPM source to 8.2604.0.
+- Add omazuredce and omsendertrack output module subpackages.
+
+* Mon May 11 2026 Andre Lorbach - 8.2602.0-2
+- Add rsyslog-imbeats subpackage (imbeats input module, Lumberjack v2).
+
 * Fri Feb 27 2026 Andre Lorbach - 8.2602.0-1
 - Release build for 8.2602.0
 

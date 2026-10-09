@@ -61,13 +61,15 @@ EXTRA_DIST = \
     ai/drift_monitoring.md \
     ai/mermaid_rules.md \
     ai/module_map.yaml \
+    ai/security_triage_rubric.md \
     ai/structure_and_paths.md \
     ai/templates/template-concept.rst \
     ai/templates/template-tutorial.rst \
     ai/terminology.md \
     build_rag_db.py \
-    contrib/README.md \
-    contrib/cron_build_all_branches.sh \
+    security/distro-component-package-map.json \
+    security/distro-component-package-map.md \
+    security/ghsa-coordination-review-template.md \
     proposed-toc \
     requirements.txt \
     source/_ext/edit_on_github.py \
@@ -183,12 +185,15 @@ EXTRA_DIST = \
     source/configuration/modules/imdiag.rst \
     source/configuration/modules/imdocker.rst \
     source/configuration/modules/imdtls.rst \
+    source/configuration/modules/imbeats.rst \
     source/configuration/modules/imfile.rst \
+    source/configuration/modules/imfifo.rst \
     source/configuration/modules/imgssapi.rst \
     source/configuration/modules/imhiredis.rst \
     source/configuration/modules/imhttp.rst \
     source/configuration/modules/imjournal.rst \
     source/configuration/modules/imkafka.rst \
+    source/configuration/modules/imkubernetes.rst \
     source/configuration/modules/imklog.rst \
     source/configuration/modules/imkmsg.rst \
     source/configuration/modules/immark.rst \
@@ -226,8 +231,46 @@ EXTRA_DIST = \
     source/configuration/modules/mmtaghostname.rst \
     source/configuration/modules/mmutf8fix.rst \
     source/configuration/modules/module_workflow.png \
+    source/reference/parameters/imbeats-address.rst \
+    source/reference/parameters/imbeats-frametimeout.rst \
+    source/reference/parameters/imbeats-gnutlsprioritystring.rst \
+    source/reference/parameters/imbeats-idletimeout.rst \
+    source/reference/parameters/imbeats-keepalive.rst \
+    source/reference/parameters/imbeats-keepalive-interval.rst \
+    source/reference/parameters/imbeats-keepalive-probes.rst \
+    source/reference/parameters/imbeats-keepalive-time.rst \
+    source/reference/parameters/imbeats-listenportfilename.rst \
+    source/reference/parameters/imbeats-maxbatchbytes.rst \
+    source/reference/parameters/imbeats-maxcompressionratio.rst \
+    source/reference/parameters/imbeats-maxdecompressedsize.rst \
+    source/reference/parameters/imbeats-maxframesize.rst \
+    source/reference/parameters/imbeats-maxinflightbytes.rst \
+    source/reference/parameters/imbeats-maxsessions.rst \
+    source/reference/parameters/imbeats-maxwindowsize.rst \
+    source/reference/parameters/imbeats-name.rst \
+    source/reference/parameters/imbeats-networknamespace.rst \
+    source/reference/parameters/imbeats-permittedpeer.rst \
+    source/reference/parameters/imbeats-port.rst \
+    source/reference/parameters/imbeats-ruleset.rst \
+    source/reference/parameters/imbeats-starvationprotection-maxreads.rst \
+    source/reference/parameters/imbeats-streamdriver-authmode.rst \
+    source/reference/parameters/imbeats-streamdriver-cafile.rst \
+    source/reference/parameters/imbeats-streamdriver-certfile.rst \
+    source/reference/parameters/imbeats-streamdriver-checkextendedkeypurpose.rst \
+    source/reference/parameters/imbeats-streamdriver-crlfile.rst \
+    source/reference/parameters/imbeats-streamdriver-keyfile.rst \
+    source/reference/parameters/imbeats-streamdriver-mode.rst \
+    source/reference/parameters/imbeats-streamdriver-name.rst \
+    source/reference/parameters/imbeats-streamdriver-permitexpiredcerts.rst \
+    source/reference/parameters/imbeats-streamdriver-prioritizesan.rst \
+    source/reference/parameters/imbeats-streamdriver-tlsrevocationcheck.rst \
+    source/reference/parameters/imbeats-streamdriver-tlsverifydepth.rst \
+    source/reference/parameters/imbeats-workerthreads.rst \
+    source/reference/parameters/imbeats-windowtimeout.rst \
     source/configuration/modules/omamqp1.rst \
     source/configuration/modules/omazuredce.rst \
+    source/configuration/modules/omawslogshlc.rst \
+    source/configuration/modules/omkinesis.rst \
     source/configuration/modules/omazureeventhubs.rst \
     source/configuration/modules/omclickhouse.rst \
     source/configuration/modules/omczmq.rst \
@@ -292,6 +335,7 @@ EXTRA_DIST = \
     source/containers/development_images.rst \
     source/containers/dockerlogs.rst \
     source/containers/etl.rst \
+    source/containers/imbeats.rst \
     source/containers/index.rst \
     source/containers/minimal.rst \
     source/containers/standard.rst \
@@ -327,6 +371,7 @@ EXTRA_DIST = \
     source/development/generic_design.rst \
     source/development/index.rst \
     source/development/internal_tooling.rst \
+    source/development/performance_optimization.rst \
     source/development/yaml_config_architecture.rst \
     source/development/queueWorkerLogic.jpg \
     source/direct_queue0.png \
@@ -347,6 +392,8 @@ EXTRA_DIST = \
     source/faq/impstats-push-mode.rst \
     source/faq/imudp-packet-loss.rst \
     source/faq/index.rst \
+    source/faq/tls_anon_auth_mitm.rst \
+    source/faq/tls_mode0_disables_tls.rst \
     source/faq/vespa-ai-integration.rst \
     source/features.rst \
     source/getting_started/ai-assistants.rst \
@@ -408,6 +455,8 @@ EXTRA_DIST = \
     source/rainerscript/functions/mo-http_request.rst \
     source/rainerscript/functions/mo-unflatten.rst \
     source/rainerscript/functions/rs-append_json.rst \
+    source/rainerscript/functions/rs-cef_ext_escape.rst \
+    source/rainerscript/functions/rs-cbool.rst \
     source/rainerscript/functions/rs-cnum.rst \
     source/rainerscript/functions/rs-cstr.rst \
     source/rainerscript/functions/rs-dyn_inc.rst \
@@ -424,6 +473,7 @@ EXTRA_DIST = \
     source/rainerscript/functions/rs-lookup.rst \
     source/rainerscript/functions/rs-parse_json.rst \
     source/rainerscript/functions/rs-parse_time.rst \
+    source/rainerscript/functions/rs-parse_time_localtz.rst \
     source/rainerscript/functions/rs-percentile_observe.rst \
     source/rainerscript/functions/rs-previous_action_suspended.rst \
     source/rainerscript/functions/rs-prifilt.rst \
@@ -437,6 +487,7 @@ EXTRA_DIST = \
     source/rainerscript/functions/rs-split.rst \
     source/rainerscript/functions/rs-strlen.rst \
     source/rainerscript/functions/rs-substring.rst \
+    source/rainerscript/functions/rs-tocef.rst \
     source/rainerscript/functions/rs-tolower.rst \
     source/rainerscript/functions/rs-toupper.rst \
     source/rainerscript/functions/rs-trim.rst \
@@ -457,6 +508,7 @@ EXTRA_DIST = \
     source/reference/parameters/imdiag-inputshutdowntimeout.rst \
     source/reference/parameters/imdiag-listenportfilename.rst \
     source/reference/parameters/imdiag-listenportfilename-module.rst \
+    source/reference/parameters/imdiag-properterminationfile.rst \
     source/reference/parameters/imdiag-mainmsgqueuetimeoutenqueue.rst \
     source/reference/parameters/imdiag-mainmsgqueuetimeoutshutdown.rst \
     source/reference/parameters/imdiag-maxsessions.rst \
@@ -474,7 +526,23 @@ EXTRA_DIST = \
     source/reference/parameters/imdocker-listcontainersoptions.rst \
     source/reference/parameters/imdocker-pollinginterval.rst \
     source/reference/parameters/imdocker-retrievenewlogsfromstart.rst \
+    source/reference/parameters/imkubernetes-allowunsignedcerts.rst \
+    source/reference/parameters/imkubernetes-cacheentryttl.rst \
+    source/reference/parameters/imkubernetes-defaultfacility.rst \
+    source/reference/parameters/imkubernetes-defaultseverity.rst \
+    source/reference/parameters/imkubernetes-enrichkubernetes.rst \
+    source/reference/parameters/imkubernetes-escapelf.rst \
+    source/reference/parameters/imkubernetes-freshstarttail.rst \
+    source/reference/parameters/imkubernetes-kubernetesurl.rst \
+    source/reference/parameters/imkubernetes-logfileglob.rst \
+    source/reference/parameters/imkubernetes-pollinginterval.rst \
+    source/reference/parameters/imkubernetes-ruleset.rst \
+    source/reference/parameters/imkubernetes-skipverifyhost.rst \
+    source/reference/parameters/imkubernetes-tls-cacert.rst \
+    source/reference/parameters/imkubernetes-token.rst \
+    source/reference/parameters/imkubernetes-tokenfile.rst \
     source/reference/parameters/imdtls-address.rst \
+    source/reference/parameters/imdtls-listenportfilename.rst \
     source/reference/parameters/imdtls-name.rst \
     source/reference/parameters/imdtls-port.rst \
     source/reference/parameters/imdtls-ruleset.rst \
@@ -489,6 +557,7 @@ EXTRA_DIST = \
     source/reference/parameters/imfile-addmetadata.rst \
     source/reference/parameters/imfile-deletestateonfiledelete.rst \
     source/reference/parameters/imfile-deletestateonfilemove.rst \
+    source/reference/parameters/imfile-delay-message.rst \
     source/reference/parameters/imfile-discardtruncatedmsg.rst \
     source/reference/parameters/imfile-endmsg-regex.rst \
     source/reference/parameters/imfile-escapelf-replacement.rst \
@@ -521,6 +590,11 @@ EXTRA_DIST = \
     source/reference/parameters/imfile-tag.rst \
     source/reference/parameters/imfile-timeoutgranularity.rst \
     source/reference/parameters/imfile-trimlineoverbytes.rst \
+    source/reference/parameters/imfifo-facility.rst \
+    source/reference/parameters/imfifo-file.rst \
+    source/reference/parameters/imfifo-ruleset.rst \
+    source/reference/parameters/imfifo-severity.rst \
+    source/reference/parameters/imfifo-tag.rst \
     source/reference/parameters/imgssapi-inputgsslistenportfilename.rst \
     source/reference/parameters/imgssapi-inputgssserverkeepalive.rst \
     source/reference/parameters/imgssapi-inputgssservermaxsessions.rst \
@@ -543,6 +617,7 @@ EXTRA_DIST = \
     source/reference/parameters/imjournal-ignorenonvalidstatefile.rst \
     source/reference/parameters/imjournal-ignorepreviousmessages.rst \
     source/reference/parameters/imjournal-main.rst \
+    source/reference/parameters/imjournal-namespace.rst \
     source/reference/parameters/imjournal-persiststateinterval.rst \
     source/reference/parameters/imjournal-ratelimit-burst.rst \
     source/reference/parameters/imjournal-ratelimit-interval.rst \
@@ -659,9 +734,16 @@ EXTRA_DIST = \
     source/reference/parameters/imsolaris-imsolarislogsocketname.rst \
     source/reference/parameters/imtcp-address.rst \
     source/reference/parameters/imtcp-addtlframedelimiter.rst \
+    source/reference/parameters/imtcp-allowedsender.rst \
+    source/reference/parameters/imtcp-compression-driver.rst \
+    source/reference/parameters/imtcp-compression-maxdecompressedbytesperreceive.rst \
+    source/reference/parameters/imtcp-compression-maxexpansionratio.rst \
+    source/reference/parameters/imtcp-compression-maxtotalzstdwindowbytes.rst \
+    source/reference/parameters/imtcp-compression-mode.rst \
     source/reference/parameters/imtcp-disablelfdelimiter.rst \
     source/reference/parameters/imtcp-discardtruncatedmsg.rst \
     source/reference/parameters/imtcp-flowcontrol.rst \
+    source/reference/parameters/imtcp-failonbinderror.rst \
     source/reference/parameters/imtcp-gnutlsprioritystring.rst \
     source/reference/parameters/imtcp-keepalive-interval.rst \
     source/reference/parameters/imtcp-keepalive-probes.rst \
@@ -699,10 +781,12 @@ EXTRA_DIST = \
     source/reference/parameters/imtcp-supportoctetcountedframing.rst \
     source/reference/parameters/imtcp-workerthreads.rst \
     source/reference/parameters/imudp-address.rst \
+    source/reference/parameters/imudp-allowedsender.rst \
     source/reference/parameters/imudp-batchsize.rst \
     source/reference/parameters/imudp-defaulttz.rst \
     source/reference/parameters/imudp-device.rst \
     source/reference/parameters/imudp-ipfreebind.rst \
+    source/reference/parameters/imudp-listenportfilename.rst \
     source/reference/parameters/imudp-name-appendport.rst \
     source/reference/parameters/imudp-name.rst \
     source/reference/parameters/imudp-port.rst \
@@ -756,6 +840,11 @@ EXTRA_DIST = \
     source/reference/parameters/mmaitag-inputproperty.rst \
     source/reference/parameters/mmaitag-model.rst \
     source/reference/parameters/mmaitag-provider.rst \
+    source/reference/parameters/mmaitag-request-connecttimeoutms.rst \
+    source/reference/parameters/mmaitag-request-lowspeedlimit.rst \
+    source/reference/parameters/mmaitag-request-lowspeedtime.rst \
+    source/reference/parameters/mmaitag-request-timeoutms.rst \
+    source/reference/parameters/mmaitag-response-maxbytes.rst \
     source/reference/parameters/mmaitag-tag.rst \
     source/reference/parameters/mmanon-embeddedipv4-anonmode.rst \
     source/reference/parameters/mmanon-embeddedipv4-bits.rst \
@@ -794,7 +883,9 @@ EXTRA_DIST = \
     source/reference/parameters/mmexternal-binary.rst \
     source/reference/parameters/mmexternal-forcesingleinstance.rst \
     source/reference/parameters/mmexternal-interface-input.rst \
+    source/reference/parameters/mmexternal-interface-output.rst \
     source/reference/parameters/mmexternal-output.rst \
+    source/reference/parameters/mmexternal-responsetimeout.rst \
     source/reference/parameters/mmfields-jsonroot.rst \
     source/reference/parameters/mmfields-separator.rst \
     source/reference/parameters/mmjsonparse-allow_trailing.rst \
@@ -824,6 +915,7 @@ EXTRA_DIST = \
     source/reference/parameters/mmkubernetes-filenamerulebase.rst \
     source/reference/parameters/mmkubernetes-filenamerules.rst \
     source/reference/parameters/mmkubernetes-kubernetesurl.rst \
+    source/reference/parameters/mmkubernetes-includenamespacemetadata.rst \
     source/reference/parameters/mmkubernetes-skipverifyhost.rst \
     source/reference/parameters/mmkubernetes-srcmetadatapath.rst \
     source/reference/parameters/mmkubernetes-sslpartialchain.rst \
@@ -832,13 +924,19 @@ EXTRA_DIST = \
     source/reference/parameters/mmkubernetes-tls-myprivkey.rst \
     source/reference/parameters/mmkubernetes-token.rst \
     source/reference/parameters/mmkubernetes-tokenfile.rst \
+    source/reference/parameters/mmkubernetes-tokenreloadinterval.rst \
     source/reference/parameters/mmnormalize-allowregex.rst \
+    source/reference/parameters/mmnormalize-debug.rst \
+    source/reference/parameters/mmnormalize-debugfile.rst \
     source/reference/parameters/mmnormalize-path.rst \
     source/reference/parameters/mmnormalize-rule.rst \
     source/reference/parameters/mmnormalize-rulebase.rst \
+    source/reference/parameters/mmnormalize-turbo.rst \
     source/reference/parameters/mmnormalize-userawmsg.rst \
     source/reference/parameters/mmnormalize-variable.rst \
     source/reference/parameters/mmpstrucdata-jsonroot.rst \
+    source/reference/parameters/mmpstrucdata-container.rst \
+    source/reference/parameters/mmpstrucdata-maxstructureddatasize.rst \
     source/reference/parameters/mmpstrucdata-sd_name.lowercase.rst \
     source/reference/parameters/mmrfc5424addhmac-hashfunction.rst \
     source/reference/parameters/mmrfc5424addhmac-key.rst \
@@ -849,6 +947,7 @@ EXTRA_DIST = \
     source/reference/parameters/mmtaghostname-tag.rst \
     source/reference/parameters/mmutf8fix-mode.rst \
     source/reference/parameters/mmutf8fix-replacementchar.rst \
+    source/reference/parameters/mmutf8fix-replacementsequence.rst \
     source/reference/parameters/omazureeventhubs-amqp_address.rst \
     source/reference/parameters/omazureeventhubs-azure_key.rst \
     source/reference/parameters/omazureeventhubs-azure_key_name.rst \
@@ -868,6 +967,23 @@ EXTRA_DIST = \
     source/reference/parameters/omazuredce-table_name.rst \
     source/reference/parameters/omazuredce-template.rst \
     source/reference/parameters/omazuredce-tenant_id.rst \
+    source/reference/parameters/omawslogshlc-bearer_token.rst \
+    source/reference/parameters/omawslogshlc-log_group.rst \
+    source/reference/parameters/omawslogshlc-log_stream.rst \
+    source/reference/parameters/omawslogshlc-max_batch_size.rst \
+    source/reference/parameters/omawslogshlc-region.rst \
+    source/reference/parameters/omawslogshlc-template.rst \
+    source/reference/parameters/omkinesis-stream.rst \
+    source/reference/parameters/omkinesis-region.rst \
+    source/reference/parameters/omkinesis-partition_key.rst \
+    source/reference/parameters/omkinesis-partition_key_template.rst \
+    source/reference/parameters/omkinesis-template.rst \
+    source/reference/parameters/omkinesis-access_key.rst \
+    source/reference/parameters/omkinesis-secret_key.rst \
+    source/reference/parameters/omkinesis-session_token.rst \
+    source/reference/parameters/omkinesis-endpoint.rst \
+    source/reference/parameters/omkinesis-timeout.rst \
+    source/reference/parameters/omkinesis-max_record_size.rst \
     source/reference/parameters/omclickhouse-allowunsignedcerts.rst \
     source/reference/parameters/omclickhouse-bulkmode.rst \
     source/reference/parameters/omclickhouse-errorfile.rst \
@@ -901,9 +1017,11 @@ EXTRA_DIST = \
     source/reference/parameters/omelasticsearch-dynsearchindex.rst \
     source/reference/parameters/omelasticsearch-dynsearchtype.rst \
     source/reference/parameters/omelasticsearch-errorfile.rst \
+    source/reference/parameters/omelasticsearch-erroronly.rst \
     source/reference/parameters/omelasticsearch-esversion-major.rst \
     source/reference/parameters/omelasticsearch-healthchecktimeout.rst \
     source/reference/parameters/omelasticsearch-indextimeout.rst \
+    source/reference/parameters/omelasticsearch-interleaved.rst \
     source/reference/parameters/omelasticsearch-maxbytes.rst \
     source/reference/parameters/omelasticsearch-parent.rst \
     source/reference/parameters/omelasticsearch-pipelinename.rst \
@@ -923,12 +1041,17 @@ EXTRA_DIST = \
     source/reference/parameters/omelasticsearch-template.rst \
     source/reference/parameters/omelasticsearch-timeout.rst \
     source/reference/parameters/omelasticsearch-tls-cacert.rst \
+    source/reference/parameters/omelasticsearch-tls-ciphersuites.rst \
+    source/reference/parameters/omelasticsearch-tls-keyexchangegroups.rst \
     source/reference/parameters/omelasticsearch-tls-mycert.rst \
     source/reference/parameters/omelasticsearch-tls-myprivkey.rst \
+    source/reference/parameters/omelasticsearch-tls-tlsversion.rst \
     source/reference/parameters/omelasticsearch-uid.rst \
     source/reference/parameters/omelasticsearch-usehttps.rst \
     source/reference/parameters/omelasticsearch-writeoperation.rst \
+    source/reference/parameters/omfwd-compression-driver.rst \
     source/reference/parameters/omfwd-ratelimit-name.rst \
+    source/reference/parameters/omfwd-tcp-user-timeout.rst \
     source/reference/parameters/omfile-addlf.rst \
     source/reference/parameters/omfile-asyncwriting.rst \
     source/reference/parameters/omfile-closetimeout.rst \
@@ -941,7 +1064,9 @@ EXTRA_DIST = \
     source/reference/parameters/omfile-dirgroupnum.rst \
     source/reference/parameters/omfile-dirowner.rst \
     source/reference/parameters/omfile-dirownernum.rst \
+    source/reference/parameters/omfile-dynafile-dangerouspermitpathescape.rst \
     source/reference/parameters/omfile-dynafile-donotsuspend.rst \
+    source/reference/parameters/omfile-dynafile-restricttemplatetype.rst \
     source/reference/parameters/omfile-dynafile.rst \
     source/reference/parameters/omfile-dynafilecachesize.rst \
     source/reference/parameters/omfile-failonchownfailure.rst \
@@ -953,6 +1078,7 @@ EXTRA_DIST = \
     source/reference/parameters/omfile-fileownernum.rst \
     source/reference/parameters/omfile-flushinterval.rst \
     source/reference/parameters/omfile-flushontxend.rst \
+    source/reference/parameters/omfile-followsymlinks.rst \
     source/reference/parameters/omfile-iobuffersize.rst \
     source/reference/parameters/omfile-rotation-sizelimit.rst \
     source/reference/parameters/omfile-rotation-sizelimitcommand.rst \
@@ -1043,7 +1169,9 @@ EXTRA_DIST = \
     source/reference/parameters/ommail-body-enable.rst \
     source/reference/parameters/ommail-mailfrom.rst \
     source/reference/parameters/ommail-mailto.rst \
+    source/reference/parameters/ommail-mode.rst \
     source/reference/parameters/ommail-port.rst \
+    source/reference/parameters/ommail-sendmail-binary.rst \
     source/reference/parameters/ommail-server.rst \
     source/reference/parameters/ommail-subject-template.rst \
     source/reference/parameters/ommail-subject-text.rst \
@@ -1096,6 +1224,7 @@ EXTRA_DIST = \
     source/reference/parameters/omrelp-tls-mycert.rst \
     source/reference/parameters/omrelp-tls-myprivkey.rst \
     source/reference/parameters/omrelp-tls-permittedpeer.rst \
+    source/reference/parameters/omrelp-tls-permanentfailuredisablesaction.rst \
     source/reference/parameters/omrelp-tls-prioritystring.rst \
     source/reference/parameters/omrelp-tls-tlscfgcmd.rst \
     source/reference/parameters/omrelp-tls-tlslib.rst \
@@ -1103,6 +1232,7 @@ EXTRA_DIST = \
     source/reference/parameters/omrelp-windowsize.rst \
     source/reference/parameters/omsendertrack-cmdfile.rst \
     source/reference/parameters/omsendertrack-interval.rst \
+    source/reference/parameters/omsendertrack-ignoreinvalidstatefile.rst \
     source/reference/parameters/omsendertrack-senderid.rst \
     source/reference/parameters/omsendertrack-statefile.rst \
     source/reference/parameters/omsnmp-community.rst \
@@ -1143,6 +1273,8 @@ EXTRA_DIST = \
     source/reference/parameters/pmrfc3164-permit-slashesinhostname.rst \
     source/reference/parameters/pmrfc3164-permit-squarebracketsinhostname.rst \
     source/reference/parameters/pmrfc3164-remove-msgfirstspace.rst \
+    source/reference/tools/index.rst \
+    source/reference/tools/rsyslog-segqueue.rst \
     source/reference/properties/message-app-name.rst \
     source/reference/properties/message-fromhost-ip.rst \
     source/reference/properties/message-fromhost-port.rst \
@@ -1170,6 +1302,7 @@ EXTRA_DIST = \
     source/reference/properties/message-syslogseverity.rst \
     source/reference/properties/message-syslogtag.rst \
     source/reference/properties/message-timegenerated.rst \
+    source/reference/properties/message-timereceived.rst \
     source/reference/properties/message-timereported.rst \
     source/reference/properties/message-timestamp.rst \
     source/reference/properties/message-uuid.rst \
@@ -1205,7 +1338,9 @@ EXTRA_DIST = \
     source/troubleshooting/file_not_written.rst \
     source/troubleshooting/howtodebug.rst \
     source/troubleshooting/index.rst \
+    source/troubleshooting/queue_full.rst \
     source/troubleshooting/selinux.rst \
+    source/troubleshooting/service_sandboxing.rst \
     source/troubleshooting/troubleshoot.rst \
     source/tutorials/cert-script.tar.gz \
     source/tutorials/config_format_translation.rst \
@@ -1266,8 +1401,9 @@ EXTRA_DIST = \
     tools/buildenv/tools/help \
     tools/buildenv/tools/version-info \
     tools/fix-mermaid-offline.py \
+    tools/test_validate_doc_samples.py \
+    tools/validate-doc-samples.py \
     tools/inside_docker_doc_html.sh \
     tools/pages-root-index.html \
     tools/pages-robots.txt \
-    tools/release_build.sh \
-    utils/release_build.sh
+    tools/release_build.sh

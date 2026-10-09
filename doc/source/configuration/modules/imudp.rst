@@ -76,6 +76,10 @@ Module Parameters
      - .. include:: ../../reference/parameters/imudp-preservecase.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-imudp-allowedsender`
+     - .. include:: ../../reference/parameters/imudp-allowedsender.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
 .. index:: imudp; input parameters
 
 Input Parameters
@@ -93,6 +97,10 @@ Input Parameters
         :end-before: .. summary-end
    * - :ref:`param-imudp-port`
      - .. include:: ../../reference/parameters/imudp-port.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-imudp-listenportfilename`
+     - .. include:: ../../reference/parameters/imudp-listenportfilename.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
    * - :ref:`param-imudp-ipfreebind`
@@ -133,6 +141,10 @@ Input Parameters
         :end-before: .. summary-end
    * - :ref:`param-imudp-rcvbufsize`
      - .. include:: ../../reference/parameters/imudp-rcvbufsize.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-imudp-allowedsender`
+     - .. include:: ../../reference/parameters/imudp-allowedsender.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
 .. _imudp-statistic-counter:
@@ -352,8 +364,10 @@ Additional Resources
    ../../reference/parameters/imudp-batchsize
    ../../reference/parameters/imudp-threads
    ../../reference/parameters/imudp-preservecase
+   ../../reference/parameters/imudp-allowedsender
    ../../reference/parameters/imudp-address
    ../../reference/parameters/imudp-port
+   ../../reference/parameters/imudp-listenportfilename
    ../../reference/parameters/imudp-ipfreebind
    ../../reference/parameters/imudp-device
    ../../reference/parameters/imudp-ruleset

@@ -88,6 +88,19 @@ Modern pipelines should prefer structured JSON. The recommended method is:
 
 This ensures correct escaping and avoids handcrafted JSON concatenation.
 
+JSON arrays and objects with JSONF
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When a property already contains a JSON value, for example one created by
+:ref:`mmjsonparse <ref-mmjsonparse>` or :doc:`parse_json()
+<../rainerscript/functions/rs-parse_json>`, ``format="jsonf"`` emits that
+value as JSON. Arrays remain arrays and objects remain objects.
+
+``dataType`` is only for converting scalar string properties to JSON strings,
+numbers, or booleans. It does not parse strings that look like JSON, and there
+is intentionally no ``dataType="array"``. Parse JSON text first, then render
+the resulting JSON value.
+
 Detailed examples are provided in the template type pages.
 
 
@@ -115,6 +128,20 @@ Predefined reserved templates like ``RSYSLOG_ForwardFormat`` or
 
 If your output is a **structured JSON pipeline** (e.g. to Elasticsearch
 or a file), you do not need to add any textual header.
+
+
+Templates for dynamic file names
+--------------------------------
+
+Templates used as ``omfile`` ``dynaFile`` names need additional care:
+each message-derived path component must be escaped. Use
+``secpath-replace`` in string templates, or ``securePath="replace"`` in
+list template ``property()`` statements. Apply this to fields such as
+``HOSTNAME``, ``programname``, ``APP-NAME``, and variables parsed from
+the message. Fixed directory separators should remain in constant text.
+
+This prevents sender-controlled values from selecting parent directories
+or absolute paths while keeping readable file names.
 
 
 .. _templates.template-object:
@@ -247,6 +274,8 @@ For modern JSON pipelines, prefer custom list or subtree templates.
      - High-precision forwarding format
    * - RSYSLOG_SyslogProtocol23Format
      - Format from IETF draft syslog-protocol-23
+   * - RSYSLOG_SyslogRFC5424Format
+     - RFC 5424 syslog format without trailing line feed
    * - RSYSLOG_DebugFormat
      - Troubleshooting format listing all properties
    * - RSYSLOG_WallFmt
@@ -259,8 +288,6 @@ For modern JSON pipelines, prefer custom list or subtree templates.
      - Insert command for PostgreSQL
    * - RSYSLOG_spoofadr
      - Sender IP address only
-   * - RSYSLOG_StdJSONFmt
-     - JSON structure of message properties
 
 
 Legacy ``$template`` statement

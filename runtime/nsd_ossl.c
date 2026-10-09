@@ -50,6 +50,7 @@
 #include "net_ossl.h"  // Include OpenSSL Helpers
 #include "nsd_ptcp.h"
 #include "nsd_ossl.h"
+#include "srUtils.h"
 #include "unicode-helper.h"
 #include "rsconf.h"
 
@@ -292,6 +293,13 @@ rsRetVal osslRecordRecv(nsd_ossl_t *pThis, unsigned *const nextIODirection) {
             DBGPRINTF("osslRecordRecv: SSL_ERROR_ZERO_RETURN received, connection may closed already\n");
             ABORT_FINALIZE(RS_RET_RETRY);
         } else if (err == SSL_ERROR_SYSCALL) {
+#ifdef ENABLE_WOLFSSL
+            if (SSL_want_read(pThis->pNetOssl->ssl) || SSL_want_write(pThis->pNetOssl->ssl)) {
+                pThis->rtryCall = osslRtry_recv;
+                pThis->rtryOsslErr = SSL_want_write(pThis->pNetOssl->ssl) ? SSL_ERROR_WANT_WRITE : SSL_ERROR_WANT_READ;
+                ABORT_FINALIZE(RS_RET_RETRY);
+            }
+#endif
             /* Output error and abort */
             nsd_ossl_lastOpenSSLErrorMsg(pThis, lenRcvd, pThis->pNetOssl->ssl, LOG_INFO, "osslRecordRecv",
                                          "SSL_read 1");
@@ -327,6 +335,28 @@ finalize_it:
     }
     dbgprintf("osslRecordRecv return. nsd %p, iRet %d, lenRcvd %zd, lenRcvBuf %d, ptrRcvBuf %d\n", pThis, iRet, lenRcvd,
               pThis->lenRcvBuf, pThis->ptrRcvBuf);
+    RETiRet;
+}
+
+static rsRetVal retrySendSideRecordRecv(nsd_ossl_t *const pThis) {
+    DEFiRet;
+    unsigned nextIODirection;
+    rsRetVal recvRet;
+
+    if (pThis->pszRcvBuf == NULL) {
+        CHKmalloc(pThis->pszRcvBuf = malloc(NSD_OSSL_MAX_RCVBUF));
+        pThis->lenRcvBuf = -1;
+    }
+    if (pThis->lenRcvBuf == -1) {
+        recvRet = osslRecordRecv(pThis, &nextIODirection);
+        if (recvRet != RS_RET_OK && recvRet != RS_RET_RETRY) ABORT_FINALIZE(recvRet);
+        if (recvRet == RS_RET_RETRY) ABORT_FINALIZE(RS_RET_RETRY);
+        pThis->rtryCall = osslRtry_None;
+        pThis->rtryOsslErr = SSL_ERROR_NONE;
+        if (pThis->lenRcvBuf == 0) ABORT_FINALIZE(RS_RET_CLOSED);
+    }
+
+finalize_it:
     RETiRet;
 }
 
@@ -759,6 +789,21 @@ static rsRetVal SetKeepAliveTime(nsd_t *pNsd, int keepAliveTime) {
 
     dbgprintf("SetKeepAliveTime: keepAliveTime=%d\n", keepAliveTime);
     nsd_ptcp.SetKeepAliveTime(pThis->pTcp, keepAliveTime);
+
+    RETiRet;
+}
+
+/* TCP user timeout option
+ */
+static rsRetVal SetTcpUserTimeout(nsd_t *pNsd, int tcpUserTimeout) {
+    DEFiRet;
+    nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
+
+    ISOBJ_TYPE_assert((pThis), nsd_ossl);
+    assert(tcpUserTimeout >= 0);
+
+    dbgprintf("SetTcpUserTimeout: tcpUserTimeout=%d\n", tcpUserTimeout);
+    nsd_ptcp.SetTcpUserTimeout(pThis->pTcp, tcpUserTimeout);
 
     RETiRet;
 }
@@ -1217,6 +1262,9 @@ static rsRetVal Send(nsd_t *pNsd, uchar *pBuf, ssize_t *pLenBuf) {
     DEFiRet;
     int iSent;
     int err;
+#ifdef ENABLE_WOLFSSL
+    unsigned wolfsslSendReadRetries = 0;
+#endif
     nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
     DBGPRINTF("Send for %p\n", pNsd);
 
@@ -1227,6 +1275,10 @@ static rsRetVal Send(nsd_t *pNsd, uchar *pBuf, ssize_t *pLenBuf) {
     if (pThis->iMode == 0) {
         CHKiRet(nsd_ptcp.Send(pThis->pTcp, pBuf, pLenBuf));
         FINALIZE;
+    }
+
+    if (pThis->rtryCall == osslRtry_recv) {
+        CHKiRet(retrySendSideRecordRecv(pThis));
     }
 
     while (1) {
@@ -1240,6 +1292,11 @@ static rsRetVal Send(nsd_t *pNsd, uchar *pBuf, ssize_t *pLenBuf) {
                 DBGPRINTF("Send: SSL_ERROR_ZERO_RETURN received, connection closed by peer\n");
                 ABORT_FINALIZE(RS_RET_CLOSED);
             } else if (err == SSL_ERROR_SYSCALL) {
+#ifdef ENABLE_WOLFSSL
+                if (SSL_want_read(pThis->pNetOssl->ssl) || SSL_want_write(pThis->pNetOssl->ssl)) {
+                    ABORT_FINALIZE(RS_RET_RETRY);
+                }
+#endif
                 /* Output error and abort */
                 nsd_ossl_lastOpenSSLErrorMsg(pThis, iSent, pThis->pNetOssl->ssl, LOG_INFO, "Send", "SSL_write");
                 iRet = RS_RET_TLS_ERR_SYSCALL;
@@ -1261,21 +1318,46 @@ static rsRetVal Send(nsd_t *pNsd, uchar *pBuf, ssize_t *pLenBuf) {
                  * OpenSSL needs us to READ or WRITE to make progress.
                  * In TLS 1.3, servers may send post-handshake messages (e.g. KeyUpdate)
                  * which require the client to read before it can continue writing.
-                 * Use the buffered receive helper to preserve any application data.
                  */
                 if (err == SSL_ERROR_WANT_READ) {
-                    unsigned nextIODirection ATTR_UNUSED;
-                    rsRetVal rcvRet = osslRecordRecv(pThis, &nextIODirection);
-                    if (rcvRet == RS_RET_CLOSED) {
-                        ABORT_FINALIZE(RS_RET_CLOSED);
-                    } else if (rcvRet != RS_RET_OK && rcvRet != RS_RET_RETRY) {
-                        ABORT_FINALIZE(rcvRet);
+#ifdef ENABLE_WOLFSSL
+                    /*
+                     * wolfSSL's OpenSSL compatibility layer has historically needed
+                     * this local progress loop for the wolfSSL CI lane. Keep real
+                     * OpenSSL on the nonblocking retry propagation path below.
+                     */
+                    unsigned nextIODirection;
+                    rsRetVal recvRet;
+
+                    if (pThis->pszRcvBuf == NULL) {
+                        CHKmalloc(pThis->pszRcvBuf = malloc(NSD_OSSL_MAX_RCVBUF));
+                        pThis->lenRcvBuf = -1;
                     }
-                    if (SSL_get_shutdown(pThis->pNetOssl->ssl) == SSL_RECEIVED_SHUTDOWN) {
-                        dbgprintf("Send: detected SSL_RECEIVED_SHUTDOWN while handling WANT_READ\n");
-                        ABORT_FINALIZE(RS_RET_CLOSED);
+                    if (pThis->lenRcvBuf == -1) {
+                        recvRet = osslRecordRecv(pThis, &nextIODirection);
+                        if (recvRet != RS_RET_OK && recvRet != RS_RET_RETRY) ABORT_FINALIZE(recvRet);
+                        if (recvRet == RS_RET_RETRY) {
+                            if (++wolfsslSendReadRetries >= 100) ABORT_FINALIZE(RS_RET_RETRY);
+                            srSleep(0, 10000);
+                            pThis->rtryCall = osslRtry_None;
+                            pThis->rtryOsslErr = SSL_ERROR_NONE;
+                            continue;
+                        }
+                        wolfsslSendReadRetries = 0;
+                        pThis->rtryCall = osslRtry_None;
+                        pThis->rtryOsslErr = SSL_ERROR_NONE;
+                        if (pThis->lenRcvBuf == 0) ABORT_FINALIZE(RS_RET_CLOSED);
                     }
+#else
+                    /*
+                     * Preserve any application data read while driving send-side TLS
+                     * control traffic.  TLS 1.3 post-handshake messages can make
+                     * SSL_write() need a read, and SSL_read() may return application
+                     * bytes after processing that control traffic.
+                     */
+                    CHKiRet(retrySendSideRecordRecv(pThis));
                     /* Continue loop to retry SSL_write */
+#endif
                 } else {
                     /* Check for SSL Shutdown */
                     if (SSL_get_shutdown(pThis->pNetOssl->ssl) == SSL_RECEIVED_SHUTDOWN) {
@@ -1374,10 +1456,10 @@ finalize_it:
 
 static rsRetVal SetGnutlsPriorityString(nsd_t *const pNsd, uchar *const gnutlsPriorityString) {
     DEFiRet;
-    nsd_ossl_t *pThis = (nsd_ossl_t *)pNsd;
+    nsd_ossl_t __attribute__((unused)) *pThis = (nsd_ossl_t *)pNsd;
     ISOBJ_TYPE_assert(pThis, nsd_ossl);
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)) || defined(ENABLE_WOLFSSL)
     sbool ApplySettings = 0;
     if ((gnutlsPriorityString != NULL && pThis->gnutlsPriorityString == NULL) ||
         (gnutlsPriorityString != NULL &&
@@ -1405,11 +1487,11 @@ static rsRetVal SetGnutlsPriorityString(nsd_t *const pNsd, uchar *const gnutlsPr
 }
 
 
-static rsRetVal applyGnutlsPriorityString(nsd_ossl_t *const pThis) {
+static rsRetVal applyGnutlsPriorityString(nsd_ossl_t __attribute__((unused)) *const pThis) {
     DEFiRet;
     ISOBJ_TYPE_assert(pThis, nsd_ossl);
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)) || defined(ENABLE_WOLFSSL)
     /* Note: we disable unkonwn functions. The corresponding error message is
      * generated during SetGntuTLSPriorityString().
      */
@@ -1420,7 +1502,7 @@ static rsRetVal applyGnutlsPriorityString(nsd_ossl_t *const pThis) {
     }
 #endif
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(ENABLE_WOLFSSL)
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)) || defined(ENABLE_WOLFSSL)
 finalize_it:
 #endif
     RETiRet;
@@ -1495,6 +1577,7 @@ static rsRetVal SetTlsRevocationCheck(nsd_t *pNsd, int enabled) {
 
     ISOBJ_TYPE_assert((pThis), nsd_ossl);
     pThis->DrvrTlsRevocationCheck = (enabled != 0) ? 1 : 0;
+    pThis->pNetOssl->bTlsRevocationCheck = pThis->DrvrTlsRevocationCheck;
     dbgprintf("SetTlsRevocationCheck: revocation check %s\n", pThis->DrvrTlsRevocationCheck ? "enabled" : "disabled");
 
     RETiRet;
@@ -1527,6 +1610,22 @@ static rsRetVal SetTlsCRLFile(nsd_t *pNsd, const uchar *const crlFile) {
 
     if (crlFile != NULL) {
         CHKmalloc(pThis->pNetOssl->pszCRLFile = (const uchar *)strdup((const char *)crlFile));
+    }
+
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal SetTlsCAExtraFiles(nsd_t *pNsd, const uchar *const extraCaFiles) {
+    DEFiRet;
+    nsd_ossl_t *const pThis = (nsd_ossl_t *)pNsd;
+
+    ISOBJ_TYPE_assert((pThis), nsd_ossl);
+    free((void *)pThis->pNetOssl->pszExtraCAFiles);
+    pThis->pNetOssl->pszExtraCAFiles = NULL;
+
+    if (extraCaFiles != NULL) {
+        CHKmalloc(pThis->pNetOssl->pszExtraCAFiles = (const uchar *)strdup((const char *)extraCaFiles));
     }
 
 finalize_it:
@@ -1629,6 +1728,7 @@ BEGINobjQueryInterface(nsd_ossl)
     pIf->SetKeepAliveIntvl = SetKeepAliveIntvl;
     pIf->SetKeepAliveProbes = SetKeepAliveProbes;
     pIf->SetKeepAliveTime = SetKeepAliveTime;
+    pIf->SetTcpUserTimeout = SetTcpUserTimeout;
     pIf->SetGnutlsPriorityString = SetGnutlsPriorityString; /* we don't NEED this interface! */
     pIf->SetCheckExtendedKeyUsage = SetCheckExtendedKeyUsage; /* we don't NEED this interface! */
     pIf->SetPrioritizeSAN = SetPrioritizeSAN;
@@ -1636,6 +1736,7 @@ BEGINobjQueryInterface(nsd_ossl)
     pIf->SetTlsRevocationCheck = SetTlsRevocationCheck;
     pIf->SetTlsCAFile = SetTlsCAFile;
     pIf->SetTlsCRLFile = SetTlsCRLFile;
+    pIf->SetTlsCAExtraFiles = SetTlsCAExtraFiles;
     pIf->SetTlsKeyFile = SetTlsKeyFile;
     pIf->SetTlsCertFile = SetTlsCertFile;
     pIf->GetRemotePort = GetRemotePort;

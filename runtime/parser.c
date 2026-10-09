@@ -260,6 +260,8 @@ finalize_it:
  * rgerhards, 2008-10-09
  */
 static rsRetVal uncompressMessage(smsg_t *pMsg) {
+    static unsigned int empty_msg_err_rate_limiter = 0;
+    static pthread_mutex_t mut_empty_msg_err_rate_limiter = PTHREAD_MUTEX_INITIALIZER;
     DEFiRet;
     uchar *deflateBuf = NULL;
     uLongf iLenDefBuf;
@@ -273,7 +275,8 @@ static rsRetVal uncompressMessage(smsg_t *pMsg) {
     /* we first need to check if we have a compressed record. If so,
      * we must decompress it.
      */
-    if (lenMsg > 0 && *pszMsg == 'z' && runConf->globals.bSupportCompressionExtension) { /* compressed data present? */
+    if (lenMsg > 0 && *pszMsg == 'z' && runConf->globals.bSupportCompressionExtension &&
+        !(pMsg->msgFlags & NO_LEGACY_Z_DECOMPRESS)) { /* compressed data present? */
         /* we have compressed data, so let's deflate it. We support a maximum
          * message size of iMaxLine. If it is larger, an error message is logged
          * and the message is dropped. We do NOT try to decompress larger messages
@@ -302,6 +305,20 @@ static rsRetVal uncompressMessage(smsg_t *pMsg) {
                      "Message ignored.",
                      ret);
             FINALIZE; /* unconditional exit, nothing left to do... */
+        }
+        if (iLenDefBuf == 0) {
+            int shouldLog = 0;
+            pthread_mutex_lock(&mut_empty_msg_err_rate_limiter);
+            if (empty_msg_err_rate_limiter < 1000) {
+                ++empty_msg_err_rate_limiter;
+                shouldLog = 1;
+            }
+            pthread_mutex_unlock(&mut_empty_msg_err_rate_limiter);
+            if (shouldLog) {
+                LogError(0, NO_ERRCODE, "legacy zlib decompression produced an empty message; discarding");
+            }
+            DBGPRINTF("legacy zlib decompression produced an empty message; discarding\n");
+            ABORT_FINALIZE(RS_RET_EMPTY_MSG);
         }
         MsgSetRawMsg(pMsg, (char *)deflateBuf, iLenDefBuf);
     }
@@ -335,12 +352,13 @@ static rsRetVal SanitizeMsg(smsg_t *pMsg) {
     size_t iDst;
     size_t iMaxLine;
     size_t maxDest;
+    size_t iFirstSanitize;
     uchar pc;
     sbool bUpdatedLen = RSFALSE;
     uchar szSanBuf[32 * 1024]; /* buffer used for sanitizing a string */
 
     assert(pMsg != NULL);
-    assert(pMsg->iLenRawMsg > 0);
+    if (pMsg->iLenRawMsg == 0) ABORT_FINALIZE(RS_RET_EMPTY_MSG);
 
     pszMsg = pMsg->pszRawMsg;
     lenMsg = pMsg->iLenRawMsg;
@@ -367,6 +385,13 @@ static rsRetVal SanitizeMsg(smsg_t *pMsg) {
         bUpdatedLen = RSTRUE;
     }
 
+    if (glbl.GetParserDropTrailingCROnReception(runConf) && lenMsg > 0 && pszMsg[lenMsg - 1] == '\r') {
+        DBGPRINTF("dropped CR at very end of message (DropTrailingCR is set)\n");
+        lenMsg--;
+        pszMsg[lenMsg] = '\0';
+        bUpdatedLen = RSTRUE;
+    }
+
     /* it is much quicker to sweep over the message and see if it actually
      * needs sanitation than to do the sanitation in any case. So we first do
      * this and terminate when it is not needed - which is expectedly the case
@@ -378,19 +403,24 @@ static rsRetVal SanitizeMsg(smsg_t *pMsg) {
      * need below (but it then still will work perfectly well!). -- rgerhards, 2009-11-27
      */
     int bNeedSanitize = 0;
+    iFirstSanitize = lenMsg;
     for (iSrc = 0; iSrc < lenMsg; iSrc++) {
         if (pszMsg[iSrc] < 32) {
             if (glbl.GetParserSpaceLFOnReceive(runConf) && pszMsg[iSrc] == '\n') {
                 pszMsg[iSrc] = ' ';
             } else if (pszMsg[iSrc] == '\0' || glbl.GetParserEscapeControlCharactersOnReceive(runConf)) {
                 bNeedSanitize = 1;
+                if (iFirstSanitize == lenMsg) iFirstSanitize = iSrc;
                 if (!glbl.GetParserSpaceLFOnReceive(runConf)) {
                     break;
                 }
             }
         } else if (pszMsg[iSrc] > 127 && glbl.GetParserEscape8BitCharactersOnReceive(runConf)) {
             bNeedSanitize = 1;
-            break;
+            if (iFirstSanitize == lenMsg) iFirstSanitize = iSrc;
+            if (!glbl.GetParserSpaceLFOnReceive(runConf)) {
+                break;
+            }
         }
     }
 
@@ -398,6 +428,7 @@ static rsRetVal SanitizeMsg(smsg_t *pMsg) {
         if (bUpdatedLen == RSTRUE) MsgSetRawMsgSize(pMsg, lenMsg);
         FINALIZE;
     }
+    iSrc = iFirstSanitize;
 
     /* now copy over the message and sanitize it. Note that up to iSrc-1 there was
      * obviously no need to sanitize, so we can go over that quickly...
@@ -424,6 +455,11 @@ static rsRetVal SanitizeMsg(smsg_t *pMsg) {
     iDst = iSrc;
     while (iSrc < lenMsg && iDst < maxDest - 3) { /* leave some space if last char must be escaped */
         if ((pszMsg[iSrc] < 32) && (pszMsg[iSrc] != '\t' || glbl.GetParserEscapeControlCharacterTab(runConf))) {
+            if (glbl.GetParserSpaceLFOnReceive(runConf) && pszMsg[iSrc] == '\n') {
+                pDst[iDst++] = ' ';
+                iSrc++;
+                continue;
+            }
             /* note: \0 must always be escaped, the rest of the code currently
              * can not handle it! -- rgerhards, 2009-08-26
              */
@@ -514,38 +550,72 @@ finalize_it:
     RETiRet;
 }
 
+/* Helper to compute the offset immediately after the initial PRI.
+ * Returns the offset of the first byte after the closing '>' if a valid
+ * PRI is found, or -1 if the message does not start with a valid PRI.
+ * Valid PRI format is '<' followed by 1 to 3 decimal digits and '>'.
+ * The PRI value must also be <= LOG_MAXPRI (191).
+ */
+static int compute_off_after_pri(const uchar *buf, size_t len, int *pri) {
+    if (len < 3 || buf[0] != '<') {
+        return -1;
+    }
+    if (isdigit(buf[1]) && buf[2] == '>') {
+        if (pri != NULL) {
+            *pri = buf[1] - '0';
+        }
+        return 3;
+    }
+    if (len >= 4 && isdigit(buf[1]) && isdigit(buf[2]) && buf[3] == '>') {
+        if (pri != NULL) {
+            *pri = (buf[1] - '0') * 10 + (buf[2] - '0');
+        }
+        return 4;
+    }
+    if (len >= 5 && isdigit(buf[1]) && isdigit(buf[2]) && isdigit(buf[3]) && buf[4] == '>') {
+        int val = (buf[1] - '0') * 100 + (buf[2] - '0') * 10 + (buf[3] - '0');
+        if (val <= LOG_MAXPRI) {
+            if (pri != NULL) {
+                *pri = val;
+            }
+            return 5;
+        }
+    }
+    return -1;
+}
+
 /* A standard parser to parse out the PRI. This is made available in
  * this module as it is expected that allmost all parsers will need
  * that functionality and so they do not need to implement it themsleves.
  */
-static rsRetVal ParsePRI(smsg_t *pMsg) {
+rsRetVal parserParsePRI(smsg_t *pMsg) {
     syslog_pri_t pri;
-    uchar *msg;
-    int lenMsg;
     DEFiRet;
 
     /* pull PRI */
-    lenMsg = pMsg->iLenRawMsg;
-    msg = pMsg->pszRawMsg;
     pri = DEFUPRI;
     if (pMsg->msgFlags & NO_PRI_IN_RAW) {
         /* In this case, simply do so as if the pri would be right at top */
+        msgSetPRI(pMsg, pri);
         MsgSetAfterPRIOffs(pMsg, 0);
     } else {
-        if (*msg == '<') {
-            pri = 0;
-            while (--lenMsg > 0 && isdigit((int)*++msg) && pri <= LOG_MAXPRI) {
-                pri = 10 * pri + (*msg - '0');
-            }
-            if (*msg == '>') {
-                ++msg;
+        if (pMsg->iLenRawMsg > 0 && pMsg->pszRawMsg[0] == '<') {
+            int parsed_pri = 0;
+            int offs = compute_off_after_pri(pMsg->pszRawMsg, pMsg->iLenRawMsg, &parsed_pri);
+            if (offs != -1) {
+                pri = parsed_pri;
+                msgSetPRI(pMsg, pri);
+                MsgSetAfterPRIOffs(pMsg, offs);
             } else {
                 pri = LOG_PRI_INVLD;
+                msgSetPRI(pMsg, pri);
+                MsgSetAfterPRIOffs(pMsg, 0);
             }
-            if (pri > LOG_MAXPRI) pri = LOG_PRI_INVLD;
+        } else {
+            pri = DEFUPRI;
+            msgSetPRI(pMsg, pri);
+            MsgSetAfterPRIOffs(pMsg, 0);
         }
-        msgSetPRI(pMsg, pri);
-        MsgSetAfterPRIOffs(pMsg, (pri == LOG_PRI_INVLD) ? 0 : msg - pMsg->pszRawMsg);
     }
     RETiRet;
 }
@@ -594,7 +664,7 @@ static rsRetVal ParseMsg(smsg_t *pMsg) {
         if (pParser->bDoSanitazion && bIsSanitized == RSFALSE) {
             CHKiRet(SanitizeMsg(pMsg));
             if (pParser->bDoPRIParsing && bPRIisParsed == RSFALSE) {
-                CHKiRet(ParsePRI(pMsg));
+                CHKiRet(parserParsePRI(pMsg));
                 bPRIisParsed = RSTRUE;
             }
             bIsSanitized = RSTRUE;

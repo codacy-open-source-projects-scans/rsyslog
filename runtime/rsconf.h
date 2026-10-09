@@ -37,6 +37,14 @@
 #define REPORT_CHILD_PROCESS_EXITS_ERRORS 1
 #define REPORT_CHILD_PROCESS_EXITS_ALL 2
 
+#define COMPAT_CONFIGFORMAT_ENABLE 0
+#define COMPAT_CONFIGFORMAT_WARN 1
+#define COMPAT_CONFIGFORMAT_DISABLE 2
+
+#define COMPAT_DEFAULTS_SECURE_STRICT 0
+#define COMPAT_DEFAULTS_SECURE_BACKWARD_COMPATIBLE 1
+#define COMPAT_DEFAULTS_SECURE_WARN 2
+
 #ifndef DFLT_INT_MSGS_SEV_FILTER
     #define DFLT_INT_MSGS_SEV_FILTER 6 /* Warning level and more important */
 #endif
@@ -70,6 +78,7 @@ struct queuecnf_s {
 struct parsercnf_s {
     uchar cCCEscapeChar; /* character to be used to start an escape sequence for control chars */
     int bDropTrailingLF; /* drop trailing LF's on reception? */
+    int bDropTrailingCR; /* drop trailing CR's on reception? */
     int bEscapeCCOnRcv; /* escape control characters on reception: 0 - no, 1 - yes */
     int bSpaceLFOnRcv; /* replace newlines with spaces on reception: 0 - no, 1 - yes */
     int bEscape8BitChars; /* escape characters > 127 on reception: 0 - no, 1 - yes */
@@ -100,6 +109,11 @@ struct globals_s {
                       config) if there was any issue in conf */
     int bAbortOnFailedQueueStartup; /* similar to bAbortOnUncleanConfig, but abort if a queue
                        startup fails. This is not exactly an unclan config. */
+    int compatConfigFormatLegacy; /* policy for legacy $-directives */
+    int compatConfigFormatSyslogd; /* policy for classic syslogd PRI selectors */
+    int compatConfigFormatProperty; /* policy for classic property-based selector filters */
+    int compatDefaultsSecure; /* policy for defaults that affect secure-by-default behavior */
+    int systemdNotifyReadyDelay; /* delay sd_notify READY=1 until opt-in modules report ready */
     int uidDropPriv; /* user-id to which priveleges should be dropped to */
     int gidDropPriv; /* group-id to which priveleges should be dropped to */
     int gidDropPrivKeepSupplemental; /* keep supplemental groups when dropping? */
@@ -138,6 +152,7 @@ struct globals_s {
                                    * 1 - yes
                                    * 0 - send them to libstdlog (e.g. to push to journal) or syslog()
                                    */
+    int iMaxOpenFiles; /* requested RLIMIT_NOFILE value, 0 means leave OS limit unchanged */
     uint64_t glblDevOptions; /* to be used by developers only */
     int intMsgRateLimitItv;
     int intMsgRateLimitBurst;
@@ -235,6 +250,9 @@ struct actions_s {
      * is no better name available.
      */
     int iActionNbr;
+    char **action_names;
+    size_t n_action_names;
+    size_t n_action_names_alloc;
 };
 
 
@@ -295,6 +313,20 @@ extern rsconf_t *loadConf; /* the config currently being loaded (no concurrent c
 
 
 int rsconfNeedDropPriv(rsconf_t *const cnf);
+
+/* module readiness barrier (see rsconf.c for details).
+ * Only meaningful when rsyslog is managed by systemd; stubs compile away
+ * otherwise so imfile and other opt-in modules need no #ifdef guards. */
+#ifdef HAVE_LIBSYSTEMD
+void rsconfRegisterReadiness(void);
+void rsconfSignalReady(void);
+void rsconfWaitForModulesReady(void);
+void rsconfReadyNotifySent(void);
+int rsconfShouldDelayReadyNotify(rsconf_t *cnf);
+#else
+static inline void rsconfRegisterReadiness(void) {}
+static inline void rsconfSignalReady(void) {}
+#endif
 
 /* some defaults (to be removed?) */
 #define DFLT_bLogStatusMsgs 1

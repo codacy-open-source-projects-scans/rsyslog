@@ -30,7 +30,8 @@
 #include <pwd.h>
 #include <grp.h>
 #include <stdarg.h>
-#include <sys/resource.h>
+#include <pthread.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -86,6 +87,118 @@ DEFobjCurrIf(ruleset) DEFobjCurrIf(module) DEFobjCurrIf(conf) DEFobjCurrIf(glbl)
     /* exported static data */
     rsconf_t *runConf = NULL; /* the currently running config */
 rsconf_t *loadConf = NULL; /* the config currently being loaded (no concurrent config load supported!) */
+static const char cfgModRefSrc[] = "cfgmodules";
+
+#ifdef HAVE_LIBSYSTEMD
+/* module readiness barrier: modules that need startup time call rsconfRegisterReadiness(),
+ * then rsconfSignalReady() once initialised. When global(systemd.notifyReadyDelay="on")
+ * is configured, rsconfWaitForModulesReady() blocks until all registered modules have
+ * signalled, then sd_notify(READY=1) can fire safely. The whole barrier is compiled only
+ * when systemd support is present; on non-systemd builds, rsconf.h provides inline no-ops
+ * for Register/Signal so opt-in modules need no #ifdef guards of their own. */
+static pthread_mutex_t mutModulesReady = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t condModulesReady;
+static pthread_once_t onceModulesReadyCond = PTHREAD_ONCE_INIT;
+static clockid_t clockModulesReady = CLOCK_REALTIME;
+static int nModulesPendingReady = 0;
+static int bModulesReadyWaitStarted = 0;
+static int bModulesReadyWaitActive = 0;
+static int bModulesReadyNotifySent = 0;
+
+static void initModulesReadyCond(void) {
+    pthread_condattr_t attr;
+
+    if (pthread_condattr_init(&attr) != 0) {
+        pthread_cond_init(&condModulesReady, NULL);
+        return;
+    }
+    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0) {
+        clockModulesReady = CLOCK_MONOTONIC;
+    }
+    if (pthread_cond_init(&condModulesReady, &attr) != 0) {
+        pthread_cond_init(&condModulesReady, NULL);
+        clockModulesReady = CLOCK_REALTIME;
+    }
+    pthread_condattr_destroy(&attr);
+}
+
+int rsconfShouldDelayReadyNotify(rsconf_t *cnf) {
+    return cnf != NULL && cnf->globals.systemdNotifyReadyDelay;
+}
+
+void rsconfRegisterReadiness(void) {
+    pthread_once(&onceModulesReadyCond, initModulesReadyCond);
+    if (!rsconfShouldDelayReadyNotify(runConf)) return;
+
+    pthread_mutex_lock(&mutModulesReady);
+    if (bModulesReadyNotifySent) {
+        /* Reload-time module setup happens after the one-shot systemd READY=1. */
+    } else if (bModulesReadyWaitActive) {
+        LogError(0, RS_RET_SYS_ERR,
+                 "rsyslogd: module registered readiness after systemd READY wait "
+                 "started - ignoring late registration");
+    } else if (bModulesReadyWaitStarted) {
+        /* The initial barrier already closed; do not corrupt the pending count. */
+    } else {
+        ++nModulesPendingReady;
+    }
+    pthread_mutex_unlock(&mutModulesReady);
+}
+
+void rsconfSignalReady(void) {
+    pthread_once(&onceModulesReadyCond, initModulesReadyCond);
+    if (!rsconfShouldDelayReadyNotify(runConf)) return;
+
+    pthread_mutex_lock(&mutModulesReady);
+    if (nModulesPendingReady > 0 && --nModulesPendingReady == 0) pthread_cond_broadcast(&condModulesReady);
+    pthread_mutex_unlock(&mutModulesReady);
+}
+
+/* Wait up to 60 s for all registered modules to signal readiness. */
+void rsconfWaitForModulesReady(void) {
+    struct timespec ts;
+    pthread_once(&onceModulesReadyCond, initModulesReadyCond);
+    pthread_mutex_lock(&mutModulesReady);
+    bModulesReadyWaitStarted = 1;
+    bModulesReadyWaitActive = 1;
+    pthread_mutex_unlock(&mutModulesReady);
+
+    if (clock_gettime(clockModulesReady, &ts) != 0) {
+        LogError(errno, RS_RET_SYS_ERR, "rsyslogd: cannot compute module readiness timeout - sending READY=1 anyway");
+        pthread_mutex_lock(&mutModulesReady);
+        bModulesReadyWaitActive = 0;
+        pthread_mutex_unlock(&mutModulesReady);
+        return;
+    }
+    ts.tv_sec += 60;
+    pthread_mutex_lock(&mutModulesReady);
+    while (nModulesPendingReady > 0) {
+        const int rc = pthread_cond_timedwait(&condModulesReady, &mutModulesReady, &ts);
+        if (rc == ETIMEDOUT) {
+            LogError(0, RS_RET_TIMED_OUT,
+                     "rsyslogd: timed out waiting for input modules to signal readiness "
+                     "(%d module(s) outstanding) - sending READY=1 anyway",
+                     nModulesPendingReady);
+            break;
+        } else if (rc != 0) {
+            LogError(0, RS_RET_SYS_ERR,
+                     "rsyslogd: pthread_cond_timedwait error %d waiting for module "
+                     "readiness - sending READY=1 anyway",
+                     rc);
+            break;
+        }
+    }
+    bModulesReadyWaitActive = 0;
+    pthread_mutex_unlock(&mutModulesReady);
+}
+
+void rsconfReadyNotifySent(void) {
+    pthread_once(&onceModulesReadyCond, initModulesReadyCond);
+    pthread_mutex_lock(&mutModulesReady);
+    bModulesReadyNotifySent = 1;
+    pthread_mutex_unlock(&mutModulesReady);
+}
+#endif /* HAVE_LIBSYSTEMD */
 
 /* hardcoded standard templates (used for defaults) */
 static uchar template_DebugFormat[] =
@@ -180,6 +293,10 @@ static void cnfSetDefaults(rsconf_t *pThis) {
 #endif
     pThis->globals.bAbortOnUncleanConfig = 0;
     pThis->globals.bAbortOnFailedQueueStartup = 0;
+    pThis->globals.compatConfigFormatLegacy = COMPAT_CONFIGFORMAT_ENABLE;
+    pThis->globals.compatConfigFormatSyslogd = COMPAT_CONFIGFORMAT_ENABLE;
+    pThis->globals.compatConfigFormatProperty = COMPAT_CONFIGFORMAT_ENABLE;
+    pThis->globals.compatDefaultsSecure = COMPAT_DEFAULTS_SECURE_WARN;
     pThis->globals.bReduceRepeatMsgs = 0;
     pThis->globals.bDebugPrintTemplateList = 1;
     pThis->globals.bDebugPrintModuleList = 0;
@@ -196,6 +313,9 @@ static void cnfSetDefaults(rsconf_t *pThis) {
     pThis->templates.lastStatic = NULL;
     pThis->actions.nbrActions = 0;
     pThis->actions.iActionNbr = 0;
+    pThis->actions.action_names = NULL;
+    pThis->actions.n_action_names = 0;
+    pThis->actions.n_action_names_alloc = 0;
     pThis->globals.pszWorkDir = NULL;
     pThis->globals.bDropMalPTRMsgs = 0;
     pThis->globals.operatingStateFile = NULL;
@@ -225,6 +345,7 @@ static void cnfSetDefaults(rsconf_t *pThis) {
     pThis->globals.bProcessInternalMessages = 0;
     const char *const log_dflt = getenv("RSYSLOG_DFLT_LOG_INTERNAL");
     if (log_dflt != NULL && !strcmp(log_dflt, "1")) pThis->globals.bProcessInternalMessages = 1;
+    pThis->globals.iMaxOpenFiles = 0;
     pThis->globals.glblDevOptions = 0;
     pThis->globals.intMsgRateLimitItv = 60;
     pThis->globals.intMsgRateLimitBurst = 100;
@@ -283,6 +404,7 @@ static void cnfSetDefaults(rsconf_t *pThis) {
 
     pThis->globals.parser.cCCEscapeChar = '#';
     pThis->globals.parser.bDropTrailingLF = 1;
+    pThis->globals.parser.bDropTrailingCR = 0;
     pThis->globals.parser.bEscapeCCOnRcv = 1;
     pThis->globals.parser.bSpaceLFOnRcv = 0;
     pThis->globals.parser.bEscape8BitChars = 0;
@@ -303,7 +425,7 @@ BEGINobjConstruct(rsconf) /* be sure to specify the object type also in END macr
     lookupInitCnf(&pThis->lu_tabs);
     CHKiRet(dynstats_initCnf(&pThis->dynstats_buckets));
     CHKiRet(perctile_initCnf(&pThis->perctile_buckets));
-    ratelimit_cfgsInit(&pThis->ratelimit_cfgs);
+    CHKiRet(ratelimit_cfgsInit(&pThis->ratelimit_cfgs));
     CHKiRet(llInit(&pThis->rulesets.llRulesets, rulesetDestructForLinkedList, rulesetKeyDestruct,
                    (int (*)(void *, void *))strcasecmp));
 finalize_it:
@@ -319,20 +441,45 @@ static rsRetVal rsconfConstructFinalize(rsconf_t __attribute__((unused)) * pThis
 }
 
 
-/* call freeCnf() module entry points AND free the module entries themselfes.
+/* call freeCnf() module entry points.
+ * Module references are released later, after all other config-owned objects
+ * that may still call back into those modules have been destroyed.
  */
 static void freeCnf(rsconf_t *pThis) {
-    cfgmodules_etry_t *etry, *del;
+    cfgmodules_etry_t *etry;
     etry = pThis->modules.root;
     while (etry != NULL) {
         if (etry->pMod->beginCnfLoad != NULL) {
             dbgprintf("calling freeCnf(%p) for module '%s'\n", etry->modCnf, (char *)module.GetName(etry->pMod));
             etry->pMod->freeCnf(etry->modCnf);
         }
+        etry = etry->next;
+    }
+}
+
+static void releaseCnfModRefs(rsconf_t *pThis) {
+    cfgmodules_etry_t *etry, *del;
+    etry = pThis->modules.root;
+    while (etry != NULL) {
         del = etry;
         etry = etry->next;
+        module.Release(cfgModRefSrc, &del->pMod);
         free(del);
     }
+    pThis->modules.root = NULL;
+}
+
+
+static void freeActionNames(rsconf_t *pThis) {
+    size_t i;
+
+    for (i = 0; i < pThis->actions.n_action_names; ++i) {
+        free(pThis->actions.action_names[i]);
+    }
+    free(pThis->actions.action_names);
+    pThis->actions.action_names = NULL;
+    pThis->actions.n_action_names = 0;
+    pThis->actions.n_action_names_alloc = 0;
 }
 
 /* destructor for the rsconf object */
@@ -361,8 +508,10 @@ BEGINobjDestruct(rsconf) /* be sure to specify the object type also in END and C
     free(pThis->globals.stdlog_chanspec);
 #endif
     lookupDestroyCnf();
-    ratelimit_cfgsDestruct(&pThis->ratelimit_cfgs);
+    freeActionNames(pThis);
     llDestroy(&(pThis->rulesets.llRulesets));
+    ratelimit_cfgsDestruct(&pThis->ratelimit_cfgs);
+    releaseCnfModRefs(pThis);
 ENDobjDestruct(rsconf)
 
 
@@ -502,6 +651,8 @@ static rsRetVal initFunc_ratelimit(struct cnfobj *o) {
     uchar *per_source_key_tpl = NULL;
     int per_source_max_states = 0;
     int per_source_topn = 0;
+    sbool has_inline_policy_params = 0;
+    sbool has_legacy_per_source_params = 0;
     DEFiRet;
 
     pvals = nvlstGetParams(o->nvlst, &ratelimitpblk, NULL);
@@ -512,29 +663,37 @@ static rsRetVal initFunc_ratelimit(struct cnfobj *o) {
     for (i = 0; i < ratelimitpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(ratelimitpblk.descr[i].name, "name")) {
-            name = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(name = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(ratelimitpblk.descr[i].name, "interval")) {
             interval = (int)pvals[i].val.d.n;
+            has_inline_policy_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "burst")) {
             burst = (int)pvals[i].val.d.n;
+            has_inline_policy_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "severity")) {
             severity = (int)pvals[i].val.d.n;
+            has_inline_policy_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "policy")) {
-            policy = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(policy = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(ratelimitpblk.descr[i].name, "policyWatch")) {
             policy_watch = (int)pvals[i].val.d.n;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "policyWatchDebounce")) {
-            policy_watch_debounce = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(policy_watch_debounce = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(ratelimitpblk.descr[i].name, "perSource")) {
             per_source_enabled = (int)pvals[i].val.d.n;
+            has_legacy_per_source_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "perSourcePolicy")) {
-            per_source_policy = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(per_source_policy = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+            has_legacy_per_source_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "perSourceKeyTpl")) {
-            per_source_key_tpl = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(per_source_key_tpl = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+            has_legacy_per_source_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "perSourceMaxStates")) {
             per_source_max_states = (int)pvals[i].val.d.n;
+            has_legacy_per_source_params = 1;
         } else if (!strcmp(ratelimitpblk.descr[i].name, "perSourceTopN")) {
             per_source_topn = (int)pvals[i].val.d.n;
+            has_legacy_per_source_params = 1;
         }
     }
 
@@ -555,10 +714,10 @@ static rsRetVal initFunc_ratelimit(struct cnfobj *o) {
         ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
     }
 
-    CHKiRet(ratelimitAddConfig(loadConf, (char *)name, (unsigned)interval, (unsigned)burst, (intTiny)severity,
-                               (char *)policy, policy_watch, (char *)policy_watch_debounce, per_source_enabled,
+    CHKiRet(ratelimitAddConfig(loadConf, (char *)name, (unsigned)interval, (unsigned)burst, severity, (char *)policy,
+                               policy_watch, (char *)policy_watch_debounce, per_source_enabled,
                                (char *)per_source_policy, (char *)per_source_key_tpl, (unsigned)per_source_max_states,
-                               (unsigned)per_source_topn));
+                               (unsigned)per_source_topn, has_inline_policy_params, has_legacy_per_source_params));
 
 finalize_it:
     free(name);
@@ -691,6 +850,10 @@ void cnfDoCfsysline(char *ln) {
                                       ln);
     }
     DBGPRINTF("cnf:global:cfsysline: %s\n", ln);
+    if (!glblPermitLegacyConfigDirective(loadConf, ln)) {
+        free(ln);
+        return;
+    }
     /* the legacy system needs the "$" stripped */
     conf.cfsysline((uchar *)ln + 1);
     free(ln);
@@ -727,7 +890,7 @@ void cnfDoBSDHost(char *ln) {
 
 
 /* drop to specified group
- * if something goes wrong, the function never returns
+ * Returns RS_RET_ERR_DROP_PRIV if the requested group privileges cannot be set.
  */
 static rsRetVal doDropPrivGid(rsconf_t *cnf) {
     int res;
@@ -737,14 +900,17 @@ static rsRetVal doDropPrivGid(rsconf_t *cnf) {
     if (!cnf->globals.gidDropPrivKeepSupplemental) {
         res = setgroups(0, NULL); /* remove all supplemental group IDs */
         if (res) {
-            LogError(errno, RS_RET_ERR_DROP_PRIV, "could not remove supplemental group IDs");
+            LogError(errno, RS_RET_ERR_DROP_PRIV,
+                     "could not remove supplemental group IDs via setgroups(): missing CAP_SETGID or insufficient "
+                     "privilege");
             ABORT_FINALIZE(RS_RET_ERR_DROP_PRIV);
         }
         DBGPRINTF("setgroups(0, NULL): %d\n", res);
     }
     res = setgid(cnf->globals.gidDropPriv);
     if (res) {
-        LogError(errno, RS_RET_ERR_DROP_PRIV, "could not set requested group id %d via setgid()",
+        LogError(errno, RS_RET_ERR_DROP_PRIV,
+                 "could not set requested group id %d via setgid(): missing CAP_SETGID or insufficient privilege",
                  cnf->globals.gidDropPriv);
         ABORT_FINALIZE(RS_RET_ERR_DROP_PRIV);
     }
@@ -758,15 +924,14 @@ finalize_it:
 
 
 /* drop to specified user
- * if something goes wrong, the function never returns
- * Note that such an abort can cause damage to on-disk structures, so we should
- * re-design the "interface" in the long term. -- rgerhards, 2008-11-19
+ * Returns RS_RET_ERR_DROP_PRIV if the requested user privileges cannot be set.
  */
-static void doDropPrivUid(rsconf_t *cnf) {
+static rsRetVal doDropPrivUid(rsconf_t *cnf) {
     int res;
     uchar szBuf[1024];
     struct passwd *pw;
     gid_t gid;
+    DEFiRet;
 
     /* Try to set appropriate supplementary groups for this user.
      * Failure is not fatal.
@@ -775,6 +940,12 @@ static void doDropPrivUid(rsconf_t *cnf) {
     if (pw) {
         gid = getgid();
         res = initgroups(pw->pw_name, gid);
+        if (res) {
+            LogError(errno, RS_RET_ERR_DROP_PRIV,
+                     "could not initialize supplemental groups for user id %d via initgroups(): missing CAP_SETGID or "
+                     "insufficient privilege",
+                     cnf->globals.uidDropPriv);
+        }
         DBGPRINTF("initgroups(%s, %ld): %d\n", pw->pw_name, (long)gid, res);
     } else {
         LogError(errno, NO_ERRCODE, "could not get username for userid '%d'", cnf->globals.uidDropPriv);
@@ -782,14 +953,18 @@ static void doDropPrivUid(rsconf_t *cnf) {
 
     res = setuid(cnf->globals.uidDropPriv);
     if (res) {
-        /* if we can not set the userid, this is fatal, so let's unconditionally abort */
-        perror("could not set requested userid");
-        exit(1);
+        LogError(errno, RS_RET_ERR_DROP_PRIV,
+                 "could not set requested user id %d via setuid(): missing CAP_SETUID or insufficient privilege",
+                 cnf->globals.uidDropPriv);
+        ABORT_FINALIZE(RS_RET_ERR_DROP_PRIV);
     }
 
     DBGPRINTF("setuid(%d): %d\n", cnf->globals.uidDropPriv, res);
     snprintf((char *)szBuf, sizeof(szBuf), "rsyslogd's userid changed to %d", cnf->globals.uidDropPriv);
     logmsgInternal(NO_ERRCODE, LOG_SYSLOG | LOG_INFO, szBuf, 0);
+
+finalize_it:
+    RETiRet;
 }
 
 
@@ -806,7 +981,7 @@ static rsRetVal dropPrivileges(rsconf_t *cnf) {
     }
 
     if (cnf->globals.uidDropPriv != 0) {
-        doDropPrivUid(cnf);
+        CHKiRet(doDropPrivUid(cnf));
         DBGPRINTF("user privileges have been dropped to uid %u\n", (unsigned)cnf->globals.uidDropPriv);
     }
 
@@ -903,12 +1078,14 @@ static rsRetVal tellModulesActivateConfigPrePrivDrop(void) {
             if (localRet != RS_RET_OK) {
                 LogError(0, localRet, "activation of module %s failed", node->pMod->pszName);
                 node->canActivate = 0; /* in a sense, could not activate... */
+                if (runConf->globals.bAbortOnUncleanConfig) return localRet;
             }
         }
         node = module.GetNxtCnfType(runConf, node, eMOD_ANY);
     }
 
-    return RS_RET_OK; /* intentional: we do not care about module errors */
+    /* Compatibility mode may continue after a module failed to activate. */
+    return RS_RET_OK;
 }
 
 
@@ -1078,6 +1255,9 @@ static rsRetVal activate(rsconf_t *cnf) {
 		generateConfigDAG(ourConf->globals.pszConfDAGFile);
 #endif
     setUmask(cnf->globals.umask);
+    if (cnf->globals.iMaxOpenFiles > 0) {
+        CHKiRet(glblSetMaxOpenFiles(NULL, cnf->globals.iMaxOpenFiles));
+    }
 
     /* the output part and the queue is now ready to run. So it is a good time
      * to initialize the inputs. Please note that the net code above should be
@@ -1087,7 +1267,7 @@ static rsRetVal activate(rsconf_t *cnf) {
      * Keep in mind. though, that the outputs already run if the queue was
      * persisted to disk. -- rgerhards
      */
-    tellModulesActivateConfigPrePrivDrop();
+    CHKiRet(tellModulesActivateConfigPrePrivDrop());
 
     CHKiRet(dropPrivileges(cnf));
 
@@ -1116,6 +1296,14 @@ finalize_it:
 /* legacy config system: set the action resume interval */
 static rsRetVal setActionResumeInterval(void __attribute__((unused)) * pVal, int iNewVal) {
     return actionSetGlobalResumeInterval(iNewVal);
+}
+
+
+/* set the processes max number of files immediately for legacy $MaxOpenFiles
+ * configs.
+ */
+static rsRetVal setMaxFiles(void *pVal, int iFiles) {
+    return glblSetMaxOpenFiles(pVal, iFiles);
 }
 
 
@@ -1177,6 +1365,9 @@ static rsRetVal setMainMsgQueType(void __attribute__((unused)) * pVal, uchar *ps
     } else if (!strcasecmp((char *)pszType, "disk")) {
         loadConf->globals.mainQ.MainMsgQueType = QUEUETYPE_DISK;
         DBGPRINTF("main message queue type set to DISK\n");
+    } else if (!strcasecmp((char *)pszType, "segmenteddisk")) {
+        loadConf->globals.mainQ.MainMsgQueType = QUEUETYPE_SEGMENTED_DISK;
+        DBGPRINTF("main message queue type set to SEGMENTED_DISK\n");
     } else if (!strcasecmp((char *)pszType, "direct")) {
         loadConf->globals.mainQ.MainMsgQueType = QUEUETYPE_DIRECT;
         DBGPRINTF("main message queue type set to DIRECT (no queueing at all)\n");
@@ -1193,39 +1384,10 @@ static rsRetVal setMainMsgQueType(void __attribute__((unused)) * pVal, uchar *ps
 /* -------------------- end legacy config handlers -------------------- */
 
 
-/* set the processes max number ob files (upon configuration request)
- * 2009-04-14 rgerhards
- */
-static rsRetVal setMaxFiles(void __attribute__((unused)) * pVal, int iFiles) {
-    // TODO this must use a local var, then carry out action during activate!
-    struct rlimit maxFiles;
-
-    DEFiRet;
-
-    maxFiles.rlim_cur = iFiles;
-    maxFiles.rlim_max = iFiles;
-
-    if (setrlimit(RLIMIT_NOFILE, &maxFiles) < 0) {
-        /* NOTE: under valgrind, we seem to be unable to extend the size! */
-        LogError(errno, RS_RET_ERR_RLIM_NOFILE,
-                 "could not set process file limit to %d "
-                 "[kernel max %ld]",
-                 iFiles, (long)maxFiles.rlim_max);
-        ABORT_FINALIZE(RS_RET_ERR_RLIM_NOFILE);
-    }
-#ifdef USE_UNLIMITED_SELECT
-    glbl.SetFdSetSize(howmany(iFiles, __NFDBITS) * sizeof(fd_mask));
-#endif
-    DBGPRINTF("Max number of files set to %d [kernel max %ld].\n", iFiles, (long)maxFiles.rlim_max);
-
-finalize_it:
-    RETiRet;
-}
-
-
 /* legacy config system: reset config variables to default values.  */
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __attribute__((unused)) * pVal) {
     free(loadConf->globals.mainQ.pszMainMsgQFName);
+    freeActionNames(loadConf);
 
     cnfSetDefaults(loadConf);
 
@@ -1474,18 +1636,31 @@ static rsRetVal validateConf(rsconf_t *cnf) {
         cnf->globals.mainQ.iMainMsgQueueNumWorkers = 1;
     }
 
-    if (cnf->globals.mainQ.MainMsgQueType == QUEUETYPE_DISK) {
+    if (cnf->globals.mainQ.MainMsgQueType == QUEUETYPE_SEGMENTED_DISK) {
+        if (glbl.GetWorkDir(cnf) == NULL) {
+            LogError(0, RS_RET_CONF_PARAM_INVLD,
+                     "No $WorkDirectory specified - can not run main "
+                     "message queue in segmentedDisk mode.\n");
+            return RS_RET_CONF_PARAM_INVLD;
+        }
+        if (cnf->globals.mainQ.pszMainMsgQFName == NULL) {
+            LogError(0, RS_RET_CONF_PARAM_INVLD,
+                     "No $MainMsgQueueFileName specified - can not run main "
+                     "message queue in segmentedDisk mode.\n");
+            return RS_RET_CONF_PARAM_INVLD;
+        }
+    } else if (cnf->globals.mainQ.MainMsgQueType == QUEUETYPE_DISK) {
         errno = 0; /* for logerror! */
         if (glbl.GetWorkDir(cnf) == NULL) {
             LogError(0, NO_ERRCODE,
                      "No $WorkDirectory specified - can not run main "
-                     "message queue in 'disk' mode. Using 'FixedArray' instead.\n");
+                     "message queue in disk-backed mode. Using 'FixedArray' instead.\n");
             cnf->globals.mainQ.MainMsgQueType = QUEUETYPE_FIXED_ARRAY;
         }
         if (cnf->globals.mainQ.pszMainMsgQFName == NULL) {
             LogError(0, NO_ERRCODE,
                      "No $MainMsgQueueFileName specified - can not run main "
-                     "message queue in 'disk' mode. Using 'FixedArray' instead.\n");
+                     "message queue in disk-backed mode. Using 'FixedArray' instead.\n");
             cnf->globals.mainQ.MainMsgQueType = QUEUETYPE_FIXED_ARRAY;
         }
     }

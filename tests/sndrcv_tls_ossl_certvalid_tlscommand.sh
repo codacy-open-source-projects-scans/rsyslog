@@ -21,7 +21,7 @@ module(	load="../plugins/imtcp/.libs/imtcp"
 	StreamDriver.PermitExpiredCerts="off"
 	gnutlsPriorityString="Protocol=ALL,-SSLv2,-SSLv3,-TLSv1,-TLSv1.2\nOptions=Bugs"
 	)
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" address="127.0.0.1" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 action(type="omfile" file="'$RSYSLOG_OUT_LOG'")
 '
@@ -64,6 +64,12 @@ content_check --check-only "TLS library does not support SSL_CONF_cmd"
 ret=$?
 if [ $ret == 0 ]; then
 	echo "SKIP: TLS library does not support SSL_CONF_cmd"
+	skip_test
+elif [ "$(tls_backend)" = "wolfssl" ]; then
+	# wolfSSL exposes SSL_CONF_cmd but the "Protocol" command is a stub
+	# (returns -2 "cmd not yet implemented"); this test relies on protocol
+	# filtering to force a handshake failure, which cannot happen there.
+	echo "SKIP: wolfSSL SSL_CONF_cmd does not implement the Protocol command"
 	skip_test
 else
 	content_check --check-only "SSL_ERROR_SYSCALL"

@@ -107,7 +107,8 @@ The configuration parameters are grouped below by use case.
 
 .. note::
 
-   Parameter names are case-insensitive; camelCase is recommended for improved readability.
+   Parameter names are case-insensitive, but punctuation such as dots is
+   significant. Use the parameter names exactly as shown.
 
 .. note::
 
@@ -295,7 +296,7 @@ Caveats/Known Bugs
 -  This module MUST be loaded right at the top of rsyslog.conf,
    otherwise stats may not get turned on in all places.
 -  When using the format "zabbix", it is not recommended to use
-   logSyslog="on". This can cause message truncation in stats.
+   log.syslog="on". This can cause message truncation in stats.
 
 
 Examples
@@ -325,8 +326,8 @@ Load module, format the output to Zabbix, and output to a local file
           interval="60"
           severity="7"
           format="zabbix"
-          logSyslog="off"
-          logFile="/var/log/stats.log")
+          log.syslog="off"
+          log.file="/var/log/stats.log")
 
 
 Load module, send stats data to local file
@@ -340,9 +341,9 @@ data is NOT emitted to the syslog stream but to a local file instead.
    module(load="impstats"
           interval="600"
           severity="7"
-          logSyslog="off"
+          log.syslog="off"
           # need to turn log stream logging off!
-          logFile="/path/to/local/stats.log")
+          log.file="/path/to/local/stats.log")
 
 
 Load module, send stats data to local file and syslog stream
@@ -357,7 +358,7 @@ server:
    module(load="impstats"
           interval="600"
           severity="7"
-          logFile="/path/to/local/stats.log")
+          log.file="/path/to/local/stats.log")
 
    syslog.=debug @central.example.net
 
@@ -373,7 +374,7 @@ VictoriaMetrics using Prometheus Remote Write:
    module(load="impstats"
           interval="30"
           format="json"
-          logFile="/var/log/rsyslog-stats.log"
+          log.file="/var/log/rsyslog-stats.log"
           push.url="http://localhost:8428/api/v1/write"
           push.labels=["env=prod", "cluster=edge"]
           push.label.origin="on"
@@ -386,7 +387,7 @@ Explanation of output
 Example output for illustration::
 
    Sep 17 11:43:49 localhost rsyslogd-pstats: imuxsock: submitted=16
-   Sep 17 11:43:49 localhost rsyslogd-pstats: main Q: size=1 enqueued=2403 full=0 maxqsize=2
+   Sep 17 11:43:49 localhost rsyslogd-pstats: main Q: size=1 enqueued=2403 size.enqueued=614168 full=0 maxqsize=2
 
 Explanation:
 
@@ -404,9 +405,17 @@ Line 2: shows details for the main queue:
 - ``main Q``, an object
 - ``size``, messages in the queue
 - ``enqueued``, all received messages thus far
+- ``size.enqueued``, cumulative byte volume of all received messages thus far
+  (counted on arrival, before discard/flow-control checks)
 - ``full``, how often was the queue was full
 - ``maxqsize``, the maximum amount of messages that have passed through the
   queue since rsyslog was started
+- ``mutex.contention``, instrumented runtime producer and consumer queue mutex
+  acquisitions that observed another holder; present only when that queue
+  enables ``queue.mutexContentionStats="on"``
+- ``mutex.wait_ns``, cumulative observed waiting time for those acquisitions;
+  divide by ``mutex.contention`` for the mean observed wait time. This is an
+  opt-in diagnostic because it probes each selected queue mutex acquisition.
 
 See Also
 ========

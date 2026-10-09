@@ -24,6 +24,14 @@
  * along with Rsyslog.  If not, see <http://www.gnu.org/licenses/>.
  *
  * A copy of the GPL can be found in the file "COPYING" in this distribution.
+ *
+ * Concurrency and locking:
+ * - ctxln is shared by all action workers. Normalization holds ctxlnLock for
+ *   reading; HUP builds a replacement privately and swaps it under the write
+ *   lock.
+ * - ctxlnTurbo is owned and used only by its action worker. HUP publishes an
+ *   atomic reload generation, and each worker rebuilds its context between
+ *   messages. The HUP thread never reads, replaces, or destroys worker state.
  */
 #include "config.h"
 #include "rsyslog.h"
@@ -38,6 +46,18 @@
 #include <libestr.h>
 #include <json.h>
 #include <liblognorm.h>
+#ifdef HAVE_LOGNORM_TURBO
+    #include <lognorm-features.h>
+    #include <lognorm-turbo.h>
+/* Compat shim: older liblognorm public headers keep LN_FFIELD_RAW_JSON
+ * internal.  Fall back to 0 so the %name:json% reparse in fast_result_to_json
+ * degrades to the plain-string path and mmnormalize builds against them
+ * without a hard liblognorm version dependency (remove once the exposed flag
+ * is guaranteed). */
+    #ifndef LN_FFIELD_RAW_JSON
+        #define LN_FFIELD_RAW_JSON 0u
+    #endif
+#endif
 #include "conf.h"
 #include "syslogd-types.h"
 #include "template.h"
@@ -46,10 +66,20 @@
 #include "cfsysline.h"
 #include "dirty.h"
 #include "unicode-helper.h"
+#include "atomic.h"
+#include "statsobj.h"
 
 MODULE_TYPE_OUTPUT;
 MODULE_TYPE_NOKEEP;
 MODULE_CNFNAME("mmnormalize")
+
+/* Concurrency & Locking
+ * ---------------------
+ * Turbo normalization contexts are private to their workers. When debugFile
+ * is configured, callbacks from the action and its worker contexts share the
+ * instance-owned FILE; flockfile serializes writes. The action lifetime ends
+ * after workers stop, before freeInstance closes that FILE.
+ */
 
 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __attribute__((unused)) * pVal);
 
@@ -58,6 +88,15 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
 /* internal structures
  */
 DEF_OMOD_STATIC_DATA;
+#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
+DEFobjCurrIf(statsobj)
+    /* Module-level impstats. turbo.truncated counts messages for which the
+     * TurboVM result hit a per-result capacity and was therefore declined: the
+     * standard parser produced the fields instead. It is a cost signal, not a
+     * loss signal -- a non-zero value means those messages were parsed twice. */
+    static statsobj_t *mmnormalizeStats;
+STATSCOUNTER_DEF(ctrTurboTruncated, mutCtrTurboTruncated)
+#endif
 
 static struct cnfparamdescr modpdescr[] = {{"allowregex", eCmdHdlrBinary, 0}};
 
@@ -65,15 +104,32 @@ static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / si
 
 typedef struct _instanceData {
     sbool bUseRawMsg; /**< use %rawmsg% instead of %msg% */
+    sbool bDebug; /**< enable liblognorm debugging */
     uchar *rule; /* rule to use */
     uchar *rulebase; /**< name of rulebase to use */
     ln_ctx ctxln; /**< context to be used for liblognorm */
+    pthread_rwlock_t ctxlnLock; /**< protects replacement and use of shared ctxln */
+    int ctxlnLockInitialized;
+    unsigned reloadGeneration; /**< HUP generation adopted by action workers */
+    pthread_mutex_t mutReloadGeneration; /**< no-atomics fallback for reloadGeneration */
+    int mutReloadGenerationInitialized;
+    uchar *rulebaseForReload; /**< saved rulebase path for HUP reload */
+    uchar *ruleForReload; /**< saved inline rules for HUP reload */
+    unsigned ctxOpts; /**< saved context options for HUP reload */
+    FILE *debugFile; /**< optional liblognorm debug output */
     char *pszPath; /**< path of normalized data */
     msgPropDescr_t *varDescr; /**< name of variable to use */
+#ifdef HAVE_LOGNORM_TURBO
+    sbool bTurbo; /**< user requested turbo mode */
+#endif
 } instanceData;
 
 typedef struct wrkrInstanceData {
     instanceData *pData;
+#ifdef HAVE_LOGNORM_TURBO
+    ln_ctx ctxlnTurbo; /**< per-worker turbo context (thread-safe) */
+    unsigned reloadGeneration; /**< rulebase generation loaded into ctxlnTurbo */
+#endif
 } wrkrInstanceData_t;
 
 typedef struct configSettings_s {
@@ -85,11 +141,14 @@ static configSettings_t cs;
 
 /* tables for interfacing with the v6 config system */
 /* action (instance) parameters */
-static struct cnfparamdescr actpdescr[] = {{"rulebase", eCmdHdlrGetWord, 0},
-                                           {"rule", eCmdHdlrArray, 0},
-                                           {"path", eCmdHdlrGetWord, 0},
-                                           {"userawmsg", eCmdHdlrBinary, 0},
-                                           {"variable", eCmdHdlrGetWord, 0}};
+static struct cnfparamdescr actpdescr[] = {
+    {"rulebase", eCmdHdlrGetWord, 0},  {"rule", eCmdHdlrArray, 0},       {"path", eCmdHdlrGetWord, 0},
+    {"userawmsg", eCmdHdlrBinary, 0},  {"variable", eCmdHdlrGetWord, 0}, {"debug", eCmdHdlrBinary, 0},
+    {"debugfile", eCmdHdlrGetWord, 0},
+#ifdef HAVE_LOGNORM_TURBO
+    {"turbo", eCmdHdlrBinary, 0},
+#endif
+};
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
 struct modConfData_s {
@@ -105,40 +164,143 @@ static void errCallBack(void __attribute__((unused)) * cookie, const char *msg, 
     LogError(0, RS_RET_ERR_LIBLOGNORM, "liblognorm error: %s", msg);
 }
 
+/* callback for liblognorm debug messages */
+static void debugCallBack(void *cookie, const char *msg, size_t lenMsg) {
+    FILE *const debugFile = cookie;
+
+    if (debugFile == NULL) {
+        LogMsg(0, RS_RET_OK, LOG_DEBUG, "mmnormalize: liblognorm debug: %s", msg);
+        return;
+    }
+
+    flockfile(debugFile);
+    (void)fwrite(msg, 1, lenMsg, debugFile);
+    if (lenMsg == 0 || msg[lenMsg - 1] != '\n') (void)fputc('\n', debugFile);
+    (void)fflush(debugFile);
+    funlockfile(debugFile);
+}
+
+/* Build a complete context without publishing it. The saved rule source is
+ * immutable after configuration, so this helper can be used by HUP and by an
+ * action worker without protecting the potentially expensive compilation. */
+static ln_ctx buildContext(const instanceData *const pData, const sbool enableTurbo, sbool *const turboAvailable) {
+    ln_ctx ctx;
+    int loadRet = -1;
+
+    if (turboAvailable != NULL) *turboAvailable = 0;
+    ctx = ln_initCtx();
+    if (ctx == NULL) return NULL;
+
+    ln_setCtxOpts(ctx, pData->ctxOpts);
+#ifdef HAVE_LOGNORM_TURBO
+    if (enableTurbo) ln_setCtxOpts(ctx, LN_CTXOPT_TURBO);
+#else
+    (void)enableTurbo;
+#endif
+    ln_setErrMsgCB(ctx, errCallBack, NULL);
+    if (pData->bDebug) {
+        if (ln_setDebugCB(ctx, debugCallBack, pData->debugFile) != 0) {
+            ln_exitCtx(ctx);
+            return NULL;
+        }
+        ln_enableDebug(ctx, 1);
+    }
+
+    if (pData->ruleForReload != NULL) {
+        loadRet = ln_loadSamplesFromString(ctx, (char *)pData->ruleForReload);
+    } else if (pData->rulebaseForReload != NULL) {
+        loadRet = ln_loadSamples(ctx, (char *)pData->rulebaseForReload);
+    }
+
+    if (loadRet != 0) {
+        ln_exitCtx(ctx);
+        return NULL;
+    }
+
+#ifdef HAVE_LOGNORM_TURBO
+    if (enableTurbo && turboAvailable != NULL) *turboAvailable = ln_turbo_is_available(ctx);
+#endif
+    return ctx;
+}
+
+#ifdef HAVE_LOGNORM_TURBO
+static ln_ctx buildTurboWorkerContext(const instanceData *const pData) {
+    sbool turboAvailable = 0;
+    ln_ctx ctx = buildContext(pData, 1, &turboAvailable);
+
+    if (ctx != NULL && !turboAvailable) {
+        ln_exitCtx(ctx);
+        ctx = NULL;
+    }
+    return ctx;
+}
+#endif
 /* to be called to build the liblognorm part of the instance ONCE ALL PARAMETERS ARE CORRECT
  * (and set within pData!).
  */
 static rsRetVal buildInstance(instanceData *pData) {
     DEFiRet;
+    pData->ctxOpts = loadModConf->allow_regex;
     if ((pData->ctxln = ln_initCtx()) == NULL) {
         LogError(0, RS_RET_ERR_LIBLOGNORM_INIT,
                  "error: could not initialize "
                  "liblognorm ctx, cannot activate action");
         ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_INIT);
     }
-    ln_setCtxOpts(pData->ctxln, loadModConf->allow_regex);
+    ln_setCtxOpts(pData->ctxln, pData->ctxOpts);
     ln_setErrMsgCB(pData->ctxln, errCallBack, NULL);
+    if (pData->bDebug) {
+        if (ln_setDebugCB(pData->ctxln, debugCallBack, pData->debugFile) != 0) {
+            LogError(0, RS_RET_ERR_LIBLOGNORM_INIT, "mmnormalize: could not set liblognorm debug callback");
+            ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_INIT);
+        }
+        ln_enableDebug(pData->ctxln, 1);
+    }
+#ifdef HAVE_LOGNORM_TURBO
+    /* Enable turbo on shared ctx so compilation happens during loadSamples */
+    if (pData->bTurbo) {
+        ln_setCtxOpts(pData->ctxln, LN_CTXOPT_TURBO);
+    }
+#endif
     if (pData->rule != NULL && pData->rulebase == NULL) {
+        /* Preserve the inline rule before the configuration copy is freed. */
+        CHKmalloc(pData->ruleForReload = (uchar *)strdup((char *)pData->rule));
         if (ln_loadSamplesFromString(pData->ctxln, (char *)pData->rule) != 0) {
             LogError(0, RS_RET_NO_RULEBASE,
                      "error: normalization rule '%s' "
                      "could not be loaded cannot activate action",
                      pData->rule);
             ln_exitCtx(pData->ctxln);
+            pData->ctxln = NULL;
             ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
         }
         free(pData->rule);
         pData->rule = NULL;
     } else if (pData->rule == NULL && pData->rulebase != NULL) {
+        CHKmalloc(pData->rulebaseForReload = (uchar *)strdup((char *)pData->rulebase));
         if (ln_loadSamples(pData->ctxln, (char *)pData->rulebase) != 0) {
             LogError(0, RS_RET_NO_RULEBASE,
                      "error: normalization rulebase '%s' "
                      "could not be loaded cannot activate action",
                      pData->rulebase);
             ln_exitCtx(pData->ctxln);
+            pData->ctxln = NULL;
             ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
         }
     }
+#ifdef HAVE_LOGNORM_TURBO
+    /* Verify turbo compilation succeeded on the shared ctx */
+    if (pData->bTurbo) {
+        if (ln_turbo_is_available(pData->ctxln)) {
+            LogMsg(0, RS_RET_OK, LOG_INFO, "mmnormalize: turbo mode available and enabled");
+        } else {
+            LogMsg(0, NO_ERRCODE, LOG_WARNING,
+                   "mmnormalize: turbo mode requested but compilation "
+                   "failed, using standard normalization");
+        }
+    }
+#endif
+
 finalize_it:
     RETiRet;
 }
@@ -151,12 +313,42 @@ ENDinitConfVars
 
 
 BEGINcreateInstance
+    int lockRet;
     CODESTARTcreateInstance;
+    if ((lockRet = pthread_rwlock_init(&pData->ctxlnLock, NULL)) != 0) {
+        errno = lockRet;
+        ABORT_FINALIZE(RS_RET_CONC_CTRL_ERR);
+    }
+    pData->ctxlnLockInitialized = 1;
+    if ((lockRet = pthread_mutex_init(&pData->mutReloadGeneration, NULL)) != 0) {
+        errno = lockRet;
+        pthread_rwlock_destroy(&pData->ctxlnLock);
+        pData->ctxlnLockInitialized = 0;
+        ABORT_FINALIZE(RS_RET_CONC_CTRL_ERR);
+    }
+    pData->mutReloadGenerationInitialized = 1;
+    ATOMIC_STORE_32BIT_unsigned(&pData->reloadGeneration, &pData->mutReloadGeneration, 0);
+finalize_it:
 ENDcreateInstance
 
 
 BEGINcreateWrkrInstance
     CODESTARTcreateWrkrInstance;
+#ifdef HAVE_LOGNORM_TURBO
+    pWrkrData->reloadGeneration = ATOMIC_LOAD_32BIT_unsigned(&pData->reloadGeneration, &pData->mutReloadGeneration);
+    pWrkrData->ctxlnTurbo = NULL;
+    if (pData->bTurbo) {
+        /* Create a SEPARATE ln_ctx for this worker's turbo mode */
+        pWrkrData->ctxlnTurbo = buildTurboWorkerContext(pData);
+        if (pWrkrData->ctxlnTurbo == NULL) {
+            LogError(0, RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD,
+                     "mmnormalize: turbo worker context build failed, "
+                     "falling back to standard normalization");
+        } else {
+            DBGPRINTF("mmnormalize: turbo worker context ready\n");
+        }
+    }
+#endif
 ENDcreateWrkrInstance
 
 
@@ -200,32 +392,314 @@ BEGINfreeInstance
     CODESTARTfreeInstance;
     free(pData->rulebase);
     free(pData->rule);
-    ln_exitCtx(pData->ctxln);
+    if (pData->ctxln != NULL) ln_exitCtx(pData->ctxln);
+    if (pData->ctxlnLockInitialized) pthread_rwlock_destroy(&pData->ctxlnLock);
+    if (pData->mutReloadGenerationInitialized) pthread_mutex_destroy(&pData->mutReloadGeneration);
+    free(pData->rulebaseForReload);
+    free(pData->ruleForReload);
     free(pData->pszPath);
     msgPropDescrDestruct(pData->varDescr);
     free(pData->varDescr);
+    if (pData->debugFile != NULL) fclose(pData->debugFile);
 ENDfreeInstance
 
 
 BEGINfreeWrkrInstance
     CODESTARTfreeWrkrInstance;
+#ifdef HAVE_LOGNORM_TURBO
+    if (pWrkrData->ctxlnTurbo != NULL) {
+        ln_exitCtx(pWrkrData->ctxlnTurbo);
+        pWrkrData->ctxlnTurbo = NULL;
+    }
+#endif
 ENDfreeWrkrInstance
 
 
 BEGINdbgPrintInstInfo
     CODESTARTdbgPrintInstInfo;
     dbgprintf("mmnormalize\n");
-    dbgprintf("\tvariable='%s'\n", pData->varDescr->name);
+    dbgprintf("\tvariable='%s'\n", pData->varDescr ? (char *)pData->varDescr->name : "(none)");
     dbgprintf("\trulebase='%s'\n", pData->rulebase);
     dbgprintf("\trule='%s'\n", pData->rule);
     dbgprintf("\tpath='%s'\n", pData->pszPath);
     dbgprintf("\tbUseRawMsg='%d'\n", pData->bUseRawMsg);
+    dbgprintf("\tdebug='%d'\n", pData->bDebug);
+#ifdef HAVE_LOGNORM_TURBO
+    dbgprintf("\tturbo='%d'\n", pData->bTurbo);
+#endif
 ENDdbgPrintInstInfo
 
 
 BEGINtryResume
     CODESTARTtryResume;
 ENDtryResume
+
+#ifdef HAVE_LOGNORM_TURBO
+    /* Maximum field name length for stack-allocated buffer */
+    #define MMNORM_MAX_FIELDNAME 256
+
+/* Forward declaration -- defined below, needed by turbo_result_to_json_cb */
+static struct json_object *fast_result_to_json(const ln_fast_result_t *result);
+
+/**
+ * Callback for lazy JSON materialization from turbo result snapshot.
+ * Called by msg.c when template/property access needs pMsg->json.
+ * turbo_result points to an ln_fast_result_snapshot_t* (deep copy).
+ */
+static void turbo_result_to_json_cb(void *result_ptr, struct json_object **json) {
+    const ln_fast_result_snapshot_t *snap = (const ln_fast_result_snapshot_t *)result_ptr;
+    if (snap != NULL) {
+        const ln_fast_result_t *r = ln_fast_result_snapshot_get(snap);
+        if (r != NULL) *json = fast_result_to_json(r);
+    }
+}
+
+/**
+ * Turbo fast-path callback: resolve a single field from the snapshot
+ * without building the json-c tree.
+ *
+ * Path conversion: rsyslog "!sns!src" -> liblognorm "sns.src"
+ *   - Skip leading '!' (rsyslog root indicator)
+ *   - Replace remaining '!' with '.' (liblognorm uses dot separator)
+ *   - Stack buffer: no malloc, max MMNORM_MAX_FIELDNAME bytes
+ *
+ * Returns 0 on hit (val/vlen set, zero-copy into snapshot), -1 on miss.
+ */
+static int turbo_result_get_str_cb(
+    void *result_ptr, const uchar *name, int nameLen, const uchar **val, rs_size_t *vlen) {
+    const ln_fast_result_snapshot_t *snap = (const ln_fast_result_snapshot_t *)result_ptr;
+    const ln_fast_result_t *r;
+    char keybuf[MMNORM_MAX_FIELDNAME];
+    int keylen;
+
+    if (snap == NULL) return -1;
+
+    r = ln_fast_result_snapshot_get(snap);
+    if (r == NULL) return -1;
+
+    /* Convert rsyslog path to liblognorm key.
+     * pProp->name is "!sns!src" (leading ! = CEE root, ! separators).
+     * liblognorm uses "sns.src" (dot separators, no root prefix).
+     * Skip first char (!), replace ! with . */
+    if (nameLen < 2 || name[0] != '!') return -1; /* bare "!" = full tree request, not a single field */
+
+    keylen = nameLen - 1; /* skip leading '!' */
+    if (keylen >= (int)sizeof(keybuf)) return -1;
+
+    const uchar *src = name + 1;
+    for (int i = 0; i < keylen; i++) keybuf[i] = (src[i] == '!') ? '.' : (char)src[i];
+    keybuf[keylen] = '\0';
+
+    const char *sval;
+    size_t slen;
+    if (ln_fast_result_get_string(r, keybuf, &sval, &slen) != 0)
+        return -1; /* field not in snapshot -> fall through to json */
+
+    *val = (const uchar *)sval;
+    *vlen = (rs_size_t)slen;
+    return 0;
+}
+
+
+/**
+ * Destructor for turbo_result snapshot.
+ * The snapshot is a self-contained deep copy (single malloc),
+ * so a single free reclaims everything.
+ */
+static void turbo_result_snapshot_free(void *ptr) {
+    if (ptr != NULL) ln_fast_result_snapshot_free((ln_fast_result_snapshot_t *)ptr);
+}
+
+
+/**
+ * Convert ln_fast_result_t to json_object directly from typed fields.
+ * This avoids the JSON-string serialize + parse roundtrip, which is the
+ * key performance win of the turbo integration.
+ *
+ * Handles nested fields (dotted names like "event.src.ip") by building
+ * nested json_objects on the fly.
+ */
+static struct json_object *fast_result_to_json(const ln_fast_result_t *result) {
+    struct json_object *root;
+    int nfields;
+    int i;
+    int ntags;
+    char namebuf[MMNORM_MAX_FIELDNAME];
+
+    root = json_object_new_object();
+    if (root == NULL) return NULL;
+
+    nfields = ln_fast_result_field_count(result);
+    for (i = 0; i < nfields; i++) {
+        /* Read the field through the public opaque accessor instead of
+         * reaching into the result struct, so mmnormalize depends only on
+         * lognorm-turbo.h and not on the internal fast-result layout. */
+        const char *fname = NULL;
+        size_t fname_len = 0;
+        unsigned ftype = 0;
+        const char *sval = NULL;
+        size_t slen = 0;
+        int64_t ival = 0;
+        double dval = 0;
+        struct json_object *jval = NULL;
+        unsigned fflags = 0;
+        int is_null = 0;
+
+        /* Request field flags.  LN_FFIELD_RAW_JSON marks a string value that a
+         * json-typed parser (%name:json%) already captured as well-formed JSON;
+         * it must be parsed into a nested json_object, not stored as a quoted
+         * string, or {"kc":{...}} degrades to {"kc":"{...}"} and downstream
+         * $!kc!field lookups resolve to nothing.  Dotted (nested) names are
+         * still detected via memchr below, so LN_FFIELD_NESTED is not needed
+         * here. */
+        if (ln_fast_result_get_field_typed(result, i, &fname, &fname_len, &ftype, &fflags, &sval, &slen, &ival,
+                                           &dval) != 0)
+            continue;
+
+        switch (ftype) {
+            case LN_FTYPE_STRING:
+            case LN_FTYPE_STRING_INLINE:
+                if ((fflags & LN_FFIELD_RAW_JSON) && sval != NULL) {
+                    /* Length-bounded parse: the flat-store value is not
+                     * guaranteed NUL-terminated, so json_tokener_parse() could
+                     * over-read.  parse_ex() with slen stays in bounds. */
+                    struct json_tokener *jtok = json_tokener_new();
+                    if (jtok != NULL) {
+                        jval = json_tokener_parse_ex(jtok, sval, (int)slen);
+                        json_tokener_free(jtok);
+                    }
+                    /* Fall back to the raw string if it is not valid JSON after
+                     * all, so the field is never silently dropped. */
+                    if (jval == NULL) jval = json_object_new_string_len(sval, (int)slen);
+                } else {
+                    jval = json_object_new_string_len(sval, (int)slen);
+                }
+                break;
+            case LN_FTYPE_INT:
+                jval = json_object_new_int64(ival);
+                break;
+            case LN_FTYPE_DOUBLE:
+                jval = json_object_new_double(dval);
+                break;
+            case LN_FTYPE_BOOL:
+                jval = json_object_new_boolean((json_bool)ival);
+                break;
+            case LN_FTYPE_NULL:
+                /* A JSON null is stored by adding the key with a NULL value,
+                 * so jval stays NULL here and the guard below must let it
+                 * through.  Dropping it would make the field absent rather
+                 * than null, which is not what the standard parser yields. */
+                is_null = 1;
+                break;
+            default:
+                continue;
+        }
+
+        if (jval == NULL && !is_null) continue;
+
+        /* Field name: stack buffer for common short names, heap
+         * fallback for names >= MMNORM_MAX_FIELDNAME.  Silently
+         * truncating (the previous behaviour) would collide two
+         * distinct field names sharing the first 255 bytes, letting
+         * the second write overwrite the first.  The heap path pays
+         * one malloc+free per oversized field; pathological inputs
+         * should not happen in well-designed rulebases, but the
+         * contract is now "no truncation, ever" for correctness. */
+        char *name_ptr;
+        char *heap_name = NULL;
+        if (fname_len < MMNORM_MAX_FIELDNAME) {
+            memcpy(namebuf, fname, fname_len);
+            namebuf[fname_len] = '\0';
+            name_ptr = namebuf;
+        } else {
+            heap_name = (char *)malloc(fname_len + 1);
+            if (heap_name == NULL) {
+                /* OOM: drop the field rather than truncate.  json_object
+                 * created above must be released to avoid leaking. */
+                json_object_put(jval);
+                continue;
+            }
+            memcpy(heap_name, fname, fname_len);
+            heap_name[fname_len] = '\0';
+            name_ptr = heap_name;
+        }
+
+        /* Handle nested fields (dotted names).
+         * Detect dots directly -- LN_FFIELD_NESTED flag is not
+         * always set by liblognorm rule compilation. */
+        char *saveptr = NULL;
+        char *tok = (memchr(fname, '.', fname_len) != NULL) ? strtok_r(name_ptr, ".", &saveptr) : NULL;
+        if (tok != NULL) {
+            struct json_object *parent = root;
+            char *next = strtok_r(NULL, ".", &saveptr);
+
+            while (next != NULL) {
+                struct json_object *child = NULL;
+                if (!json_object_object_get_ex(parent, tok, &child) || !json_object_is_type(child, json_type_object)) {
+                    child = json_object_new_object();
+                    json_object_object_add(parent, tok, child);
+                }
+                parent = child;
+                tok = next;
+                next = strtok_r(NULL, ".", &saveptr);
+            }
+            json_object_object_add(parent, tok, jval);
+        } else {
+            /* Flat name, or a degenerate all-dot name (".", "..") produced by a
+             * discard match such as %.:json%: strtok_r() returns NULL there and
+             * json_object_object_add(key=NULL) does strdup(NULL) -> SIGSEGV.
+             * Add under the literal (possibly empty) name instead. */
+            json_object_object_add(root, name_ptr, jval);
+        }
+
+        /* json_object_object_add copies the key internally, so
+         * heap_name is safe to release on every iteration. */
+        free(heap_name);
+    }
+
+    /* Add tags at root level as JSON array (ECS standard) */
+    ntags = ln_fast_result_tag_count(result);
+    if (ntags > 0) {
+        struct json_object *tags = json_object_new_array();
+        for (i = 0; i < ntags; i++) {
+            const char *tag = ln_fast_result_get_tag(result, i);
+            if (tag) json_object_array_add(tags, json_object_new_string(tag));
+        }
+        json_object_object_add(root, "tags", tags);
+    }
+
+    return root;
+}
+#endif /* HAVE_LOGNORM_TURBO */
+
+#ifdef HAVE_LOGNORM_TURBO
+/* Adopt a pending HUP generation at a worker-owned safe point. Building the
+ * replacement before swapping keeps the previous context usable during
+ * compilation. Both the swap and reclamation occur on the owning worker. */
+static void refreshTurboContext(wrkrInstanceData_t *const pWrkrData) {
+    instanceData *const pData = pWrkrData->pData;
+    const unsigned targetGeneration = ATOMIC_LOAD_32BIT_unsigned(&pData->reloadGeneration, &pData->mutReloadGeneration);
+    ln_ctx newCtx;
+    ln_ctx oldCtx;
+
+    if (!pData->bTurbo || pWrkrData->reloadGeneration == targetGeneration) return;
+
+    newCtx = buildTurboWorkerContext(pData);
+    oldCtx = pWrkrData->ctxlnTurbo;
+    pWrkrData->ctxlnTurbo = newCtx;
+    pWrkrData->reloadGeneration = targetGeneration;
+    if (oldCtx != NULL) ln_exitCtx(oldCtx);
+
+    if (newCtx == NULL) {
+        LogError(0, RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD,
+                 "mmnormalize: HUP turbo worker context build failed, "
+                 "falling back to standard normalization");
+    } else {
+        DBGPRINTF("mmnormalize: turbo worker adopted HUP generation %u\n", targetGeneration);
+    }
+}
+#endif
+
 
 BEGINdoAction_NoStrings
     smsg_t **ppMsg = (smsg_t **)pMsgData;
@@ -244,11 +718,87 @@ BEGINdoAction_NoStrings
         buf = getMSG(pMsg);
         len = getMSGLen(pMsg);
     }
-    r = ln_normalize(pWrkrData->pData->ctxln, (char *)buf, len, &json);
-    if (freeBuf) {
-        free(buf);
-        buf = NULL;
+#ifdef HAVE_LOGNORM_TURBO
+    refreshTurboContext(pWrkrData);
+    if (pWrkrData->ctxlnTurbo != NULL) {
+        const sbool isCeeRoot = pWrkrData->pData->pszPath[0] == '$' && pWrkrData->pData->pszPath[1] == '!' &&
+                                pWrkrData->pData->pszPath[2] == '\0';
+        const ln_fast_result_t *result = NULL;
+        r = ln_turbo_normalize_raw(pWrkrData->ctxlnTurbo, (char *)buf, len, &result);
+        sbool turboTruncated = 0;
+    #ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
+        /* A truncated result is missing fields the rulebase did match. Decline
+         * it and let the standard parser below produce the complete set, the
+         * way ln_normalize_to_str() does. Counting it here, at the point the
+         * fast path is abandoned, keeps the counter exact: it can never report
+         * a message the standard parser went on to parse in full anyway. */
+        if (r == 0 && result != NULL && ln_fast_result_is_truncated(result)) {
+            STATSCOUNTER_INC(ctrTurboTruncated, mutCtrTurboTruncated);
+            DBGPRINTF(
+                "mmnormalize: turbo result truncated, "
+                "falling back to standard normalization\n");
+            turboTruncated = 1;
+        }
+    #endif
+        if (r == 0 && result != NULL && !turboTruncated) {
+            /* SNAPSHOT PATH: when path is "$!" (CEE root).
+             * Create a deep-copy snapshot of the turbo result.
+             * The snapshot is a single allocation (~6KB) that owns
+             * all string data -- safe for async output actions and
+             * non-DIRECT queues. The lazy materializer builds json
+             * on-demand only when templates access $! or $!field. */
+            if (isCeeRoot) {
+                ln_fast_result_snapshot_t *snap = ln_turbo_snapshot_result(pWrkrData->ctxlnTurbo);
+                if (snap == NULL) {
+                    DBGPRINTF(
+                        "mmnormalize: turbo snapshot alloc failed, "
+                        "trying JSON materialization\n");
+                    json = fast_result_to_json(result);
+                    if (json != NULL) goto add_json;
+                    DBGPRINTF(
+                        "mmnormalize: turbo JSON materialization failed, "
+                        "falling back to standard normalization\n");
+                } else {
+                    /* If a prior mmnormalize action on the same pMsg
+                     * already populated a snapshot, release it before
+                     * overwriting — rsyslog action chains can stack
+                     * parsers, and each snapshot owns ~6KB of string
+                     * data that would otherwise leak. */
+                    MsgLock(pMsg);
+                    MsgReleaseTurboResult(pMsg);
+                    pMsg->turbo_result = (void *)snap;
+                    pMsg->turbo_result_free = turbo_result_snapshot_free;
+                    pMsg->turbo_result_to_json = turbo_result_to_json_cb;
+                    pMsg->turbo_result_get_str = turbo_result_get_str_cb;
+                    MsgSetParseSuccess(pMsg, 1);
+                    MsgUnlock(pMsg);
+                    goto turbo_done;
+                }
+            }
+            /* Non-$! paths cannot retain a snapshot, so build JSON directly.
+             * A failed $! snapshot/materialization above deliberately falls
+             * through to standard normalization rather than retrying Turbo. */
+            if (!isCeeRoot) {
+                json = fast_result_to_json(result);
+                if (json != NULL) goto add_json;
+            }
+        } else {
+            DBGPRINTF(
+                "mmnormalize: turbo normalize failed (r=%d), "
+                "falling back to standard\n",
+                r);
+        }
     }
+#endif
+
+    /* STANDARD PATH: original ln_normalize (fallback or non-turbo) */
+    pthread_rwlock_rdlock(&pWrkrData->pData->ctxlnLock);
+    r = ln_normalize(pWrkrData->pData->ctxln, (char *)buf, len, &json);
+    pthread_rwlock_unlock(&pWrkrData->pData->ctxlnLock);
+
+#ifdef HAVE_LOGNORM_TURBO
+add_json:
+#endif
     if (r != 0) {
         DBGPRINTF("error %d during ln_normalize\n", r);
         MsgSetParseSuccess(pMsg, 0);
@@ -258,6 +808,14 @@ BEGINdoAction_NoStrings
 
     msgAddJSON(pMsg, (uchar *)pWrkrData->pData->pszPath + 1, json, 0, 0);
 
+#ifdef HAVE_LOGNORM_TURBO
+turbo_done:
+#endif
+    if (freeBuf) {
+        free(buf);
+        buf = NULL;
+    }
+
 ENDdoAction
 
 
@@ -265,8 +823,16 @@ static void setInstParamDefaults(instanceData *pData) {
     pData->rulebase = NULL;
     pData->rule = NULL;
     pData->bUseRawMsg = 0;
+    pData->rulebaseForReload = NULL;
+    pData->ruleForReload = NULL;
+    pData->ctxOpts = 0;
+    pData->bDebug = 0;
+    pData->debugFile = NULL;
     pData->pszPath = strdup("$!");
     pData->varDescr = NULL;
+#ifdef HAVE_LOGNORM_TURBO
+    pData->bTurbo = 0;
+#endif
 }
 
 BEGINsetModCnf
@@ -311,6 +877,7 @@ BEGINnewActInst
     char *varName = NULL;
     char *buffer;
     char *tStr;
+    char *debugFileName = NULL;
     int size = 0;
     CODESTARTnewActInst;
     DBGPRINTF("newActInst (mmnormalize)\n");
@@ -336,7 +903,7 @@ BEGINnewActInst
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "rulebase")) {
-            pData->rulebase = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->rulebase = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "rule")) {
             for (int j = 0; j < pvals[i].val.d.ar->nmemb; ++j) {
                 tStr = (char *)es_str2cstr(pvals[i].val.d.ar->arr[j], NULL);
@@ -362,9 +929,17 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "userawmsg")) {
             pData->bUseRawMsg = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "variable")) {
-            varName = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(varName = es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(actpblk.descr[i].name, "debug")) {
+            pData->bDebug = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "debugfile")) {
+            CHKmalloc(debugFileName = es_str2cstr(pvals[i].val.d.estr, NULL));
+#ifdef HAVE_LOGNORM_TURBO
+        } else if (!strcmp(actpblk.descr[i].name, "turbo")) {
+            pData->bTurbo = (int)pvals[i].val.d.n;
+#endif
         } else if (!strcmp(actpblk.descr[i].name, "path")) {
-            cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(cstr = es_str2cstr(pvals[i].val.d.estr, NULL));
             if (strlen(cstr) < 2) {
                 LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
                          "mmnormalize: valid path name should be at least "
@@ -402,6 +977,19 @@ BEGINnewActInst
         free(varName);
         varName = NULL;
     }
+    if (debugFileName != NULL) {
+        if (!pData->bDebug) {
+            LogError(0, RS_RET_CONFIG_ERROR, "mmnormalize: 'debugFile' requires 'debug=on'");
+            ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+        }
+        pData->debugFile = fopen(debugFileName, "a");
+        if (pData->debugFile == NULL) {
+            LogError(errno, RS_RET_CONFIG_ERROR, "mmnormalize: could not open debug file '%s'", debugFileName);
+            ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+        }
+        free(debugFileName);
+        debugFileName = NULL;
+    }
     if (!pData->rulebase) {
         if (!pData->rule) {
             LogError(0, RS_RET_CONFIG_ERROR,
@@ -421,6 +1009,7 @@ BEGINnewActInst
     CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
     iRet = buildInstance(pData);
     CODE_STD_FINALIZERnewActInst;
+    free(debugFileName);
     if (bDestructPValsOnExit) cnfparamvalsDestruct(pvals, &actpblk);
 ENDnewActInst
 
@@ -463,9 +1052,54 @@ BEGINparseSelectorAct
     CODE_STD_FINALIZERparseSelectorAct
 ENDparseSelectorAct
 
+BEGINdoHUP
+    ln_ctx newCtx;
+    ln_ctx oldCtx;
+    sbool turboAvailable = 0;
+    sbool enableTurbo = 0;
+    CODESTARTdoHUP;
+    DBGPRINTF("mmnormalize: HUP received\n");
+#ifdef HAVE_LOGNORM_TURBO
+    enableTurbo = pData->bTurbo;
+#endif
+    newCtx = buildContext(pData, enableTurbo, &turboAvailable);
+    if (newCtx == NULL) {
+        LogError(0, RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD,
+                 "mmnormalize: HUP rulebase reload failed, "
+                 "keeping the previous context");
+        ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+    }
+
+    pthread_rwlock_wrlock(&pData->ctxlnLock);
+    oldCtx = pData->ctxln;
+    pData->ctxln = newCtx;
+    pthread_rwlock_unlock(&pData->ctxlnLock);
+    ln_exitCtx(oldCtx);
+
+#ifdef HAVE_LOGNORM_TURBO
+    if (pData->bTurbo) {
+        const unsigned generation =
+            ATOMIC_INC_AND_FETCH_unsigned(&pData->reloadGeneration, &pData->mutReloadGeneration);
+        if (!turboAvailable) {
+            LogMsg(0, NO_ERRCODE, LOG_WARNING,
+                   "mmnormalize: HUP reloaded the standard rulebase, "
+                   "but Turbo compilation is unavailable");
+        }
+        DBGPRINTF("mmnormalize: published HUP generation %u for Turbo workers\n", generation);
+    }
+#else
+    (void)turboAvailable;
+#endif
+    LogMsg(0, RS_RET_OK, LOG_INFO, "mmnormalize: rulebase reloaded");
+finalize_it:
+ENDdoHUP
 
 BEGINmodExit
     CODESTARTmodExit;
+#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
+    if (mmnormalizeStats != NULL) statsobj.Destruct(&mmnormalizeStats);
+    objRelease(statsobj, CORE_COMPONENT);
+#endif
 ENDmodExit
 
 
@@ -476,6 +1110,7 @@ BEGINqueryEtryPt
     CODEqueryEtryPt_STD_CONF2_QUERIES;
     CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES;
     CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES;
+    CODEqueryEtryPt_doHUP
 ENDqueryEtryPt
 
 
@@ -532,6 +1167,16 @@ BEGINmodInit()
                                STD_LOADABLE_MODULE_ID));
     CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL,
                                STD_LOADABLE_MODULE_ID));
+#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
+    CHKiRet(objUse(statsobj, CORE_COMPONENT));
+    CHKiRet(statsobj.Construct(&mmnormalizeStats));
+    CHKiRet(statsobj.SetName(mmnormalizeStats, (uchar *)"mmnormalize"));
+    CHKiRet(statsobj.SetOrigin(mmnormalizeStats, (uchar *)"mmnormalize"));
+    STATSCOUNTER_INIT(ctrTurboTruncated, mutCtrTurboTruncated);
+    CHKiRet(statsobj.AddCounter(mmnormalizeStats, UCHAR_CONSTANT("turbo.truncated"), ctrType_IntCtr,
+                                CTR_FLAG_RESETTABLE, &ctrTurboTruncated));
+    CHKiRet(statsobj.ConstructFinalize(mmnormalizeStats));
+#endif
 ENDmodInit
 
 /* vi:set ai:

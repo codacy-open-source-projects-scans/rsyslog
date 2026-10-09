@@ -30,6 +30,7 @@
 #ifndef GLBL_H_INCLUDED
 #define GLBL_H_INCLUDED
 
+#include <signal.h>
 #include <sys/types.h>
 #ifdef ENABLE_LIBLOGGING_STDLOG
     #include <liblogging/stdlog.h>
@@ -101,6 +102,7 @@ BEGINinterface(glbl) /* name must also be changed in ENDinterface macro! */
     SIMP_PROP(NetstrmDrvrCAExtraFiles, uchar *);
     SIMP_PROP(ParserControlCharacterEscapePrefix, uchar);
     SIMP_PROP(ParserDropTrailingLFOnReception, int);
+    SIMP_PROP(ParserDropTrailingCROnReception, int);
     SIMP_PROP(ParserEscapeControlCharactersOnReceive, int);
     SIMP_PROP(ParserSpaceLFOnReceive, int);
     SIMP_PROP(ParserEscape8BitCharactersOnReceive, int);
@@ -111,7 +113,7 @@ BEGINinterface(glbl) /* name must also be changed in ENDinterface macro! */
 
 #undef SIMP_PROP
 ENDinterface(glbl)
-#define glblCURR_IF_VERSION 10 /* increment whenever you change the interface structure! */
+#define glblCURR_IF_VERSION 11 /* increment whenever you change the interface structure! */
 /* version 2 had PreserveFQDN added - rgerhards, 2008-12-08 */
 
 /* the remaining prototypes */
@@ -126,6 +128,7 @@ extern int glblDbgWhitelist;
 extern int glblPermitCtlC;
 extern int glblAbortOnProgramError;
 extern int bTerminateInputs;
+extern volatile sig_atomic_t bTerminateInputsSigSafe;
 #ifndef HAVE_ATOMIC_BUILTINS
 extern DEF_ATOMIC_HELPER_MUT(mutTerminateInputs);
 #endif
@@ -159,5 +162,18 @@ int glblGetOversizeMsgInputMode(rsconf_t *cnf);
 int glblReportOversizeMessage(rsconf_t *cnf);
 void glblReportChildProcessExit(rsconf_t *cnf, const uchar *name, pid_t pid, int status);
 uchar *glblGetLocalHostName(void);
+rsRetVal glblSetMaxOpenFiles(void *pVal, int iFiles);
+/** Check whether a legacy $-directive may be processed under the active compatibility policy. */
+int glblPermitLegacyConfigDirective(rsconf_t *cnf, const char *directive);
+/** Check whether a classic syslogd PRI selector may be processed under the active compatibility policy. */
+int glblPermitSyslogdConfigFilter(rsconf_t *cnf, const char *filter);
+/** Check whether a classic property-based selector filter may be processed under the active compatibility policy. */
+int glblPermitPropertyConfigFilter(rsconf_t *cnf, const char *filter);
+/** Emit an insecure-default warning when compatibility.defaults.secure is set to warn. */
+void glblWarnIfInsecureDefault(rsconf_t *cnf, const char *detail);
+/** Return local stream driver name or the configured global default. */
+const uchar *glblGetEffectiveNetstrmDrvr(rsconf_t *cnf, const uchar *localDrvr);
+/** Check whether a netstream driver name selects a TLS-capable driver. */
+int glblIsTlsCapableNetstrmDrvr(const uchar *drvr);
 
 #endif /* #ifndef GLBL_H_INCLUDED */

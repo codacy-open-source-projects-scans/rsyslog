@@ -26,6 +26,8 @@
 #include <assert.h>
 #include <signal.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <curl/curl.h>
 #include <json.h>
@@ -305,11 +307,26 @@ static struct curl_slist* httpfs_curl_add_header(struct curl_slist* headers, int
  * @return size_t
  */
 static size_t httpfs_curl_result_callback(void* contents, size_t size, size_t nmemb, void* userp) {
-    size_t realsize = size * nmemb;
+    size_t realsize;
     char* newreply = NULL;
     wrkrInstanceData_t* mem = (wrkrInstanceData_t*)userp;
 
-    newreply = realloc(mem->reply, mem->replyLen + realsize + 1);
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) {
+        dbgprintf("response buffer size overflow\n");
+        return 0;
+    }
+    realsize = size * nmemb;
+    if (mem->replyLen < 0) {
+        dbgprintf("response buffer size overflow\n");
+        return 0;
+    }
+    const size_t replyLen = (size_t)mem->replyLen;
+    if (replyLen == SIZE_MAX || realsize > SIZE_MAX - replyLen - 1 || realsize > (size_t)INT_MAX - replyLen) {
+        dbgprintf("response buffer size overflow\n");
+        return 0;
+    }
+
+    newreply = realloc(mem->reply, replyLen + realsize + 1);
     if (newreply == NULL) {
         /* out of memory! */
         dbgprintf("not enough memory (realloc returned NULL)\n");
@@ -323,8 +340,8 @@ static size_t httpfs_curl_result_callback(void* contents, size_t size, size_t nm
     }
 
     mem->reply = newreply;
-    memcpy(&(mem->reply[mem->replyLen]), contents, realsize);
-    mem->replyLen += realsize;
+    memcpy(&(mem->reply[replyLen]), contents, realsize);
+    mem->replyLen = (int)(replyLen + realsize);
     mem->reply[mem->replyLen] = 0;
 
     return realsize;
@@ -451,7 +468,7 @@ replication - required block replication for the file.
     httpfs_set_url(pWrkrData, "&op=create&overwrite=false&data=true");
 
     curl_easy_setopt(pWrkrData->curl, CURLOPT_POSTFIELDS, (char*)buf);
-    curl_easy_setopt(pWrkrData->curl, CURLOPT_POSTFIELDSIZE, strlen((char*)buf));
+    curl_easy_setopt(pWrkrData->curl, CURLOPT_POSTFIELDSIZE, (long)strlen((char*)buf));
 
     DBGPRINTF("%s(): msg=%s\n", __FUNCTION__, buf);
 
@@ -493,7 +510,7 @@ static rsRetVal httpfs_append_file(wrkrInstanceData_t* pWrkrData, uchar* buf) {
     httpfs_set_url(pWrkrData, "&op=append&data=true");
 
     curl_easy_setopt(pWrkrData->curl, CURLOPT_POSTFIELDS, (char*)buf);
-    curl_easy_setopt(pWrkrData->curl, CURLOPT_POSTFIELDSIZE, strlen((char*)buf));
+    curl_easy_setopt(pWrkrData->curl, CURLOPT_POSTFIELDSIZE, (long)strlen((char*)buf));
 
     headers = httpfs_curl_add_header(headers, 1, HTTPFS_CONTENT_TYPE);
     curl_easy_setopt(pWrkrData->curl, CURLOPT_HTTPHEADER, headers);
@@ -710,23 +727,23 @@ BEGINnewActInst
     for (i = 0; i < actpblk.nParams; ++i) {
         if (!pvals[i].bUsed) continue;
         if (!strcmp(actpblk.descr[i].name, "host")) {
-            pData->host = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->host = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else if (!strcmp(actpblk.descr[i].name, "port")) {
             pData->port = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "user")) {
-            pData->user = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->user = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
 
         } else if (!strcmp(actpblk.descr[i].name, "https")) {
             pData->https = pvals[i].val.d.n ? 1 : 0;
 
         } else if (!strcmp(actpblk.descr[i].name, "file")) {
-            pData->file = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->file = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
 
         } else if (!strcmp(actpblk.descr[i].name, "isdynfile")) {
             pData->isDynFile = pvals[i].val.d.n ? 1 : 0;
 
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            CHKmalloc(pData->tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL));
         } else {
             DBGPRINTF("omhttpfs: program error, non-handled param '%s'\n", actpblk.descr[i].name);
         }

@@ -183,6 +183,104 @@ disk for best performance and/or isolation by setting a dedicated
 ``queue.spoolDirectory`` on that queue definition. To create a disk
 queue, set ``queue.type="Disk"``.
 
+Disk queue durability is a configuration tradeoff, not an unconditional
+guarantee. A larger ``queue.checkpointInterval`` improves throughput but
+can require replay or recovery work after an ungraceful stop. Enabling
+``queue.syncqueuefiles`` and a very small checkpoint interval improves
+crash and power-loss resilience at a significant performance cost.
+
+Experimental segmented disk queues
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``queue.type="segmentedDisk"`` enables an experimental pure-disk queue
+backend based on a queue-private log-structured store. It writes one active
+segment at a time, seals segments at ``queue.maxFileSize``, and commits
+completed dequeue batches through a fixed-size, two-slot state file. A batch that
+must be retried is appended before the original batch is committed. A crash
+can therefore replay an uncommitted batch, but a committed record is never
+discarded merely because a later batch completed first.
+
+The store uses a versioned binary TLV message codec with checksums on metadata,
+record headers, payloads, and sealed-segment footers. Its files live in the
+dedicated ``<workDirectory>/<queue.filename>.segq/`` directory. The format is
+experimental and may change incompatibly while this queue type remains
+experimental. It is intentionally separate from the classic disk queue and
+does not use ``.qi`` or ``recover_qi.pl``.
+
+Startup reads only the 512-byte state file and probes the named active/recovery
+transition files. It does not enumerate segments or scan record payloads, so a
+valid queue's startup time is independent of backlog size. Segment metadata and
+record framing, payload checksums, and codec data are validated lazily when
+dequeue reaches them. Recovery scanning yields periodically so it does not hold
+the queue lock for an unbounded time.
+
+The state file is indispensable control data. If both slots are invalid, or the
+file is missing while segment files remain, rsyslog fails that queue immediately
+and requests offline recovery instead of delaying daemon startup with a full
+scan. Version 1 of this unmerged experimental format is intentionally rejected;
+there is no migration guarantee for experimental queue data.
+
+Use :doc:`../reference/tools/rsyslog-segqueue` while rsyslog is stopped to
+inspect the store, export live records as JSON Lines, restore state redundancy,
+or conservatively rebuild and salvage version 2 queue data.
+
+The segmented store is also the default disk child for new disk-assisted
+``FixedArray`` and ``LinkedList`` queues. Their memory tier remains primary and
+the segmented child stays unmaterialized until the first spill. The
+``queue.diskQueueType`` selector can pin the classic or segmented engine. Its
+default ``auto`` preserves existing classic backlogs, with a warning, and uses
+a durable ``.da-engine`` marker to keep the choice stable. It never converts
+records or mixes the two formats. For a fresh selection, queue encryption
+providers and classic-only corruption modes make ``auto`` select the classic
+engine. If segmented state already exists, those unsupported options make
+initialization fail instead of converting or falling back to another engine.
+
+For a fresh segmented disk-assisted child, neither the marker nor the
+``.segq`` store exists before the first spill. The marker is made durable
+before the store is materialized. Idle cleanup removes the store but retains
+the marker so the same engine is selected when a later spill recreates it.
+
+After a segmented disk-assisted child drains, ``queue.diskQueueIdleTimeout``
+can remove its empty ``.segq`` directory and terminate the last child worker.
+The default grace period is 60 seconds; ``0`` requests immediate cleanup and
+``-1`` keeps the materialized child. New producer activity restarts the full
+grace period, and recovery, retries, or in-flight batches prevent cleanup. The
+small engine marker remains so a later spill can recreate the store safely.
+
+Storage operations are serialized under the queue lock. Multiple generic
+queue workers may consume batches concurrently, and their completions may be
+out of order; the durable commit frontier still advances in dequeue order.
+As with other multi-worker queues, output ordering is not guaranteed when
+``queue.workerThreads`` is greater than one.
+
+``segmentedDisk`` uses the classic ``queue.checkpointInterval`` default of
+``0``, which disables periodic completion checkpoints. Positive intervals count
+records by contiguous commit-frontier advancement, not worker batches. Topology
+transitions, segment-ID reservations, pre-delete publication, and clean shutdown
+still force state updates. Setting ``queue.syncQueueFiles="on"`` additionally
+synchronizes ordinary segment and checkpoint writes, at a throughput cost.
+
+Before committed segments are unlinked, their range and conservative byte/count
+accounting are recorded durably. Interrupted or transiently failed deletion is
+retried idempotently by queue workers after restart; startup itself does not scan
+that range. The pending range remains visible as queue work, so empty waits and
+shutdown cannot silently strand those files.
+
+Recovery validates every framed record. In the supported ``safe`` corruption
+mode, rsyslog skips a payload-corrupt record and continues at the next valid
+record in the segment. A damaged tail of an active segment is recovered lazily.
+Missing or invalid state is not reconstructed automatically; the queue fails
+fast with an offline-recovery diagnostic.
+
+Queue statistics add ``disk.usage``, ``segments``, ``checkpoints``,
+``replayed``, ``corruption.events``, ``corruption.bytes``,
+``corruption.records``, ``corruption.segments``, ``retry.overage.bytes``,
+``retry.overage.maxbytes``, state-write/recovery counters, and the startup
+payload-byte and segment-probe counters for this backend. Segmented
+disk-assisted children additionally expose ``store.materializations``,
+``store.idleDematerializations``, ``store.idleCleanupFailures``, and
+``workers.current`` for lifecycle observability.
+
 If you happen to lose or otherwise need the housekeeping structures and
 have all your queue chunks you can use the ``recover_qi.pl`` script
 included in rsyslog to regenerate them::
@@ -258,10 +356,11 @@ parameters can be set. From the user's point of view, think of a DA
 queue like a "super-queue" which does all within a single queue.
 
 DA queues are typically used to de-couple potentially long-running and
-unreliable actions (to make them reliable). For example, it is
+unreliable actions and make them more resilient to destination outages.
+For example, it is
 recommended to use a disk-assisted linked list in-memory queue in front
-of each database and "send via tcp" action. Doing so makes these actions
-reliable and de-couples their potential low execution speed from the
+of each database and "send via tcp" action. Doing so de-couples their
+potential low execution speed from the
 rest of your rules (e.g. the local file writes). There is a howto on
 :doc:`massive database inserts </tutorials/high_database_rate>` which
 nicely describes this use case. It may even be a good read if you do not
@@ -279,6 +378,14 @@ eventually written to disk, but only if the high water mark is ever
 reached again. If it isn't, these items never touch the disk. So even
 when a queue runs disk-assisted, there is in-memory data present (this
 is a big difference to pure disk queues!).
+
+This also means that disk-assisted queues should not be treated like
+pure disk queues for crash durability. ``queue.saveOnShutdown="on"``
+persists the in-memory portion during an orderly rsyslog shutdown, but
+it cannot run after an immediate process kill, kernel OOM kill, system
+crash, or power loss. For scenarios where every accepted message must
+survive those events, use a pure disk queue and tune checkpointing and
+file synchronization for the required durability level.
 
 This algorithm prevents unnecessary disk writes but also leaves some
 additional buffer space for message bursts. Remember that creating disk

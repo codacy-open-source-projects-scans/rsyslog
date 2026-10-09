@@ -64,6 +64,8 @@ struct tcpLstnParams_s {
     sbool bMultiLine; /**< support multi-line messages */
     uchar *pszStartRegex; /**< regex that indicates start of frame */
     uchar *pszRatelimitName; /**< name of rate limit configuration */
+    struct AllowedSenders *pAllowedSenderRoot; /**< source-address ACL list */
+    sbool bUseLegacyAllowedSender; /**< if true, use protocol-global legacy ACLs */
 };
 
 /* list of tcp listen ports */
@@ -73,6 +75,19 @@ struct tcpLstnPortList_s {
     statsobj_t *stats; /**< associated stats object */
     ratelimit_t *ratelimiter;
     STATSCOUNTER_DEF(ctrSubmit, mutCtrSubmit)
+    STATSCOUNTER_DEF(ctrBytesRcvd, mutCtrBytesRcvd)
+    STATSCOUNTER_DEF(ctrBytesDecompressed, mutCtrBytesDecompressed)
+    STATSCOUNTER_DEF(ctrDecompressErr, mutCtrDecompressErr)
+    uint8_t compressionMode;
+    uint8_t compressionDriver;
+    uint64_t compressionMaxExpansionRatio;
+    uint64_t compressionMaxDecompressedBytesPerReceive;
+    uint64_t compressionMaxTotalZstdWindowBytes;
+    /* Concurrency & Locking: sessions have independent decoder state and share
+     * only this listener-wide zstd window counter. Native 64-bit atomics avoid
+     * serialization; the helper mutex exists only on no-64-bit-atomics builds. */
+    uint64 compressionZstdWindowBytesInUse;
+    DEF_ATOMIC_HELPER_MUT64(mutCompressionZstdWindow);
 #ifdef FEATURE_REGEXP
     regex_t start_preg;
     sbool bHasStartRegex;
@@ -179,13 +194,19 @@ struct tcpsrv_s {
         int addtlFrameDelim; /**< additional frame delimiter for plain TCP syslog
                      framing (e.g. to handle NetScreen) */
         int maxFrameSize; /**< max frame size for octet counted*/
+        uint8_t compressionMode;
+        uint8_t compressionDriver;
+        uint64_t compressionMaxExpansionRatio;
+        uint64_t compressionMaxDecompressedBytesPerReceive;
+        uint64_t compressionMaxTotalZstdWindowBytes;
         int bDisableLFDelim; /**< if 1, standard LF frame delimiter is disabled (*very dangerous*) */
         int discardTruncatedMsg; /**< discard msg part that has been truncated*/
         sbool bPreserveCase; /**< preserve case in fromhost */
         int iSynBacklog;
         unsigned int ratelimitInterval;
         unsigned int ratelimitBurst;
-        tcps_sess_t **pSessions; /**< array of all of our sessions */
+        tcps_sess_t **pSessions; /**< session slots shared by accept and worker threads */
+        DEF_ATOMIC_HELPER_MUT(mut_sessions);
         unsigned int starvationMaxReads;
         void *pUsr; /**< a user-settable pointer (provides extensibility for "derived classes")*/
         /* callbacks */
@@ -205,6 +226,7 @@ struct tcpsrv_s {
         /* work queue */
         workQueue_t workQueue;
         int currWrkrs;
+        int failOnBindError; /**< return a listener bind error after session setup */
 };
 
 
@@ -235,6 +257,12 @@ BEGINinterface(tcpsrv) /* name must also be changed in ENDinterface macro! */
     /* set methods */
     rsRetVal (*SetAddtlFrameDelim)(tcpsrv_t *, int);
     rsRetVal (*SetMaxFrameSize)(tcpsrv_t *, int);
+    rsRetVal (*SetCompressionMode)(tcpsrv_t *, int);
+    rsRetVal (*SetCompressionDriver)(tcpsrv_t *, int);
+    rsRetVal (*SetCompressionMaxExpansionRatio)(tcpsrv_t *, uint64_t);
+    rsRetVal (*SetCompressionMaxDecompressedBytesPerReceive)(tcpsrv_t *, uint64_t);
+    /* added v32 */
+    rsRetVal (*SetCompressionMaxTotalZstdWindowBytes)(tcpsrv_t *, uint64_t);
     /**
      * Set the input name for a listener configuration.
      *
@@ -331,7 +359,7 @@ BEGINinterface(tcpsrv) /* name must also be changed in ENDinterface macro! */
                                     const char *const networkNamespace);
 
 ENDinterface(tcpsrv)
-#define tcpsrvCURR_IF_VERSION 29 /* increment whenever you change the interface structure! */
+#define tcpsrvCURR_IF_VERSION 32 /* increment whenever you change the interface structure! */
 /* change for v4:
  * - SetAddtlFrameDelim() added -- rgerhards, 2008-12-10
  * - SetInputName() added -- rgerhards, 2008-12-10

@@ -143,6 +143,7 @@ typedef struct docker_cont_logs_inst_s {
 
 typedef struct docker_cont_log_instances_s {
     struct hashtable *ht_container_log_insts;
+    struct hashtable *ht_seen_container_ids;
     pthread_mutex_t mut;
     CURLM *curlm;
     /* track the latest created container */
@@ -191,6 +192,8 @@ static rsRetVal dockerContLogReqsGet(docker_cont_log_instances_t *pThis,
 static rsRetVal dockerContLogReqsPrint(docker_cont_log_instances_t *pThis);
 static rsRetVal dockerContLogReqsAdd(docker_cont_log_instances_t *pThis, docker_cont_logs_inst_t *pContLogsReqInst);
 static rsRetVal dockerContLogReqsRemove(docker_cont_log_instances_t *pThis, const char *id);
+static rsRetVal dockerContLogReqsRememberSeen(docker_cont_log_instances_t *pThis, const char *id);
+static rsRetVal dockerContLogReqsClearLastContainer(docker_cont_log_instances_t *pThis);
 
 /* docker_container_info_t */
 static rsRetVal dockerContainerInfoNew(docker_container_info_t **pThis);
@@ -325,6 +328,10 @@ static rsRetVal dockerContLogsBufWrite(docker_cont_logs_buf_t *const pThis,
     DEFiRet;
 
     imdocker_buf_t *const mem = pThis->buf;
+    if (mem->len == SIZE_MAX || write_size > SIZE_MAX - mem->len - 1) {
+        LogError(0, RS_RET_ERR, "%s() - buffer size overflow\n", __FUNCTION__);
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
     if (mem->len + write_size + 1 > mem->data_size) {
         uchar *const pbuf = realloc(mem->data, mem->len + write_size + 1);
         if (pbuf == NULL) {
@@ -715,6 +722,7 @@ static rsRetVal dockerContLogReqsNew(docker_cont_log_instances_t **ppThis) {
     CHKmalloc(pThis);
     CHKmalloc(pThis->ht_container_log_insts =
                   create_hashtable(7, hash_from_string, key_equals_string, dockerContLogReqsDestructForHashtable));
+    CHKmalloc(pThis->ht_seen_container_ids = create_hashtable(7, hash_from_string, key_equals_string, NULL));
 
     CHKiConcCtrl(pthread_mutex_init(&pThis->mut, NULL));
 
@@ -741,6 +749,11 @@ static rsRetVal dockerContLogReqsDestruct(docker_cont_log_instances_t *pThis) {
         if (pThis->ht_container_log_insts) {
             pthread_mutex_lock(&pThis->mut);
             hashtable_destroy(pThis->ht_container_log_insts, 1);
+            pthread_mutex_unlock(&pThis->mut);
+        }
+        if (pThis->ht_seen_container_ids) {
+            pthread_mutex_lock(&pThis->mut);
+            hashtable_destroy(pThis->ht_seen_container_ids, 0);
             pthread_mutex_unlock(&pThis->mut);
         }
         if (pThis->last_container_id) {
@@ -832,6 +845,87 @@ static rsRetVal dockerContLogReqsRemove(docker_cont_log_instances_t *pThis, cons
         } else {
             iRet = RS_RET_NOT_FOUND;
         }
+    }
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal dockerContLogReqsRememberId(struct hashtable *table, const char *id) {
+    DEFiRet;
+    uchar *keyName = NULL;
+
+    if (table && id && hashtable_search(table, (void *)id) == NULL) {
+        CHKmalloc(keyName = (uchar *)strdup(id));
+        if (!hashtable_insert(table, keyName, keyName)) {
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
+        keyName = NULL;
+    }
+finalize_it:
+    free(keyName);
+    RETiRet;
+}
+
+static rsRetVal dockerContLogReqsRememberSeen(docker_cont_log_instances_t *pThis, const char *id) {
+    return dockerContLogReqsRememberId(pThis ? pThis->ht_seen_container_ids : NULL, id);
+}
+
+static rsRetVal dockerContLogReqsPruneSeen(docker_cont_log_instances_t *pThis, struct hashtable *ht_current_ids) {
+    DEFiRet;
+    int ret = 0;
+    struct hashtable_itr *itr = NULL;
+
+    if (!pThis || !pThis->ht_seen_container_ids || !ht_current_ids ||
+        hashtable_count(pThis->ht_seen_container_ids) == 0) {
+        FINALIZE;
+    }
+
+    CHKmalloc(itr = hashtable_iterator(pThis->ht_seen_container_ids));
+    do {
+        char *id = hashtable_iterator_key(itr);
+        if (hashtable_search(ht_current_ids, id) == NULL) {
+            DBGPRINTF("prune stale seen container %s\n", id);
+            ret = hashtable_iterator_remove(itr);
+        } else {
+            ret = hashtable_iterator_advance(itr);
+        }
+    } while (ret);
+
+finalize_it:
+    free(itr);
+    RETiRet;
+}
+
+static rsRetVal dockerContLogReqsUpdateLastContainer(docker_cont_log_instances_t *pThis,
+                                                     const char *containerId,
+                                                     uint64_t created) {
+    DEFiRet;
+    uchar *new_last_container_id = NULL;
+
+    if (pThis && containerId && pThis->last_container_created < created) {
+        CHKmalloc(new_last_container_id = (uchar *)strdup(containerId));
+        pThis->last_container_created = created;
+        free(pThis->last_container_id);
+        pThis->last_container_id = new_last_container_id;
+        new_last_container_id = NULL;
+        DBGPRINTF("last_container_id updated: ('%s', %u)\n", pThis->last_container_id,
+                  (unsigned)pThis->last_container_created);
+    }
+
+finalize_it:
+    free(new_last_container_id);
+    RETiRet;
+}
+
+static rsRetVal dockerContLogReqsClearLastContainer(docker_cont_log_instances_t *pThis) {
+    DEFiRet;
+
+    if (pThis) {
+        CHKiConcCtrl(pthread_mutex_lock(&pThis->mut));
+        free(pThis->last_container_id);
+        pThis->last_container_id = NULL;
+        pThis->last_container_created = 0;
+        pthread_mutex_unlock(&pThis->mut);
     }
 finalize_it:
     RETiRet;
@@ -1103,7 +1197,7 @@ static rsRetVal enqMsg(docker_cont_logs_inst_t *pInst,
         size_t lenMsg = pMsg->iLenRawMsg;
         uchar *pszMsg = pMsg->pszRawMsg;
 
-        if (pszMsg[lenMsg - 1] == '\0') {
+        if (lenMsg > 0 && pszMsg[lenMsg - 1] == '\0') {
             DBGPRINTF("dropped NULL at very end of message\n");
             lenMsg--;
         }
@@ -1135,7 +1229,10 @@ static rsRetVal enqMsg(docker_cont_logs_inst_t *pInst,
     STATSCOUNTER_INC(ctrSubmit, mutCtrSubmit);
 
 finalize_it:
-    if (iRet == RS_RET_DISCARDMSG) STATSCOUNTER_INC(ctrLostRatelimit, mutCtrLostRatelimit)
+    if (iRet == RS_RET_DISCARDMSG) {
+        STATSCOUNTER_INC(ctrLostRatelimit, mutCtrLostRatelimit);
+        iRet = RS_RET_OK;
+    }
 
     RETiRet;
 }
@@ -1179,10 +1276,13 @@ static void debug_byte_buffer(const uchar *data, size_t size) {
 static size_t imdocker_container_list_curlCB(void *data, size_t size, size_t nmemb, void *buffer) {
     DEFiRet;
 
-    size_t realsize = size * nmemb;
+    size_t realsize;
     uchar *pbuf = NULL;
     imdocker_buf_t *mem = (imdocker_buf_t *)buffer;
 
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) ABORT_FINALIZE(RS_RET_ERR);
+    realsize = size * nmemb;
+    if (mem->len == SIZE_MAX || realsize > SIZE_MAX - mem->len - 1) ABORT_FINALIZE(RS_RET_ERR);
     if ((pbuf = realloc(mem->data, mem->len + realsize + 1)) == NULL) {
         LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
         ABORT_FINALIZE(RS_RET_ERR);
@@ -1217,20 +1317,30 @@ static rsRetVal SubmitMultiLineMsg(docker_cont_logs_inst_t *pInst,
     uchar *message = (uchar *)mem->data;
     int facility = loadModConf->iDfltFacility;
     int severity = pBufData->stream_type == dst_stderr ? LOG_ERR : loadModConf->iDfltSeverity;
-    enqMsg(pInst, message, len, (const uchar *)pszTag, facility, severity, NULL);
-
-    size_t size = mem->len - pInst->prevSegEnd;
-    memmove(mem->data, mem->data + pInst->prevSegEnd, size);
+    if (len > mem->len) {
+        LogError(0, RS_RET_ERR, "imdocker: multiline segment length %zu exceeds buffer length %zu", len, mem->len);
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+    uchar savedChar = mem->data[len];
     mem->data[len] = '\0';
+    const rsRetVal localRet = enqMsg(pInst, message, len, (const uchar *)pszTag, facility, severity, NULL);
+    mem->data[len] = savedChar;
+    CHKiRet(localRet);
+
+    size_t size = mem->len - len;
+    memmove(mem->data, mem->data + len, size);
+    mem->data[size] = '\0';
     mem->len = size;
     pBufData->bytes_remaining = 0;
 
+finalize_it:
     RETiRet;
 }
 
 static rsRetVal SubmitMsgWithStartRegex(docker_cont_logs_inst_t *pInst,
                                         docker_cont_logs_buf_t *pBufData,
                                         const uchar *pszTag) {
+    DEFiRet;
     imdocker_buf_t *mem = (imdocker_buf_t *)pBufData->buf;
     /* must be null terminated string */
     assert(mem->data[mem->len] == 0 || mem->data[mem->len] == '\0');
@@ -1247,7 +1357,7 @@ static rsRetVal SubmitMsgWithStartRegex(docker_cont_logs_inst_t *pInst,
     const int isStartMatch = start_preg ? !regexec(start_preg, (char *)thisLine, 0, NULL, 0) : 0;
 
     if (isStartMatch && pInst->prevSegEnd != 0) {
-        SubmitMultiLineMsg(pInst, pBufData, pszTag, pInst->prevSegEnd);
+        CHKiRet(SubmitMultiLineMsg(pInst, pBufData, pszTag, pInst->prevSegEnd));
         pInst->prevSegEnd = 0;
         FINALIZE;
     } else {
@@ -1256,36 +1366,41 @@ static rsRetVal SubmitMsgWithStartRegex(docker_cont_logs_inst_t *pInst,
     }
 
 finalize_it:
-    return RS_RET_OK;
+    RETiRet;
 }
 
 static rsRetVal SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar *pszTag) {
+    DEFiRet;
     imdocker_buf_t *mem = (imdocker_buf_t *)pBufData->buf;
     DBGPRINTF("%s() - {type=%d, len=%u} %s\n", __FUNCTION__, pBufData->stream_type, (unsigned int)mem->len, mem->data);
 
     if (pInst->start_regex) {
-        SubmitMsgWithStartRegex(pInst, pBufData, pszTag);
+        CHKiRet(SubmitMsgWithStartRegex(pInst, pBufData, pszTag));
     } else {
-        SubmitMsg(pInst, pBufData, pszTag);
+        CHKiRet(SubmitMsg(pInst, pBufData, pszTag));
     }
-    return RS_RET_OK;
+
+finalize_it:
+    RETiRet;
 }
 
 static rsRetVal SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar *pszTag) {
+    DEFiRet;
     imdocker_buf_t *mem = (imdocker_buf_t *)pBufData->buf;
     DBGPRINTF("%s() - {type=%d, len=%u} %s\n", __FUNCTION__, pBufData->stream_type, (unsigned int)mem->len, mem->data);
 
     uchar *message = mem->data;
     int facility = loadModConf->iDfltFacility;
     int severity = pBufData->stream_type == dst_stderr ? LOG_ERR : loadModConf->iDfltSeverity;
-    enqMsg(pInst, message, mem->len, (const uchar *)pszTag, facility, severity, NULL);
+    CHKiRet(enqMsg(pInst, message, mem->len, (const uchar *)pszTag, facility, severity, NULL));
 
     /* clear existing buffer. */
     mem->len = 0;
     memset(mem->data, 0, mem->data_size);
     pBufData->bytes_remaining = 0;
 
-    return RS_RET_OK;
+finalize_it:
+    RETiRet;
 }
 
 /** imdocker_container_logs_curlCB
@@ -1328,9 +1443,12 @@ static size_t imdocker_container_logs_curlCB(void *data, size_t size, size_t nme
     docker_cont_logs_inst_t *pInst = (docker_cont_logs_inst_t *)buffer;
     docker_cont_logs_req_t *req = pInst->logsReq;
 
-    size_t realsize = size * nmemb;
+    size_t realsize;
     const uchar *pdata = data;
     size_t write_size = 0;
+
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) ABORT_FINALIZE(RS_RET_ERR);
+    realsize = size * nmemb;
 
 #ifdef ENABLE_DEBUG_BYTE_BUFFER
     debug_byte_buffer((const uchar *)data, realsize);
@@ -1372,7 +1490,7 @@ static size_t imdocker_container_logs_curlCB(void *data, size_t size, size_t nme
                              curl_easy_strerror(ccode));
                     ABORT_FINALIZE(RS_RET_ERR);
                 }
-                req->submitMsg(pInst, pDataBuf, (const uchar *)DOCKER_TAG_NAME);
+                CHKiRet(req->submitMsg(pInst, pDataBuf, (const uchar *)DOCKER_TAG_NAME));
             }
         }
 
@@ -1410,7 +1528,7 @@ static size_t imdocker_container_logs_curlCB(void *data, size_t size, size_t nme
     CHKiRet(dockerContLogsBufWrite(pDataBuf, pread, write_size));
     if (pDataBuf->bytes_remaining == 0) {
         DBGPRINTF("%s() - write size is same as payload_size\n", __FUNCTION__);
-        req->submitMsg(pInst, pDataBuf, (const uchar *)DOCKER_TAG_NAME);
+        CHKiRet(req->submitMsg(pInst, pDataBuf, (const uchar *)DOCKER_TAG_NAME));
     }
 
 finalize_it:
@@ -1469,6 +1587,7 @@ static char *dupDockerContainerName(const char *pname) {
 static rsRetVal process_json(sbool isInit, const char *json, docker_cont_log_instances_t *pInstances) {
     DEFiRet;
     struct fjson_object *json_obj = NULL;
+    struct hashtable *ht_current_container_ids = NULL;
     int mut_locked = 0;
     DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
 
@@ -1482,6 +1601,7 @@ static rsRetVal process_json(sbool isInit, const char *json, docker_cont_log_ins
     }
 
     int length = fjson_object_array_length(json_obj);
+    CHKmalloc(ht_current_container_ids = create_hashtable(7, hash_from_string, key_equals_string, NULL));
     /* LOCK the update process. */
     CHKiConcCtrl(pthread_mutex_lock(&pInstances->mut));
     mut_locked = 1;
@@ -1525,31 +1645,25 @@ static rsRetVal process_json(sbool isInit, const char *json, docker_cont_log_ins
             }
 
             if (containerId) {
+                CHKiRet(dockerContLogReqsRememberId(ht_current_container_ids, containerId));
+                CHKiRet(dockerContLogReqsUpdateLastContainer(pInstances, containerId, containerInfo.created));
+                if (hashtable_search(pInstances->ht_seen_container_ids, (void *)containerId) != NULL) {
+                    DBGPRINTF("skip already seen container %s\n", containerId);
+                    continue;
+                }
                 docker_cont_logs_inst_t *pInst = NULL;
                 iRet = dockerContLogReqsGet(pInstances, &pInst, containerId);
                 if (iRet == RS_RET_NOT_FOUND) {
-                    uchar *new_last_container_id = NULL;
 #ifdef USE_MULTI_LINE
                     if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg2)
 #else
                     if (dockerContLogsInstNew(&pInst, containerId, &containerInfo, SubmitMsg)
 #endif
                         == RS_RET_OK) {
-                        if (pInstances->last_container_created < containerInfo.created) {
-                            CHKmalloc(new_last_container_id = (uchar *)strdup(containerId));
-                            pInstances->last_container_created = containerInfo.created;
-                            free(pInstances->last_container_id);
-                            pInstances->last_container_id = new_last_container_id;
-                            new_last_container_id = NULL;
-                            DBGPRINTF("last_container_id updated: ('%s', %u)\n", pInstances->last_container_id,
-                                      (unsigned)pInstances->last_container_created);
-                        }
                         iRet = dockerContLogsInstSetUrlById(isInit, pInst, pInstances->curlm, containerId);
                         if (iRet != RS_RET_OK) {
                             dockerContLogsInstDestruct(pInst);
                             pInst = NULL;
-                            free(new_last_container_id);
-                            new_last_container_id = NULL;
                             ABORT_FINALIZE(iRet);
                         }
 
@@ -1557,20 +1671,23 @@ static rsRetVal process_json(sbool isInit, const char *json, docker_cont_log_ins
                         if (iRet != RS_RET_OK) {
                             dockerContLogsInstDestruct(pInst);
                             pInst = NULL;
-                            free(new_last_container_id);
-                            new_last_container_id = NULL;
                             ABORT_FINALIZE(iRet);
                         }
+                        CHKiRet(dockerContLogReqsRememberSeen(pInstances, containerId));
                         pInst = NULL;
                     }
                 }
             }
         }
     }
+    CHKiRet(dockerContLogReqsPruneSeen(pInstances, ht_current_container_ids));
 
 finalize_it:
     if (mut_locked) {
         pthread_mutex_unlock(&pInstances->mut);
+    }
+    if (ht_current_container_ids) {
+        hashtable_destroy(ht_current_container_ids, 0);
     }
     if (json_obj) {
         json_object_put(json_obj);
@@ -1578,9 +1695,44 @@ finalize_it:
     RETiRet;
 }
 
-static rsRetVal getContainerIds(sbool isInit, docker_cont_log_instances_t *pInstances, const char *url) {
+static sbool containerListErrorReferencesId(const char *json, const char *id) {
+    sbool referencesId = 0;
+    struct fjson_object *json_obj = NULL;
+    struct fjson_object *message_obj = NULL;
+
+    if (json == NULL || id == NULL) {
+        goto done;
+    }
+
+    json_obj = fjson_tokener_parse(json);
+    if (!json_obj || !fjson_object_is_type(json_obj, fjson_type_object)) {
+        goto done;
+    }
+    if (!fjson_object_object_get_ex(json_obj, "message", &message_obj)) {
+        goto done;
+    }
+
+    const char *const message = fjson_object_get_string(message_obj);
+    referencesId = message != NULL && strstr(message, id) != NULL;
+
+done:
+    if (json_obj) {
+        json_object_put(json_obj);
+    }
+    return referencesId;
+}
+
+static rsRetVal getContainerIds(sbool isInit,
+                                docker_cont_log_instances_t *pInstances,
+                                const char *url,
+                                const char *sinceId,
+                                sbool *const pSinceRejected) {
     DEFiRet;
     imdocker_req_t *req = NULL;
+
+    if (pSinceRejected != NULL) {
+        *pSinceRejected = 0;
+    }
 
     CHKiRet(imdockerReqNew(&req));
 
@@ -1588,6 +1740,15 @@ static rsRetVal getContainerIds(sbool isInit, docker_cont_log_instances_t *pInst
     if (response != CURLE_OK) {
         DBGPRINTF("%s() - curl response: %d\n", __FUNCTION__, response);
         ABORT_FINALIZE(RS_RET_ERR);
+    }
+
+    if (pSinceRejected != NULL) {
+        long http_status = 0;
+        curl_easy_getinfo(req->curl, CURLINFO_RESPONSE_CODE, &http_status);
+        if (http_status == 404 && containerListErrorReferencesId((const char *)req->buf->data, sinceId)) {
+            *pSinceRejected = 1;
+            ABORT_FINALIZE(RS_RET_OK);
+        }
     }
 
     CHKiRet(process_json(isInit, (const char *)req->buf->data, pInstances));
@@ -1609,20 +1770,33 @@ static rsRetVal getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances
         pApiAddr = runModConf->dockerApiAddr;
     }
 
-    /*
-     * TODO: consider if we really need 'isInit' parameter. I suspect we don't need it
-     * and i'm almost certain Travis CI will complain its not used.
-     */
     if (pInstances->last_container_id) {
+        sbool sinceRejected = 0;
         CHKiRet(allocContainersListUrl(&url, pApiAddr, runModConf->apiVersionStr, runModConf->listContainersOptions,
                                        pInstances->last_container_id));
+        DBGPRINTF("listcontainers url: %s\n", url);
+        CHKiRet(getContainerIds(isInit, pInstances, (const char *)url, (const char *)pInstances->last_container_id,
+                                &sinceRejected));
+        if (sinceRejected) {
+            LogMsg(0, RS_RET_OK_WARN, LOG_WARNING,
+                   "imdocker: Docker rejected the last-seen container id; retrying container discovery without the "
+                   "since filter and ignoring containers already seen");
+            CHKiRet(dockerContLogReqsClearLastContainer(pInstances));
+            free(url);
+            url = NULL;
+            CHKiRet(allocContainersListUrl(&url, pApiAddr, runModConf->apiVersionStr, runModConf->listContainersOptions,
+                                           NULL));
+        } else {
+            goto after_get_container_ids;
+        }
     } else {
         CHKiRet(
             allocContainersListUrl(&url, pApiAddr, runModConf->apiVersionStr, runModConf->listContainersOptions, NULL));
     }
     DBGPRINTF("listcontainers url: %s\n", url);
 
-    CHKiRet(getContainerIds(isInit, pInstances, (const char *)url));
+    CHKiRet(getContainerIds(isInit, pInstances, (const char *)url, NULL, NULL));
+after_get_container_ids:
     if (Debug) {
         dockerContLogReqsPrint(pInstances);
     }

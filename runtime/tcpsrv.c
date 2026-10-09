@@ -216,7 +216,7 @@ static rsRetVal ATTR_NONNULL()
         pWorkset[i] = event[i].data.ptr;
         /* default is no error, on error we terminate, so we need only to set in error case! */
         if (event[i].events & EPOLLERR) {
-            ATOMIC_STORE_1_TO_INT(&pWorkset[i]->isInError, &pWorkset[i]->mut_isInError);
+            ATOMIC_STORE_32BIT(&pWorkset[i]->isInError, &pWorkset[i]->mut_isInError, 1);
         }
     }
     *numEntries = nfds;
@@ -385,11 +385,17 @@ static rsRetVal ATTR_NONNULL() addNewLstnPort(tcpsrv_t *const pThis, tcpLstnPara
     /* create entry */
     CHKmalloc(pEntry = (tcpLstnPortList_t *)calloc(1, sizeof(tcpLstnPortList_t)));
     pEntry->cnf_params = cnf_params;
+    INIT_ATOMIC_HELPER_MUT64(pEntry->mutCompressionZstdWindow);
 
     u_cstr_copy(pEntry->cnf_params->dfltTZ, pThis->dfltTZ, sizeof(pEntry->cnf_params->dfltTZ));
     pEntry->cnf_params->bSPFramingFix = pThis->bSPFramingFix;
     pEntry->cnf_params->bPreserveCase = pThis->bPreserveCase;
     pEntry->pSrv = pThis;
+    pEntry->compressionMode = pThis->compressionMode;
+    pEntry->compressionDriver = pThis->compressionDriver;
+    pEntry->compressionMaxExpansionRatio = pThis->compressionMaxExpansionRatio;
+    pEntry->compressionMaxDecompressedBytesPerReceive = pThis->compressionMaxDecompressedBytesPerReceive;
+    pEntry->compressionMaxTotalZstdWindowBytes = pThis->compressionMaxTotalZstdWindowBytes;
 
 #ifdef FEATURE_REGEXP
     if (cnf_params->pszStartRegex != NULL) {
@@ -430,8 +436,17 @@ static rsRetVal ATTR_NONNULL() addNewLstnPort(tcpsrv_t *const pThis, tcpLstnPara
     CHKiRet(statsobj.SetName(pEntry->stats, statname));
     CHKiRet(statsobj.SetOrigin(pEntry->stats, pThis->pszOrigin));
     STATSCOUNTER_INIT(pEntry->ctrSubmit, pEntry->mutCtrSubmit);
+    STATSCOUNTER_INIT(pEntry->ctrBytesRcvd, pEntry->mutCtrBytesRcvd);
+    STATSCOUNTER_INIT(pEntry->ctrBytesDecompressed, pEntry->mutCtrBytesDecompressed);
+    STATSCOUNTER_INIT(pEntry->ctrDecompressErr, pEntry->mutCtrDecompressErr);
     CHKiRet(statsobj.AddCounter(pEntry->stats, UCHAR_CONSTANT("submitted"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &(pEntry->ctrSubmit)));
+    CHKiRet(statsobj.AddCounter(pEntry->stats, UCHAR_CONSTANT("bytes.received"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &(pEntry->ctrBytesRcvd)));
+    CHKiRet(statsobj.AddCounter(pEntry->stats, UCHAR_CONSTANT("bytes.decompressed"), ctrType_IntCtr,
+                                CTR_FLAG_RESETTABLE, &(pEntry->ctrBytesDecompressed)));
+    CHKiRet(statsobj.AddCounter(pEntry->stats, UCHAR_CONSTANT("decompression.errors"), ctrType_IntCtr,
+                                CTR_FLAG_RESETTABLE, &(pEntry->ctrDecompressErr)));
     CHKiRet(statsobj.ConstructFinalize(pEntry->stats));
 
     /* all OK - add to list */
@@ -452,6 +467,7 @@ finalize_it:
                 regexp.regfree(&pEntry->start_preg);
             }
 #endif
+            DESTROY_ATOMIC_HELPER_MUT64(pEntry->mutCompressionZstdWindow);
             free(pEntry);
         }
     }
@@ -514,17 +530,33 @@ finalize_it:
 }
 
 
-/* find a free spot in the session table. If the table
- * is full, -1 is returned, else the index of the free
- * entry (0 or higher).
+static tcps_sess_t tcpsess_slot_reserved;
+
+
+#if !defined(ENABLE_IMTCP_EPOLL)
+static inline tcps_sess_t *ATTR_NONNULL() TCPSessTblLoad(tcpsrv_t *const pThis, const int i) {
+    tcps_sess_t *const pSess = (tcps_sess_t *)ATOMIC_LOAD_PTR((void **)&pThis->pSessions[i], &pThis->mut_sessions);
+    return pSess == &tcpsess_slot_reserved ? NULL : pSess;
+}
+#endif
+
+
+static inline void ATTR_NONNULL(1) TCPSessTblStore(tcpsrv_t *const pThis, const int i, tcps_sess_t *const pSess) {
+    ATOMIC_STORE_PTR((void **)&pThis->pSessions[i], &pThis->mut_sessions, pSess);
+}
+
+
+/* Atomically reserve a free spot in the session table. If the table is full,
+ * -1 is returned, else the index of the reserved entry (0 or higher). Readers
+ * treat the reservation marker like an empty slot until initialization is done.
  */
-static int ATTR_NONNULL() TCPSessTblFindFreeSpot(tcpsrv_t *const pThis) {
+static int ATTR_NONNULL() TCPSessTblClaimFreeSpot(tcpsrv_t *const pThis) {
     register int i;
 
     ISOBJ_TYPE_assert(pThis, tcpsrv);
 
     for (i = 0; i < pThis->iSessMax; ++i) {
-        if (pThis->pSessions[i] == NULL) break;
+        if (ATOMIC_CAS_PTR((void **)&pThis->pSessions[i], NULL, &tcpsess_slot_reserved, &pThis->mut_sessions)) break;
     }
 
     return ((i < pThis->iSessMax) ? i : -1);
@@ -546,7 +578,7 @@ static int ATTR_NONNULL() TCPSessGetNxtSess(tcpsrv_t *pThis, const int iCurr) {
     ISOBJ_TYPE_assert(pThis, tcpsrv);
     assert(pThis->pSessions != NULL);
     for (i = iCurr + 1; i < pThis->iSessMax; ++i) {
-        if (pThis->pSessions[i] != NULL) break;
+        if (TCPSessTblLoad(pThis, i) != NULL) break;
     }
 
     return ((i < pThis->iSessMax) ? i : -1);
@@ -572,7 +604,9 @@ static void ATTR_NONNULL() deinit_tcp_listener(tcpsrv_t *const pThis) {
         /* close all TCP connections! */
         i = TCPSessGetNxtSess(pThis, -1);
         while (i != -1) {
-            tcps_sess.Destruct(&pThis->pSessions[i]);
+            tcps_sess_t *pSess = TCPSessTblLoad(pThis, i);
+            tcps_sess.Destruct(&pSess);
+            TCPSessTblStore(pThis, i, NULL);
             /* now get next... */
             i = TCPSessGetNxtSess(pThis, i);
         }
@@ -592,8 +626,13 @@ static void ATTR_NONNULL() deinit_tcp_listener(tcpsrv_t *const pThis) {
         }
 #endif
         freeLstnParams(pEntry->cnf_params);
-        ratelimitDestruct(pEntry->ratelimiter);
-        statsobj.Destruct(&(pEntry->stats));
+        if (pEntry->ratelimiter != NULL) {
+            ratelimitDestruct(pEntry->ratelimiter);
+        }
+        if (pEntry->stats != NULL) {
+            statsobj.Destruct(&(pEntry->stats));
+        }
+        DESTROY_ATOMIC_HELPER_MUT64(pEntry->mutCompressionZstdWindow);
         pDel = pEntry;
         pEntry = pEntry->pNext;
         free(pDel);
@@ -650,6 +689,7 @@ finalize_it:
 static rsRetVal ATTR_NONNULL() create_tcp_socket(tcpsrv_t *const pThis) {
     DEFiRet;
     rsRetVal localRet;
+    rsRetVal firstFailure = RS_RET_OK;
     tcpLstnPortList_t *pEntry;
 
     ISOBJ_TYPE_assert(pThis, tcpsrv);
@@ -659,11 +699,12 @@ static rsRetVal ATTR_NONNULL() create_tcp_socket(tcpsrv_t *const pThis) {
     while (pEntry != NULL) {
         localRet = initTCPListener(pThis, pEntry);
         if (localRet != RS_RET_OK) {
+            if (firstFailure == RS_RET_OK) firstFailure = localRet;
             char *ns = pEntry->cnf_params->pszNetworkNamespace;
 
             LogError(
                 0, localRet,
-                "Could not create tcp listener, ignoring port "
+                "Could not create tcp listener for port "
                 "%s bind-address %s%s%s.",
                 (pEntry->cnf_params->pszPort == NULL) ? "**UNSPECIFIED**" : (const char *)pEntry->cnf_params->pszPort,
                 (pEntry->cnf_params->pszAddr == NULL) ? "**UNSPECIFIED**" : (const char *)pEntry->cnf_params->pszAddr,
@@ -671,6 +712,8 @@ static rsRetVal ATTR_NONNULL() create_tcp_socket(tcpsrv_t *const pThis) {
         }
         pEntry = pEntry->pNext;
     }
+
+    if (pThis->failOnBindError && firstFailure != RS_RET_OK) ABORT_FINALIZE(firstFailure);
 
     /* OK, we had success. Now it is also time to
      * initialize our connections
@@ -727,7 +770,7 @@ static ATTR_NONNULL() rsRetVal SessAccept(tcpsrv_t *const pThis,
     CHKiRet(netstrm.AcceptConnReq(pStrm, &pNewStrm, connInfo));
 
     /* Add to session list */
-    iSess = TCPSessTblFindFreeSpot(pThis);
+    iSess = TCPSessTblClaimFreeSpot(pThis);
     if (iSess == -1) {
         errno = 0;
         LogError(0, RS_RET_MAX_SESS_REACHED, "too many tcp sessions - dropping incoming request");
@@ -817,7 +860,7 @@ static ATTR_NONNULL() rsRetVal SessAccept(tcpsrv_t *const pThis,
     }
 
     *ppSess = pSess;
-    pThis->pSessions[iSess] = pSess;
+    TCPSessTblStore(pThis, iSess, pSess);
     *piSessIdx = iSess;
     pSess = NULL; /* this is now also handed over */
 
@@ -828,6 +871,7 @@ static ATTR_NONNULL() rsRetVal SessAccept(tcpsrv_t *const pThis,
 
 finalize_it:
     if (iRet != RS_RET_OK) {
+        if (iSess >= 0) TCPSessTblStore(pThis, iSess, NULL);
         if (iRet != RS_RET_HOST_NOT_PERMITTED && pThis->bEmitMsgOnOpen) {
             LogError(0, NO_ERRCODE,
                      "imtcp: connection could not be "
@@ -885,7 +929,7 @@ static ATTR_NONNULL() rsRetVal closeSess(tcpsrv_t *const pThis, tcpsrv_io_descr_
     pThis->pOnRegularClose(pSess);
 
     tcps_sess.Destruct(&pSess);
-    pThis->pSessions[pioDescr->id] = NULL;
+    TCPSessTblStore(pThis, pioDescr->id, NULL);
 #if defined(ENABLE_IMTCP_EPOLL)
     /* in epoll mode, pioDescr is dynamically allocated */
     DESTROY_ATOMIC_HELPER_MUT(pioDescr->mut_isInError);
@@ -989,8 +1033,8 @@ static rsRetVal ATTR_NONNULL(1)
 
 #if defined(ENABLE_IMTCP_EPOLL)
     /* If we had EPOLLERR, log additional info; processing continues. */
-    if (ATOMIC_FETCH_32BIT(&pioDescr->isInError, &pioDescr->mut_isInError)) {
-        ATOMIC_STORE_0_TO_INT(&pioDescr->isInError, &pioDescr->mut_isInError);
+    if (ATOMIC_LOAD_32BIT(&pioDescr->isInError, &pioDescr->mut_isInError)) {
+        ATOMIC_STORE_32BIT(&pioDescr->isInError, &pioDescr->mut_isInError, 0);
         int error = 0;
         socklen_t len = sizeof(error);
         const int sock = pioDescr->sock;
@@ -1159,14 +1203,18 @@ static rsRetVal ATTR_NONNULL(1)
     doAccept(tcpsrv_io_descr_t *const pioDescr, tcpsrvWrkrData_t *const wrkrData ATTR_UNUSED) {
     DEFiRet;
     int bRun = 1;
+#if defined(ENABLE_IMTCP_EPOLL)
     int nAccept = 0;
+#endif
 
     while (bRun) {
         iRet = doSingleAccept(pioDescr);
         if (iRet != RS_RET_OK) {
             bRun = 0;
         }
+#if defined(ENABLE_IMTCP_EPOLL)
         ++nAccept;
+#endif
     }
 #if defined(ENABLE_IMTCP_EPOLL)
     if (pioDescr->pSrv->workQueue.numWrkr > 1) {
@@ -1513,9 +1561,11 @@ static void ATTR_NONNULL() * wrkr(void *arg) {
  */
 static rsRetVal ATTR_NONNULL() processWorkset(const int numEntries, tcpsrv_io_descr_t *const pioDescr[]) {
     int i;
-    assert(numEntries > 0);
-    const unsigned numWrkr = pioDescr[0]->pSrv->workQueue.numWrkr; /* pSrv is always the same! */
+    unsigned numWrkr;
     DEFiRet;
+    assert(numEntries > 0);
+    if (numEntries <= 0 || pioDescr[0] == NULL || pioDescr[0]->pSrv == NULL) return RS_RET_INTERNAL_ERROR;
+    numWrkr = pioDescr[0]->pSrv->workQueue.numWrkr; /* pSrv is always the same! */
 
     DBGPRINTF("tcpsrv: ready to process %d event entries\n", numEntries);
 
@@ -1542,6 +1592,7 @@ PRAGMA_IGNORE_Wempty_body static ATTR_NONNULL() rsRetVal RunPoll(tcpsrv_t *const
     int iWorkset;
     int iTCPSess;
     int bIsReady;
+    tcps_sess_t *pSess;
     tcpsrv_io_descr_t *pWorkset[NSPOLL_MAX_EVENTS_PER_WAIT];
     tcpsrv_io_descr_t workset[NSPOLL_MAX_EVENTS_PER_WAIT];
     const int sizeWorkset = sizeof(workset) / sizeof(tcpsrv_io_descr_t);
@@ -1574,8 +1625,13 @@ PRAGMA_IGNORE_Wempty_body static ATTR_NONNULL() rsRetVal RunPoll(tcpsrv_t *const
         /* do the sessions */
         iTCPSess = TCPSessGetNxtSess(pThis, -1);
         while (iTCPSess != -1) {
+            pSess = TCPSessTblLoad(pThis, iTCPSess);
+            if (pSess == NULL) {
+                iTCPSess = TCPSessGetNxtSess(pThis, iTCPSess);
+                continue;
+            }
             /* TODO: access to pNsd is NOT really CLEAN, use method... */
-            CHKiRet(poll_Add(pThis, pThis->pSessions[iTCPSess]->pStrm, NSDSEL_RD));
+            CHKiRet(poll_Add(pThis, pSess->pStrm, NSDSEL_RD));
             DBGPRINTF("tcpsrv process session %d:\n", iTCPSess);
 
             /* now get next... */
@@ -1615,15 +1671,20 @@ PRAGMA_IGNORE_Wempty_body static ATTR_NONNULL() rsRetVal RunPoll(tcpsrv_t *const
         iTCPSess = TCPSessGetNxtSess(pThis, -1);
         while (nfds && iTCPSess != -1) {
             if (glbl.GetGlobalInputTermState() == 1) ABORT_FINALIZE(RS_RET_FORCE_TERM);
-            localRet = poll_IsReady(pThis, pThis->pSessions[iTCPSess]->pStrm, NSDSEL_RD, &bIsReady);
+            pSess = TCPSessTblLoad(pThis, iTCPSess);
+            if (pSess == NULL) {
+                iTCPSess = TCPSessGetNxtSess(pThis, iTCPSess);
+                continue;
+            }
+            localRet = poll_IsReady(pThis, pSess->pStrm, NSDSEL_RD, &bIsReady);
             if (bIsReady || localRet != RS_RET_OK) {
                 workset[iWorkset].pSrv = pThis;
                 workset[iWorkset].ptrType = NSD_PTR_TYPE_SESS;
                 workset[iWorkset].id = iTCPSess;
                 workset[iWorkset].isInError = 0;
                 workset[iWorkset].ioDirection = NSDSEL_RD; /* non-epoll: ensure sane default */
-                CHKiRet(netstrm.GetSock(pThis->pSessions[iTCPSess]->pStrm, &(workset[iWorkset].sock)));
-                workset[iWorkset].ptr.pSess = pThis->pSessions[iTCPSess];
+                CHKiRet(netstrm.GetSock(pSess->pStrm, &(workset[iWorkset].sock)));
+                workset[iWorkset].ptr.pSess = pSess;
                 ++iWorkset;
                 if (iWorkset >= (int)sizeWorkset) {
                     processWorkset(iWorkset, pWorkset);
@@ -1699,6 +1760,12 @@ static rsRetVal ATTR_NONNULL() RunEpoll(tcpsrv_t *const pThis) {
         processWorkset(numEntries, workset);
     }
 
+    /* Workers can still process listener events queued just before shutdown.
+     * Join them before freeing listener descriptors so rearmIoEvent() cannot
+     * observe descriptor storage that RunEpoll() is tearing down.
+     */
+    stopWrkrPool(pThis);
+
     /* remove the tcp listen sockets from the epoll set */
     for (i = 0; i < pThis->iLstnCurr; ++i) {
         CHKiRet(epoll_Ctl(pThis, pThis->ppioDescrPtr[i], 1, EPOLL_CTL_DEL));
@@ -1759,6 +1826,8 @@ finalize_it:
 
 /* Standard-Constructor */
 BEGINobjConstruct(tcpsrv) /* be sure to specify the object type also in END macro! */
+    INIT_ATOMIC_HELPER_MUT(pThis->mut_sessions);
+    pThis->failOnBindError = 0;
     pThis->iSessMax = TCPSESS_MAX_DEFAULT;
     pThis->iLstnMax = TCPLSTN_MAX_DEFAULT;
     pThis->addtlFrameDelim = TCPSRV_NO_ADDTL_DELIMITER;
@@ -1776,6 +1845,11 @@ BEGINobjConstruct(tcpsrv) /* be sure to specify the object type also in END macr
     pThis->iSynBacklog = 0; /* default: unset */
     pThis->DrvrTlsVerifyDepth = 0;
     pThis->DrvrTlsRevocationCheck = 0;
+    pThis->compressionMode = TCPSRV_COMPRESS_NEVER;
+    pThis->compressionDriver = TCPSRV_COMPRESS_DRIVER_ZLIB;
+    pThis->compressionMaxExpansionRatio = TCPSRV_COMPRESS_MAX_EXPANSION_RATIO_DEFAULT;
+    pThis->compressionMaxDecompressedBytesPerReceive = TCPSRV_COMPRESS_MAX_DECOMPRESSED_BYTES_PER_RECEIVE_DEFAULT;
+    pThis->compressionMaxTotalZstdWindowBytes = TCPSRV_COMPRESS_MAX_TOTAL_ZSTD_WINDOW_BYTES_DEFAULT;
 ENDobjConstruct(tcpsrv)
 
 
@@ -1814,6 +1888,8 @@ static rsRetVal ATTR_NONNULL() tcpsrvConstructFinalize(tcpsrv_t *pThis) {
 
 finalize_it:
     if (iRet != RS_RET_OK) {
+        for (int i = 0; i < pThis->iLstnCurr; ++i) netstrm.Destruct(pThis->ppLstn + i);
+        pThis->iLstnCurr = 0;
         if (pThis->pNS != NULL) netstrms.Destruct(&pThis->pNS);
         free(pThis->ppLstn);
         pThis->ppLstn = NULL;
@@ -1851,6 +1927,7 @@ BEGINobjDestruct(tcpsrv) /* be sure to specify the object type also in END and C
     free(pThis->ppLstnPort);
     free(pThis->ppioDescrPtr);
     free(pThis->pszOrigin);
+    DESTROY_ATOMIC_HELPER_MUT(pThis->mut_sessions);
 ENDobjDestruct(tcpsrv)
 
 
@@ -2012,6 +2089,53 @@ static rsRetVal ATTR_NONNULL(1) SetMaxFrameSize(tcpsrv_t *pThis, int maxFrameSiz
     RETiRet;
 }
 
+static rsRetVal ATTR_NONNULL(1) SetCompressionMode(tcpsrv_t *pThis, int mode) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, tcpsrv);
+    if (mode != TCPSRV_COMPRESS_NEVER && mode != TCPSRV_COMPRESS_STREAM_ALWAYS) {
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+    pThis->compressionMode = (uint8_t)mode;
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal ATTR_NONNULL(1) SetCompressionDriver(tcpsrv_t *pThis, int driver) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, tcpsrv);
+    if (driver != TCPSRV_COMPRESS_DRIVER_ZLIB && driver != TCPSRV_COMPRESS_DRIVER_ZSTD) {
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+#ifndef ENABLE_LIBZSTD
+    if (driver == TCPSRV_COMPRESS_DRIVER_ZSTD) {
+        ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+    }
+#endif
+    pThis->compressionDriver = (uint8_t)driver;
+finalize_it:
+    RETiRet;
+}
+
+static rsRetVal ATTR_NONNULL(1) SetCompressionMaxExpansionRatio(tcpsrv_t *pThis, const uint64_t ratio) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, tcpsrv);
+    pThis->compressionMaxExpansionRatio = ratio;
+    RETiRet;
+}
+
+static rsRetVal ATTR_NONNULL(1) SetCompressionMaxDecompressedBytesPerReceive(tcpsrv_t *pThis, const uint64_t maxBytes) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, tcpsrv);
+    pThis->compressionMaxDecompressedBytesPerReceive = maxBytes;
+    RETiRet;
+}
+
+static rsRetVal ATTR_NONNULL(1) SetCompressionMaxTotalZstdWindowBytes(tcpsrv_t *pThis, const uint64_t maxBytes) {
+    DEFiRet;
+    ISOBJ_TYPE_assert(pThis, tcpsrv);
+    pThis->compressionMaxTotalZstdWindowBytes = maxBytes;
+    RETiRet;
+}
 
 static rsRetVal ATTR_NONNULL(1) SetDfltTZ(tcpsrv_t *const pThis, uchar *const tz) {
     DEFiRet;
@@ -2323,6 +2447,11 @@ BEGINobjQueryInterface(tcpsrv)
     pIf->SetbSPFramingFix = SetbSPFramingFix;
     pIf->SetAddtlFrameDelim = SetAddtlFrameDelim;
     pIf->SetMaxFrameSize = SetMaxFrameSize;
+    pIf->SetCompressionMode = SetCompressionMode;
+    pIf->SetCompressionDriver = SetCompressionDriver;
+    pIf->SetCompressionMaxExpansionRatio = SetCompressionMaxExpansionRatio;
+    pIf->SetCompressionMaxDecompressedBytesPerReceive = SetCompressionMaxDecompressedBytesPerReceive;
+    pIf->SetCompressionMaxTotalZstdWindowBytes = SetCompressionMaxTotalZstdWindowBytes;
     pIf->SetbDisableLFDelim = SetbDisableLFDelim;
     pIf->SetDiscardTruncatedMsg = SetDiscardTruncatedMsg;
     pIf->SetSessMax = SetSessMax;
@@ -2379,7 +2508,9 @@ BEGINObjClassExit(tcpsrv, OBJ_IS_LOADABLE_MODULE) /* CHANGE class also in END MA
     objRelease(netstrms, DONT_LOAD_LIB);
     objRelease(netstrm, LM_NETSTRMS_FILENAME);
     objRelease(net, LM_NET_FILENAME);
+#ifdef FEATURE_REGEXP
     objRelease(regexp, LM_REGEXP_FILENAME);
+#endif
 ENDObjClassExit(tcpsrv)
 
 
@@ -2398,7 +2529,9 @@ BEGINObjClassInit(tcpsrv, 1, OBJ_IS_LOADABLE_MODULE) /* class, version - CHANGE 
     CHKiRet(objUse(ruleset, CORE_COMPONENT));
     CHKiRet(objUse(statsobj, CORE_COMPONENT));
     CHKiRet(objUse(prop, CORE_COMPONENT));
+#ifdef FEATURE_REGEXP
     CHKiRet(objUse(regexp, LM_REGEXP_FILENAME));
+#endif
 
     /* set our own handlers */
     OBJSetMethodHandler(objMethod_DEBUGPRINT, tcpsrvDebugPrint);
