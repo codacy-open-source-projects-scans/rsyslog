@@ -485,6 +485,9 @@ static void freeActionNames(rsconf_t *pThis) {
 /* destructor for the rsconf object */
 BEGINobjDestruct(rsconf) /* be sure to specify the object type also in END and CODESTART macros! */
     CODESTARTobjDestruct(rsconf);
+    const rsRetVal graph_ret = ruleset_shutdown_local_graph(pThis);
+    if (graph_ret != RS_RET_OK) LogError(0, graph_ret, "local queue graph shutdown failed during config teardown");
+    ruleset_free_local_graph(pThis);
     freeCnf(pThis);
     tplDeleteAll(pThis);
     dynstats_destroyAllBuckets(pThis);
@@ -790,14 +793,15 @@ void ATTR_NONNULL() cnfDoObj(struct cnfobj *const o) {
             glblProcessTimezone(o);
             break;
         case CNFOBJ_MAINQ:
+            qqueue_note_local_config_intent(o->nvlst);
             glblProcessMainQCnf(o);
             bDestructObj = 0;
             break;
         case CNFOBJ_MODULE:
-            modulesProcessCnf(o);
+            if (modulesProcessCnf(o) != RS_RET_OK) loadConf->globals.bInputDeclarationFailed = 1;
             break;
         case CNFOBJ_INPUT:
-            inputProcessCnf(o);
+            if (inputProcessCnf(o) != RS_RET_OK) loadConf->globals.bInputDeclarationFailed = 1;
             break;
         case CNFOBJ_LOOKUP_TABLE:
             lookupTableDefProcessCnf(o);
@@ -809,6 +813,7 @@ void ATTR_NONNULL() cnfDoObj(struct cnfobj *const o) {
             perctile_processCnf(o);
             break;
         case CNFOBJ_PARSER:
+            loadConf->local_custom_parser = 1;
             parserProcessCnf(o);
             break;
         case CNFOBJ_RATELIMIT:
@@ -818,6 +823,7 @@ void ATTR_NONNULL() cnfDoObj(struct cnfobj *const o) {
             if (tplProcessCnf(o) != RS_RET_OK) parser_errmsg("error processing template object");
             break;
         case CNFOBJ_RULESET:
+            qqueue_note_local_config_intent(o->nvlst);
             rulesetProcessCnf(o);
             break;
         case CNFOBJ_PROPERTY:
@@ -1022,6 +1028,7 @@ static rsRetVal tellModulesConfigLoadDone(void) {
 static rsRetVal tellModulesCheckConfig(void) {
     cfgmodules_etry_t *node;
     rsRetVal localRet;
+    rsRetVal firstFailure = RS_RET_OK;
 
     DBGPRINTF("telling modules to check config %p\n", loadConf);
     node = module.GetNxtCnfType(loadConf, NULL, eMOD_ANY);
@@ -1034,12 +1041,15 @@ static rsRetVal tellModulesCheckConfig(void) {
                 node->canActivate = 1;
             } else {
                 node->canActivate = 0;
+                if (node->pMod->eType == eMOD_IN && firstFailure == RS_RET_OK) firstFailure = localRet;
             }
         }
         node = module.GetNxtCnfType(loadConf, node, eMOD_ANY);  // runConf -> loadConf
     }
 
-    return RS_RET_OK; /* intentional: we do not care about module errors */
+    if (loadConf->globals.bRequireAllInputs && loadConf->globals.bInputDeclarationFailed) return RS_RET_CONFIG_ERROR;
+    if (loadConf->globals.bRequireAllInputs && loadConf->globals.bInputRulesetMissing) return RS_RET_NOT_FOUND;
+    return loadConf->globals.bRequireAllInputs ? firstFailure : RS_RET_OK;
 }
 
 /* verify parser instances after full config load */
@@ -1078,7 +1088,9 @@ static rsRetVal tellModulesActivateConfigPrePrivDrop(void) {
             if (localRet != RS_RET_OK) {
                 LogError(0, localRet, "activation of module %s failed", node->pMod->pszName);
                 node->canActivate = 0; /* in a sense, could not activate... */
-                if (runConf->globals.bAbortOnUncleanConfig) return localRet;
+                if (runConf->globals.bAbortOnUncleanConfig ||
+                    (runConf->globals.bRequireAllInputs && node->pMod->eType == eMOD_IN))
+                    return localRet;
             }
         }
         node = module.GetNxtCnfType(runConf, node, eMOD_ANY);
@@ -1103,12 +1115,13 @@ static rsRetVal tellModulesActivateConfig(void) {
             if (localRet != RS_RET_OK) {
                 LogError(0, localRet, "activation of module %s failed", node->pMod->pszName);
                 node->canActivate = 0; /* in a sense, could not activate... */
+                if (runConf->globals.bRequireAllInputs && node->pMod->eType == eMOD_IN) return localRet;
             }
         }
         node = module.GetNxtCnfType(runConf, node, eMOD_ANY);
     }
 
-    return RS_RET_OK; /* intentional: we do not care about module errors */
+    return RS_RET_OK; /* best-effort mode keeps other modules running */
 }
 
 
@@ -1118,6 +1131,7 @@ static rsRetVal tellModulesActivateConfig(void) {
 static rsRetVal runInputModules(void) {
     cfgmodules_etry_t *node;
     int bNeedsCancel;
+    rsRetVal localRet;
 
     node = module.GetNxtCnfType(runConf, NULL, eMOD_IN);
     while (node != NULL) {
@@ -1126,8 +1140,12 @@ static rsRetVal runInputModules(void) {
                 (node->pMod->isCompatibleWithFeature(sFEATURENonCancelInputTermination) == RS_RET_OK) ? 0 : 1;
             DBGPRINTF("running module %s with config %p, term mode: %s\n", node->pMod->pszName, node,
                       bNeedsCancel ? "cancel" : "cooperative/SIGTTIN");
-            thrdCreate(node->pMod->mod.im.runInput, node->pMod->mod.im.afterRun, bNeedsCancel,
-                       (node->pMod->cnfName == NULL) ? node->pMod->pszName : node->pMod->cnfName);
+            localRet = thrdCreate(node->pMod->mod.im.runInput, node->pMod->mod.im.afterRun, bNeedsCancel,
+                                  (node->pMod->cnfName == NULL) ? node->pMod->pszName : node->pMod->cnfName);
+            if (localRet != RS_RET_OK && runConf->globals.bRequireAllInputs) {
+                LogError(0, localRet, "input module %s could not start its worker thread", node->pMod->pszName);
+                return localRet;
+            }
         }
         node = module.GetNxtCnfType(runConf, node, eMOD_IN);
     }
@@ -1141,6 +1159,7 @@ static rsRetVal runInputModules(void) {
 static rsRetVal startInputModules(void) {
     DEFiRet;
     cfgmodules_etry_t *node;
+    rsRetVal firstFailure = RS_RET_OK;
 
     node = module.GetNxtCnfType(runConf, NULL, eMOD_IN);
     while (node != NULL) {
@@ -1149,6 +1168,8 @@ static rsRetVal startInputModules(void) {
             node->canRun = (iRet == RS_RET_OK);
             if (!node->canRun) {
                 DBGPRINTF("module %s will not run, iRet %d\n", node->pMod->pszName, iRet);
+                LogError(0, iRet, "input module %s will not run", node->pMod->pszName);
+                if (firstFailure == RS_RET_OK) firstFailure = iRet;
             }
         } else {
             node->canRun = 0;
@@ -1156,7 +1177,7 @@ static rsRetVal startInputModules(void) {
         node = module.GetNxtCnfType(runConf, node, eMOD_IN);
     }
 
-    return RS_RET_OK; /* intentional: we do not care about module errors */
+    return runConf->globals.bRequireAllInputs ? firstFailure : RS_RET_OK;
 }
 
 /* load the main queue */
@@ -1272,13 +1293,14 @@ static rsRetVal activate(rsconf_t *cnf) {
     CHKiRet(dropPrivileges(cnf));
 
     lookupActivateConf();
-    tellModulesActivateConfig();
-    startInputModules();
+    CHKiRet(tellModulesActivateConfig());
+    CHKiRet(startInputModules());
     CHKiRet(activateActions());
     CHKiRet(activateRulesetQueues());
     CHKiRet(activateMainQueue());
+    ruleset_activate_local_graph(cnf);
     /* finally let the inputs run... */
-    runInputModules();
+    CHKiRet(runInputModules());
     qqueueDoneLoadCnf(); /* we no longer need config-load-only data structures */
 
     dbgprintf("configuration %p activated\n", cnf);
@@ -1752,10 +1774,11 @@ static rsRetVal load(rsconf_t **cnf, uchar *confFile) {
     CHKiRet(tellCoreConfigLoadDone());
     tellModulesConfigLoadDone();
 
-    tellModulesCheckConfig();
+    CHKiRet(tellModulesCheckConfig());
     CHKiRet(checkParserInstances());
     CHKiRet(validateConf(loadConf));
     CHKiRet(loadMainQueue());
+    CHKiRet(rulesetValidateLocalQueues(loadConf));
 
     if (iConfigVerify && !rsconfTranslateEnabled()) {
         if (iRet == RS_RET_OK) iRet = RS_RET_VALIDATION_RUN;
@@ -1773,6 +1796,12 @@ static rsRetVal load(rsconf_t **cnf, uchar *confFile) {
     rsconfDebugPrint(loadConf);
 
 finalize_it:
+    if (loadConf != NULL && (loadConf->local_config_requested || loadConf->local_config_error) &&
+        (loadConf->local_config_error || hadErrMsgs() || (iRet != RS_RET_OK && iRet != RS_RET_VALIDATION_RUN) ||
+         delayed_iRet != RS_RET_OK)) {
+        loadConf->local_config_error = 1;
+        iRet = RS_RET_LOCAL_QUEUE_CONFIG;
+    }
     if (iRet == RS_RET_OK && delayed_iRet != RS_RET_OK) {
         iRet = delayed_iRet;
     }

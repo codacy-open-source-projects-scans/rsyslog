@@ -61,6 +61,7 @@ EXTRA_DIST = \
     ai/drift_monitoring.md \
     ai/mermaid_rules.md \
     ai/module_map.yaml \
+    ai/designs/local-queue-target-measurement-method.md \
     ai/security_triage_rubric.md \
     ai/structure_and_paths.md \
     ai/templates/template-concept.rst \
@@ -743,7 +744,6 @@ EXTRA_DIST = \
     source/reference/parameters/imtcp-disablelfdelimiter.rst \
     source/reference/parameters/imtcp-discardtruncatedmsg.rst \
     source/reference/parameters/imtcp-flowcontrol.rst \
-    source/reference/parameters/imtcp-failonbinderror.rst \
     source/reference/parameters/imtcp-gnutlsprioritystring.rst \
     source/reference/parameters/imtcp-keepalive-interval.rst \
     source/reference/parameters/imtcp-keepalive-probes.rst \
@@ -1407,3 +1407,13 @@ EXTRA_DIST = \
     tools/pages-root-index.html \
     tools/pages-robots.txt \
     tools/release_build.sh
+
+# Local queue design references must also resolve in release archives.
+EXTRA_DIST += \
+    ai/designs/local-queue-execution-ledger.md \
+    ai/designs/local-queue-frontends.md \
+    ai/designs/local-queue-implementation-plan.md \
+    ai/designs/local-queue-related-work.md \
+    ai/designs/local-queue-s0-contracts.md \
+    ai/designs/local-queue-s0-ownership.md \
+    ai/designs/local-queue-s2-integration-notes.md

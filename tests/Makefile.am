@@ -14,10 +14,18 @@ EXTRA_DIST = \
 	proprepltest-rfctag.sh \
 	unit/README.md
 
+TESTS_LOCAL_OMFILE_CANCEL = local-queue-omfile-cancel.sh local-queue-omfile-hup.sh
+TESTS_LOCAL_OMFILE_ACTIVATION = local-queue-omfile-activation.sh
+TESTS_LOCAL_OMFILE_YAML = yaml-local-queue-omfile-activation.sh
+EXTRA_DIST += $(TESTS_LOCAL_OMFILE_CANCEL) $(TESTS_LOCAL_OMFILE_ACTIVATION) $(TESTS_LOCAL_OMFILE_YAML)
+
 TESTS_FUZZING = \
 	fuzz-syslog-message-smoke.sh \
 	fuzz-imtcp-session-smoke.sh
-TESTS_RELEASE_PACKAGING = rpm-baseline-patch-policy.sh
+TESTS_RELEASE_PACKAGING = \
+	rpm-baseline-patch-policy.sh \
+	daily-stable-package-drift.sh \
+	daily-stable-failure-report.sh
 FUZZING_CORPUS = \
 	fuzz/README.md \
 	fuzz/prepare-imtcp-session-corpus.py \
@@ -28,6 +36,8 @@ FUZZING_CORPUS = \
 	fuzz/corpus/imtcp-session/oversized.hex \
 	fuzz/corpus/imtcp-session/plain-lf.hex \
 	fuzz/corpus/imtcp-session/regex-framing.hex \
+	fuzz/corpus/imtcp-session/regex-framing-zstd-no-newline-oct10.hex \
+	fuzz/corpus/imtcp-session/regex-framing-zstd-no-newline-oct13.hex \
 	fuzz/corpus/imtcp-session/zlib-octet.hex \
 	fuzz/corpus/imtcp-session/zlib-trailer.hex \
 	fuzz/corpus/imtcp-session/zlib-truncated.hex \
@@ -62,16 +72,38 @@ EXTRA_DIST += $(TESTS_RSCRIPT_OBJECT_STRINGS)
 TESTS_RSCRIPT_REPLACE_OVERLAP = rscript_replace-overlap.sh
 EXTRA_DIST += $(TESTS_RSCRIPT_REPLACE_OVERLAP)
 
+TESTS_RSCRIPT_REPLACE_LIMIT = rscript-replace-result-limit.sh
+EXTRA_DIST += $(TESTS_RSCRIPT_REPLACE_LIMIT)
+
 TESTS_PRIFILT_TRAILING_SEPARATOR = prifilt-trailing-separator.sh prifilt-trailing-separator-vg.sh
 EXTRA_DIST += $(TESTS_PRIFILT_TRAILING_SEPARATOR)
 
 TESTS_TEMPLATE_PARAMETER_ERRORS = template-parameter-errors.sh
 EXTRA_DIST += $(TESTS_TEMPLATE_PARAMETER_ERRORS)
 
+TESTS_QUEUE_BENCHMARK_ORACLE = queue-benchmark-oracle.sh
+EXTRA_DIST += $(TESTS_QUEUE_BENCHMARK_ORACLE) ../benchmarks/queue-contention/selftest.sh
+
+TESTS_QUEUE_BENCHMARK_LATENCY_ORACLE = queue-benchmark-latency-oracle.sh
+EXTRA_DIST += $(TESTS_QUEUE_BENCHMARK_LATENCY_ORACLE) ../benchmarks/queue-contention/latency-observer.py \
+	../benchmarks/queue-contention/latency-observer-selftest.py ../benchmarks/queue-contention/trial-latency.sh \
+	../benchmarks/queue-contention/compare-latency.py ../benchmarks/queue-contention/docker_image.py
+
 TESTS_QUEUE_DEFERRED_IDLE_WAKEUP = queue-deferred-idle-wakeup.sh queue-deferred-idle-shutdown.sh
 EXTRA_DIST += $(TESTS_QUEUE_DEFERRED_IDLE_WAKEUP) override_queue_disposal.c
-TESTS_WTP_TARGETED_WAKEUP = wtp-targeted-wakeup.sh
+TESTS_QUEUE_LEASE = queue-discard-only-lease.sh queue-lease-attribution.sh
+EXTRA_DIST += $(TESTS_QUEUE_LEASE)
+
+TESTS_QUEUE_BENCHMARK_THROUGHPUT_CONFIG = queue-benchmark-throughput-config.sh
+EXTRA_DIST += $(TESTS_QUEUE_BENCHMARK_THROUGHPUT_CONFIG) ../benchmarks/queue-contention/trial-multi.sh \
+	../benchmarks/queue-contention/compare.py
+TESTS_QUEUE_BENCHMARK_THROUGHPUT_LOCAL = queue-benchmark-throughput-local.sh
+EXTRA_DIST += $(TESTS_QUEUE_BENCHMARK_THROUGHPUT_LOCAL)
+TESTS_WTP_TARGETED_WAKEUP = wtp-targeted-wakeup.sh wtp-exiting-worker-restart.sh
 EXTRA_DIST += $(TESTS_WTP_TARGETED_WAKEUP) unit/wtp_wakeup_test.c
+TESTS_OMPIPE_LEGACY_PATH = ompipe-legacy-path-length.sh
+TESTS_OMPIPE_LEGACY_PATH_VALGRIND = ompipe-legacy-path-length-vg.sh
+EXTRA_DIST += $(TESTS_OMPIPE_LEGACY_PATH) $(TESTS_OMPIPE_LEGACY_PATH_VALGRIND)
 
 TESTS_SEGQUEUE_TOOL = rsyslog-segqueue-tool.py rsyslog-segqueue-runtime.sh
 EXTRA_DIST += $(TESTS_SEGQUEUE_TOOL)
@@ -157,7 +189,92 @@ EXTRA_DIST += $(TESTS_SEGMENTED_DISK_QUEUE) $(TESTS_SEGMENTED_DISK_QUEUE_LIBYAML
 	testsuites/segmented-diskqueue-invalid-state-driver.sh \
 	testsuites/pure-disk-queue-scope-driver.sh
 
-TESTS_IMFIFO = imfifo.sh imfifo-vg.sh yaml-imfifo.sh
+TESTS_LOCAL_QUEUE_CONFIG = local-queue-config.sh local-queue-s4-config.sh
+TESTS_LOCAL_QUEUE_CONFIG_YAML = local-queue-config-yaml.sh local-queue-s4-config-yaml.sh
+EXTRA_DIST += $(TESTS_LOCAL_QUEUE_CONFIG) $(TESTS_LOCAL_QUEUE_CONFIG_YAML)
+
+TESTS_LOCAL_QUEUE = \
+	local-queue-known-success.sh \
+	local-queue-s6-linkedlist-oom.sh \
+	local-queue-s6-linkedlist-retry-oom.sh \
+	local-queue-s6-schedule.sh \
+	local-queue-s6-slowdown.sh \
+	local-queue-s6-sampling-retry.sh \
+	local-queue-s6-discard.sh \
+	local-queue-s6-linkedlist-discard.sh \
+	local-queue-s6-sampling.sh \
+	local-queue-s6-segmented-sampling.sh \
+	local-queue-s6-min-batch.sh \
+	local-queue-s6-linkedlist-tiered.sh \
+	local-queue-s6-linkedlist-help-capacity.sh \
+	local-queue-s6-linkedlist-stats.sh \
+	local-queue-s6-linkedlist-persistence.sh \
+	local-queue-s6-linkedlist-segmented-persistence.sh \
+	local-queue-s5-store-failure.sh \
+	local-queue-s5-da-emergency-lease.sh \
+	local-queue-s5-segmented-store-failure.sh \
+	local-queue-s5-save-disabled.sh \
+	local-queue-s5-segmented-save-disabled.sh \
+	local-queue-s5-graph-shutdown.sh \
+	local-queue-s5-segmented-graph-shutdown.sh \
+	local-queue-s5-spill.sh \
+	local-queue-s5-segmented-spill.sh \
+	local-queue-s5-persistence.sh \
+	local-queue-s5-segmented-persistence.sh \
+	local-queue-s4-graph.sh \
+	local-queue-s4-global-boundary.sh \
+	local-queue-s4-direct-main.sh \
+	local-queue-s4-shutdown.sh \
+	local-queue-helper-force-term-actions.sh \
+	local-queue-helper-replay-actions.sh \
+	local-queue-helper-cancel-actions.sh \
+	local-queue-helping.sh \
+	local-queue-help-capacity.sh \
+	local-queue-helping-default.sh \
+	local-queue-help-wake-before.sh \
+	local-queue-help-wake-after.sh \
+	local-queue-help-wake-handoff.sh \
+	local-queue-imtcp-tiered.sh \
+	local-queue-imtcp-internal.sh \
+	local-queue-imtcp-partial-batch.sh \
+	local-queue-imtcp-shutdown.sh \
+	local-queue-force-term-actions.sh
+TESTS_LOCAL_QUEUE_INET = \
+	local-queue-s4-output-tcp.sh \
+	local-queue-s4-output-tcp-recovery.sh \
+	local-queue-s4-output-tcp-fallback.sh
+TESTS_LOCAL_QUEUE_ELASTICSEARCH = \
+	local-queue-s4-output-es.sh \
+	local-queue-s4-output-es-partial.sh
+TESTS_LOCAL_QUEUE_IMDIAG = \
+	local-queue-redirect-publication.sh \
+	local-queue-stats-lifetime.sh
+TESTS_LOCAL_QUEUE_IMDIAG_IMPSTATS = local-queue-be-force-term-actions.sh \
+    local-queue-input-force-term.sh \
+    local-queue-global-input-force-term.sh \
+    local-queue-shutdown-loss-report.sh
+TESTS_LOCAL_QUEUE_IMDIAG_IMPSTATS_OMTESTING = \
+	local-queue-stats-reconciliation.sh \
+	local-queue-submit-batches.sh \
+	local-queue-global-shutdown-loss-report.sh \
+	local-queue-global-shutdown-loss-report-linkedlist.sh
+TESTS_LOCAL_QUEUE_EPOLL = \
+	local-queue-imtcp-registration.sh \
+	local-queue-imtcp-shutdown-multi-fe.sh
+EXTRA_DIST += $(TESTS_LOCAL_QUEUE) $(TESTS_LOCAL_QUEUE_INET) $(TESTS_LOCAL_QUEUE_ELASTICSEARCH) \
+	$(TESTS_LOCAL_QUEUE_IMDIAG) $(TESTS_LOCAL_QUEUE_IMDIAG_IMPSTATS) \
+	$(TESTS_LOCAL_QUEUE_IMDIAG_IMPSTATS_OMTESTING) $(TESTS_LOCAL_QUEUE_EPOLL) local-queue-common.sh
+
+TESTS_LOCAL_QUEUE_FAILURES = \
+	local-queue-imtcp-tls-failure.sh \
+	local-queue-imtcp-cache-failure.sh \
+	local-queue-imtcp-worker-failure.sh
+TESTS_LOCAL_QUEUE_STARTUP_FAILURE = local-queue-startup-failure.sh
+TESTS_LOCAL_QUEUE_PRODUCER_LIFECYCLE = local-queue-imtcp-producer-exit.sh
+EXTRA_DIST += $(TESTS_LOCAL_QUEUE_FAILURES) $(TESTS_LOCAL_QUEUE_STARTUP_FAILURE) \
+	$(TESTS_LOCAL_QUEUE_PRODUCER_LIFECYCLE)
+
+TESTS_IMFIFO = imfifo.sh imfifo-vg.sh yaml-imfifo.sh imfifo-startup-failure.sh
 EXTRA_DIST += $(TESTS_IMFIFO)
 
 TESTS_GSSAPI = \
@@ -170,6 +287,7 @@ EXTRA_DIST += $(TESTS_GSSAPI) $(TESTS_GSSAPI_LIBYAML) unit/gss_token_util_test.c
 EXTRA_DIST += unit/impcap_arp_parser_test.c
 EXTRA_DIST += unit/imbeats_seq_test.c
 EXTRA_DIST += unit/segdisk_state_test.c
+EXTRA_DIST += unit/queue_spsc_test.c
 EXTRA_DIST += unit/omazuredce_utils_test.c
 EXTRA_DIST += unit/imbeats_parser_test.c
 EXTRA_DIST += unit/mmaitag_gemini_response_test.c
@@ -253,6 +371,7 @@ TESTS_DEFAULT = \
 	mangle_qi_usage_output.sh \
 	chkseq_usage_output.sh \
 	minitcpsrv_usage_output.sh \
+	minitcpsrv-reconnect.sh \
 	diagtalker-retry.sh \
 	test_id_usage_output.sh \
 	uxsockrcvr_usage_output.sh \
@@ -446,6 +565,7 @@ TESTS_DEFAULT = \
 	sndrcv_udp_nonstdpt_v6.sh \
 	imudp_thread_hang.sh \
 	imudp-listenportfilename-secure.sh \
+	imudp-bind-failure.sh \
 	imudp-ratelimit-programname.sh \
 	imudp_ratelimit_name.sh \
 	omfwd_ratelimit_name.sh \
@@ -572,6 +692,7 @@ TESTS_DEFAULT = \
 	rscript_unaffected_reset.sh \
 	rscript_replace_complex.sh \
 	$(TESTS_RSCRIPT_REPLACE_OVERLAP) \
+	$(TESTS_RSCRIPT_REPLACE_LIMIT) \
 	rscript_wrap2.sh \
 	rscript_wrap3.sh \
 	rscript_re_extract_i.sh \
@@ -889,7 +1010,6 @@ TESTS_IMTCP = \
 	imtcp-spacelf-escape.sh \
 	legacy-zlib-empty-output.sh \
 	imtcp-basic-hup.sh \
-	imtcp-shutdown-pending-accepts.sh \
 	imtcp-impstats-single-thread.sh \
 	imtcp-starvation-0.sh \
 	imtcp-starvation-1.sh \
@@ -922,6 +1042,11 @@ TESTS_IMTCP = \
 	omfile-dynafile-traversal-permit-escape.sh \
 	omfile-dynafile-traversal-repro.sh \
 	omfile-dynafile-traversal-root-base.sh
+
+# The pending-accepts fixture exercises epoll's worker/listener teardown.
+# Poll has its own deterministic inner-workset shutdown regression.
+TESTS_IMTCP_EPOLL = imtcp-shutdown-pending-accepts.sh
+TESTS_IMTCP_POLL = imtcp-poll-shutdown-workset.sh
 
 TESTS_IMTCP_STREAM_ALWAYS_ZLIB = \
 	imtcp-stream-always-zlib-basic.sh \
@@ -1400,6 +1525,7 @@ TESTS_IMDOCKER_VALGRIND = \
 	imdocker-multi-line-vg.sh
 
 TESTS_IMCZMQ = \
+	imczmq-startup-failure.sh \
 	imczmq-topic-too-long.sh
 
 TESTS_IMHTTP = \
@@ -1436,6 +1562,7 @@ TESTS_IMHTTP_VALGRIND = \
 	imhttp-getrequest-file-vg.sh
 
 TESTS_IMBEATS = \
+	imbeats-bind-failure.sh \
 	imbeats-basic.sh \
 	imbeats-compressed.sh \
 	imbeats-seq-cumulative-two-windows.sh \
@@ -1593,6 +1720,7 @@ TESTS_IMPSTATS_VALGRIND = \
 	dynstats-persist-vg.sh
 
 TESTS_IMPTCP = \
+	imptcp-bind-failure.sh \
 	manyptcp.sh \
 	imptcp-debug-recv-length.sh \
 	imptcp-epoll-add-failure.sh \
@@ -2503,6 +2631,8 @@ EXTRA_DIST += $(TESTS_LIBYAML_OSSL)
 EXTRA_DIST += $(TESTS_LIBYAML_IMHTTP)
 EXTRA_DIST += $(TESTS_LIBYAML_OMSTDOUT)
 EXTRA_DIST += $(TESTS_IMTCP)
+EXTRA_DIST += $(TESTS_IMTCP_EPOLL)
+EXTRA_DIST += $(TESTS_IMTCP_POLL)
 EXTRA_DIST += $(TESTS_IMTCP_STREAM_ALWAYS_ZLIB)
 EXTRA_DIST += $(TESTS_IMTCP_STREAM_ALWAYS_ZLIB_IMPSTATS)
 EXTRA_DIST += $(TESTS_IMTCP_STREAM_ALWAYS_ZSTD)
@@ -2715,10 +2845,10 @@ check_LTLIBRARIES =
 # TODO: reenable TESTRUNS = rt_init rscript
 check_PROGRAMS = runtime_unit_linkedlist runtime_unit_stringbuf runtime_unit_parser_pri runtime_unit_msg_replace \
 	runtime_unit_ommongodb_date runtime_unit_segdisk_state runtime_unit_queue_da runtime_unit_omazuredce_utils \
-	runtime_unit_wtp_wakeup runtime_unit_perctile_ringbuf
+	runtime_unit_wtp_wakeup runtime_unit_queue_lease runtime_unit_queue_spsc runtime_unit_perctile_ringbuf
 TESTS = runtime_unit_linkedlist runtime_unit_stringbuf runtime_unit_parser_pri runtime_unit_msg_replace \
 	runtime_unit_ommongodb_date runtime_unit_segdisk_state runtime_unit_queue_da runtime_unit_omazuredce_utils \
-	runtime_unit_wtp_wakeup runtime_unit_perctile_ringbuf
+	runtime_unit_wtp_wakeup runtime_unit_queue_lease runtime_unit_queue_spsc runtime_unit_perctile_ringbuf
 
 runtime_unit_perctile_ringbuf_SOURCES = unit/perctile_ringbuf_test.c ../runtime/perctile_ringbuf.c
 runtime_unit_perctile_ringbuf_CPPFLAGS = -I$(top_srcdir)/runtime
@@ -2747,6 +2877,11 @@ runtime_unit_segdisk_state_SOURCES = \
 
 runtime_unit_queue_da_SOURCES = \
 	unit/queue_da_test.c
+
+runtime_unit_queue_lease_SOURCES = \
+	unit/queue_lease_test.c
+runtime_unit_queue_spsc_SOURCES = \
+	unit/queue_spsc_test.c
 
 runtime_unit_omazuredce_utils_SOURCES = \
 	unit/omazuredce_utils_test.c
@@ -2841,6 +2976,10 @@ runtime_unit_segdisk_state_CPPFLAGS = \
 	$(runtime_unit_linkedlist_CPPFLAGS)
 runtime_unit_queue_da_CPPFLAGS = \
 	$(runtime_unit_linkedlist_CPPFLAGS)
+runtime_unit_queue_lease_CPPFLAGS = \
+	$(runtime_unit_linkedlist_CPPFLAGS)
+runtime_unit_queue_spsc_CPPFLAGS = \
+	$(runtime_unit_linkedlist_CPPFLAGS)
 runtime_unit_wtp_wakeup_CPPFLAGS = \
 	$(runtime_unit_linkedlist_CPPFLAGS) \
 	-Wno-inline
@@ -2852,6 +2991,8 @@ runtime_unit_msg_replace_LDADD = $(runtime_unit_linkedlist_LDADD)
 runtime_unit_ommongodb_date_LDADD = $(runtime_unit_linkedlist_LDADD)
 runtime_unit_segdisk_state_LDADD = $(LIBESTR_LIBS) $(PTHREADS_LIBS) $(SOL_LIBS)
 runtime_unit_queue_da_LDADD = $(LIBESTR_LIBS) $(PTHREADS_LIBS) $(SOL_LIBS)
+runtime_unit_queue_lease_LDADD = $(PTHREADS_LIBS)
+runtime_unit_queue_spsc_LDADD = $(PTHREADS_LIBS) $(SOL_LIBS)
 runtime_unit_wtp_wakeup_LDADD = $(PTHREADS_LIBS) $(SOL_LIBS)
 
 if ENABLE_LIBLOGGING_STDLOG
@@ -2864,6 +3005,28 @@ endif
 TEST_LIBOVERRIDE_LDFLAGS = -module -shared -avoid-version -rpath $(abs_builddir)
 
 if ENABLE_TESTBENCH
+if ENABLE_IMTCP_TESTS
+if ENABLE_IMDIAG
+TESTS += $(TESTS_LOCAL_OMFILE_CANCEL)
+check_LTLIBRARIES += liblocal_queue_omfile_cancel_preload.la
+liblocal_queue_omfile_cancel_preload_la_SOURCES = local-queue-omfile-cancel-preload.c
+# External sanitizer symbolizers inherit LD_PRELOAD but do not link its runtime.
+# Keep the fixture uninstrumented; daemon synchronization remains intercepted.
+liblocal_queue_omfile_cancel_preload_la_CFLAGS =
+# Automake appends global CFLAGS after target CFLAGS, so an earlier disabling
+# flag is ineffective. Filter instrumentation from both compile and link flags
+# for this fixture only; also works with compilers predating -fno-sanitize=all.
+liblocal_queue_omfile_cancel_preload_la-local-queue-omfile-cancel-preload.lo: local-queue-omfile-cancel-preload.c $(top_builddir)/config.h
+	$(AM_V_CC)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile \
+		$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) \
+		$(filter-out -fsanitize=%,$(CFLAGS)) -c -o $@ $(srcdir)/local-queue-omfile-cancel-preload.c
+liblocal_queue_omfile_cancel_preload_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) \
+	--mode=link $(CCLD) $(filter-out -fsanitize=%,$(CFLAGS)) \
+	$(liblocal_queue_omfile_cancel_preload_la_LDFLAGS) $(filter-out -fsanitize=%,$(LDFLAGS)) -o $@
+liblocal_queue_omfile_cancel_preload_la_LDFLAGS = $(TEST_LIBOVERRIDE_LDFLAGS)
+liblocal_queue_omfile_cancel_preload_la_LIBADD = $(DL_LIBS) $(PTHREADS_LIBS)
+endif
+endif
 check_LTLIBRARIES += liboverride_gethostname.la
 liboverride_gethostname_la_SOURCES = override_gethostname.c
 liboverride_gethostname_la_CFLAGS =
@@ -2921,7 +3084,40 @@ if ENABLE_IMJOURNAL
 check_PROGRAMS += journal_print
 endif
 endif # if ENABLE_JOURNAL_TESTS
-TESTS += $(TESTRUNS)
+TESTS += $(TESTRUNS) $(TESTS_LOCAL_QUEUE_CONFIG)
+TESTS += $(TESTS_LOCAL_OMFILE_ACTIVATION)
+if HAVE_LIBYAML
+TESTS += $(TESTS_LOCAL_QUEUE_CONFIG_YAML)
+TESTS += $(TESTS_LOCAL_OMFILE_YAML)
+endif
+if ENABLE_IMDIAG
+TESTS += $(TESTS_LOCAL_QUEUE_IMDIAG)
+if ENABLE_IMPSTATS
+TESTS += $(TESTS_LOCAL_QUEUE_IMDIAG_IMPSTATS)
+TESTS += $(TESTS_LOCAL_QUEUE_IMDIAG_IMPSTATS_OMTESTING)
+endif
+endif
+if ENABLE_IMTCP_TESTS
+if ENABLE_IMDIAG
+TESTS += $(TESTS_LOCAL_QUEUE_STARTUP_FAILURE)
+endif
+if ENABLE_IMPSTATS
+if ENABLE_IMDIAG
+TESTS += $(TESTS_LOCAL_QUEUE)
+TESTS += $(TESTS_LOCAL_QUEUE_FAILURES)
+if ENABLE_INET
+TESTS += $(TESTS_LOCAL_QUEUE_INET)
+endif
+if ENABLE_ELASTICSEARCH_TESTS
+TESTS += $(TESTS_LOCAL_QUEUE_ELASTICSEARCH)
+endif
+if ENABLE_IMTCP_EPOLL
+TESTS += $(TESTS_LOCAL_QUEUE_EPOLL)
+TESTS += $(TESTS_LOCAL_QUEUE_PRODUCER_LIFECYCLE)
+endif
+endif
+endif
+endif
 
 if ENABLE_GSSAPI
 TESTS += $(TESTS_GSSAPI)
@@ -3032,8 +3228,15 @@ endif # if ENABLE_ELASTICSEARCH_TESTS
 if ENABLE_DEFAULT_TESTS
 TESTS += $(TESTS_DEFAULT)
 TESTS += $(TESTS_MERMAID_OFFLINE)
-TESTS += $(TESTS_QUEUE_DEFERRED_IDLE_WAKEUP)
+TESTS += $(TESTS_QUEUE_BENCHMARK_ORACLE) $(TESTS_QUEUE_DEFERRED_IDLE_WAKEUP)
+TESTS += $(TESTS_QUEUE_LEASE)
+TESTS += $(TESTS_QUEUE_BENCHMARK_THROUGHPUT_CONFIG)
+if ENABLE_IMTCP_TESTS
+TESTS += $(TESTS_QUEUE_BENCHMARK_LATENCY_ORACLE)
+TESTS += $(TESTS_QUEUE_BENCHMARK_THROUGHPUT_LOCAL)
+endif
 TESTS += $(TESTS_WTP_TARGETED_WAKEUP)
+TESTS += $(TESTS_OMPIPE_LEGACY_PATH)
 TESTS += $(TESTS_JSON_OMITIFZERO)
 TESTS += $(TESTS_SEGMENTED_DISK_QUEUE)
 if ENABLE_SEGQUEUE_TOOL
@@ -3082,6 +3285,7 @@ if ENABLE_OSSL
 TESTS += $(TESTS_OSSL_WRONG_OPT)
 endif # ENABLE_OSSL
 TESTS += $(TESTS_DEFAULT_VALGRIND)
+TESTS += $(TESTS_OMPIPE_LEGACY_PATH_VALGRIND)
 if ENABLE_LIBGCRYPT
 TESTS += $(TESTS_LIBGCRYPT_VALGRIND)
 endif # ENABLE_LIBGCRYPT
@@ -3125,6 +3329,7 @@ endif
 
 if ENABLE_IMFIFO
 TESTS += imfifo.sh
+TESTS += imfifo-startup-failure.sh
 if HAVE_VALGRIND
 TESTS += imfifo-vg.sh
 endif
@@ -3178,6 +3383,11 @@ endif # ENABLE_IMFILE_TESTS
 
 if ENABLE_IMTCP_TESTS
 TESTS += $(TESTS_IMTCP)
+if ENABLE_IMTCP_EPOLL
+TESTS += $(TESTS_IMTCP_EPOLL)
+else
+TESTS += $(TESTS_IMTCP_POLL)
+endif
 TESTS += $(TESTS_IMTCP_STREAM_ALWAYS_ZLIB)
 if ENABLE_LIBZSTD
 TESTS += $(TESTS_IMTCP_STREAM_ALWAYS_ZSTD)
